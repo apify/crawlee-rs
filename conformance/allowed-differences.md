@@ -51,9 +51,6 @@ _None._ All 755 checks match.
   - Integers beyond 2^53 are kept exact; JS rounds them.
   - Lone UTF-16 surrogates in `\u` escapes are rejected by serde_json.
   - Object keys keep insertion order (`preserve_order`). JS moves integer-like keys first.
-- **robots.txt that is missing.** A 4xx answer is cached as allow-all. Crawlee for JS throws on
-  any non-2xx status before its own 404 check. As a result, every request to a site without
-  robots.txt fetches it again.
 - **Malformed sitemaps.** A sitemap is parsed whole once fetched. A syntax error discards it and
   is retried like a failed fetch. JS streams it: it yields the entries before the error, then the
   error ends the whole `Sitemap.load`.

@@ -31,6 +31,15 @@ impl ProxyInfo {
 pub trait ProxySource: Send + Sync {
     /// The proxy for a new session, or `None` to connect directly.
     fn new_proxy_info(&self, session_id: &str) -> Option<ProxyInfo>;
+
+    /// The proxy of a session restored from the saved state of the session pool. Return the
+    /// equivalent proxy usable in the current environment (for example, the Apify Proxy endpoint
+    /// after a migration), the argument itself when there is nothing to refresh, or `None` to
+    /// connect directly. Does not create a new proxy for an existing session, unlike
+    /// [`new_proxy_info`](Self::new_proxy_info).
+    fn restored_proxy_info(&self, _session_id: &str, restored: ProxyInfo) -> Option<ProxyInfo> {
+        Some(restored)
+    }
 }
 
 /// Round-robin over a fixed list of proxy URLs (`proxyUrls` in Crawlee for JS).
