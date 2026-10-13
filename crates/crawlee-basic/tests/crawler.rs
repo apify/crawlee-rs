@@ -49,6 +49,34 @@ async fn handles_every_request_once() {
 }
 
 #[tokio::test]
+async fn skip_request_marks_the_request_handled_without_retries_or_failures() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let counter = attempts.clone();
+    let crawler = BasicCrawler::builder()
+        .services(services())
+        .max_request_retries(3)
+        .request_handler(move |ctx: BasicContext| {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                if ctx.request().url.ends_with("/skip") {
+                    return Err(ctx.skip_request(Some("not interesting")));
+                }
+                ctx.push_data(&json!({ "url": ctx.request().url }))?;
+                Ok(())
+            }
+        })
+        .build()
+        .unwrap();
+
+    let stats = crawler.run(["https://a.dev/skip", "https://a.dev/keep"]).await.unwrap();
+
+    assert_eq!(attempts.load(Ordering::SeqCst), 2, "the skipped request is not retried");
+    assert_eq!((stats.requests_succeeded, stats.requests_failed, stats.requests_skipped), (1, 0, 1));
+    assert_eq!(items(&crawler).await.len(), 1);
+}
+
+#[tokio::test]
 async fn retries_then_fails_and_rolls_back_writes() {
     let attempts = Arc::new(AtomicUsize::new(0));
     let failed = Arc::new(Mutex::new(None::<Request>));

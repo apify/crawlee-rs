@@ -240,6 +240,12 @@ impl Default for SessionPoolOptions {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum SessionPoolError {
+    #[error("Cannot add session with id '{0}' as it already exists in the pool")]
+    AlreadyExists(String),
+}
+
 /// Hands out sessions: new ones until the pool is full, then random usable ones, replacing
 /// sessions that are no longer usable (the `random` strategy of Crawlee for JS).
 pub struct SessionPool {
@@ -307,6 +313,24 @@ impl SessionPool {
         session
     }
 
+    /// Adds a session to the pool, also beyond the maximum pool size.
+    ///
+    /// A session with the same id is replaced when it is no longer usable (retired, expired or used
+    /// up), otherwise [`SessionPoolError::AlreadyExists`] is returned.
+    pub fn add_session(&self, session: Session) -> Result<Arc<Session>, SessionPoolError> {
+        let mut sessions = self.sessions.lock();
+        if let Some(index) = sessions.iter().position(|existing| existing.id() == session.id()) {
+            if sessions[index].is_usable() {
+                return Err(SessionPoolError::AlreadyExists(session.id));
+            }
+            let removed = sessions.remove(index);
+            tracing::debug!("Removed Session - {}", removed.id());
+        }
+        let session = Arc::new(session);
+        sessions.push(session.clone());
+        Ok(session)
+    }
+
     /// The usable session with this id, if any.
     pub fn get_session_by_id(&self, id: &str) -> Option<Arc<Session>> {
         self.sessions.lock().iter().find(|session| session.id() == id && session.is_usable()).cloned()
@@ -335,10 +359,19 @@ impl PersistedState for SessionPool {
     /// Recreates the saved sessions, keeping only the usable ones.
     fn restore(&self, record: Value) -> Result<(), BoxError> {
         let saved = record["sessions"].as_array().ok_or("the record has no `sessions`")?;
-        let sessions = saved
+        let mut sessions = saved
             .iter()
             .map(|state| Session::from_state(state, &self.options.session_options))
             .collect::<Result<Vec<_>, _>>()?;
+        if let Some(proxies) = &self.proxies {
+            // As `createSessionFunction` does in JS: the proxy source decides what a restored proxy becomes.
+            for session in &mut sessions {
+                session.proxy_info = match session.proxy_info.take() {
+                    Some(restored) => proxies.restored_proxy_info(&session.id, restored),
+                    None => proxies.new_proxy_info(&session.id),
+                };
+            }
+        }
         let usable: Vec<Arc<Session>> =
             sessions.into_iter().filter(|session| session.is_usable()).map(Arc::new).collect();
         tracing::debug!("{} active sessions loaded from the key-value store", usable.len());
@@ -389,6 +422,45 @@ mod tests {
         assert!(c.id() != a.id() && c.id() != b.id());
         assert_eq!(pool.get_session_by_id(c.id()).unwrap().id(), c.id());
         assert!(pool.get_session_by_id(a.id()).is_none());
+    }
+
+    #[test]
+    fn add_session_replaces_an_unusable_session_with_the_same_id() {
+        let pool = SessionPool::new(SessionPoolOptions { max_pool_size: 1, ..Default::default() }, None);
+        let pinned = pool.add_session(Session::new("pinned".into(), None, SessionOptions::default())).unwrap();
+        let duplicate = Session::new("pinned".into(), None, SessionOptions::default());
+        assert!(matches!(pool.add_session(duplicate), Err(SessionPoolError::AlreadyExists(id)) if id == "pinned"));
+
+        pinned.retire();
+        let replacement = pool.add_session(Session::new("pinned".into(), None, SessionOptions::default())).unwrap();
+        assert!(!Arc::ptr_eq(&pinned, &replacement));
+        assert!(Arc::ptr_eq(&pool.get_session_by_id("pinned").unwrap(), &replacement));
+        assert_eq!(pool.retired_count(), 0, "the retired session is gone");
+    }
+
+    #[test]
+    fn restored_sessions_get_their_proxy_refreshed() {
+        struct Refresh;
+        impl ProxySource for Refresh {
+            fn new_proxy_info(&self, _: &str) -> Option<ProxyInfo> {
+                Some(ProxyInfo::from_url(Url::parse("http://fresh:1").unwrap()))
+            }
+            fn restored_proxy_info(&self, _: &str, restored: ProxyInfo) -> Option<ProxyInfo> {
+                Some(ProxyInfo::from_url(Url::parse(&restored.url.as_str().replace("old", "new")).unwrap()))
+            }
+        }
+        let pool = SessionPool::with_id("0", SessionPoolOptions::default(), None);
+        pool.add_session(Session::new(
+            "s".into(),
+            Some(ProxyInfo::from_url(Url::parse("http://old:1").unwrap())),
+            SessionOptions::default(),
+        ))
+        .unwrap();
+        let record = pool.to_record();
+
+        let restored = SessionPool::with_id("0", SessionPoolOptions::default(), Some(Arc::new(Refresh)));
+        restored.restore(record).unwrap();
+        assert_eq!(restored.get_session_by_id("s").unwrap().proxy_info().unwrap().hostname, "new");
     }
 
     #[test]

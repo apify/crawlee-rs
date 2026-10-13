@@ -25,7 +25,7 @@ pub use crate::handler::{ErrorHandler, FnMiddleware, Identity, Middleware, Reque
 pub use crate::proxy::{ProxyConfiguration, ProxyInfo, ProxySource};
 pub use crate::robots::RobotsTxtFile;
 pub use crate::router::Router;
-pub use crate::session::{Session, SessionOptions, SessionPool, SessionPoolOptions};
+pub use crate::session::{Session, SessionOptions, SessionPool, SessionPoolError, SessionPoolOptions};
 pub use crate::sitemap::{Sitemap, SitemapOptions};
 pub use crate::sitemap_loader::{SitemapRequestLoader, SitemapRequestLoaderOptions};
 pub use crate::statistics::{FinalStatistics, Statistics};

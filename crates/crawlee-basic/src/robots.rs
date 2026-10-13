@@ -44,9 +44,8 @@ impl RobotsTxtFile {
 
     /// Fetches the robots.txt of the site `url` belongs to.
     ///
-    /// A 4xx answer (no robots.txt) allows everything. Crawlee for JS throws on it instead, so
-    /// every request to such a site fetches robots.txt again; see
-    /// `conformance/allowed-differences.md`. Other failures are errors.
+    /// As in RFC 9309 (and Crawlee for JS), a 4xx answer (no robots.txt) allows everything and a
+    /// 5xx answer (unreachable) disallows everything. Other statuses are errors.
     pub async fn find(url: &str, client: &dyn HttpClient, proxy_url: Option<Url>) -> Result<RobotsTxt, RobotsTxtError> {
         let robots_url = Self::url_for(url)?;
         let options = SendOptions { proxy_url, timeout: Some(FETCH_TIMEOUT), ..SendOptions::default() };
@@ -58,6 +57,7 @@ impl RobotsTxtFile {
         match status {
             200..=299 => Ok(RobotsTxt::parse(robots_url.as_str(), &String::from_utf8_lossy(&response.body))),
             400..=499 => Ok(RobotsTxt::allow_all(robots_url.as_str())),
+            500..=599 => Ok(RobotsTxt::disallow_all(robots_url.as_str())),
             _ => Err(RobotsTxtError::Status { url: robots_url.to_string(), status }),
         }
     }
@@ -114,5 +114,43 @@ impl RobotsCache {
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crawlee_http_client::{HttpClientError, HttpResponse};
+
+    struct Status(u16);
+
+    #[async_trait::async_trait]
+    impl HttpClient for Status {
+        async fn send_request(&self, request: HttpRequest, _: &SendOptions) -> Result<HttpResponse, HttpClientError> {
+            Ok(HttpResponse {
+                status: http::StatusCode::from_u16(self.0).unwrap(),
+                headers: http::HeaderMap::new(),
+                url: request.url,
+                body: "User-agent: *\nAllow: /".into(),
+                redirects: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn missing_robots_txt_allows_all_and_unreachable_one_disallows_all() {
+        let page = "https://a.test/some/page.html";
+        for status in [401, 403, 404, 410] {
+            let robots = RobotsTxtFile::find(page, &Status(status), None).await.unwrap();
+            assert_eq!(robots.check(page, "bot"), Some(true), "HTTP {status}");
+        }
+        for status in [500, 503] {
+            let robots = RobotsTxtFile::find(page, &Status(status), None).await.unwrap();
+            assert_eq!(robots.check(page, "bot"), Some(false), "HTTP {status}");
+        }
+        assert!(matches!(
+            RobotsTxtFile::find(page, &Status(304), None).await,
+            Err(RobotsTxtError::Status { status: 304, .. })
+        ));
     }
 }

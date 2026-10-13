@@ -16,6 +16,7 @@ use crawlee_core::{
 };
 use crawlee_http_client::{HttpClient, HttpClientError, HttpRequest, HttpResponse, SendOptions};
 
+use crate::errors::RequestSkipped;
 use crate::proxy::ProxyInfo;
 use crate::robots::RobotsCache;
 use crate::session::Session;
@@ -192,6 +193,21 @@ impl BasicContext {
 
     pub fn request(&self) -> &Request {
         self.request.as_ref().expect(PRESENT)
+    }
+
+    /// The error that skips the current request: return it from the handler (`return
+    /// Err(ctx.skip_request(None))`, or use `?`). The request is marked as handled and counted as
+    /// skipped, without a retry or a hit to the session's score (`context.skipRequest()` in JS,
+    /// which throws instead).
+    pub fn skip_request(&self, message: Option<&str>) -> anyhow::Error {
+        let request = self.request();
+        tracing::debug!(
+            "Skipping request {} ({}){}",
+            request.url,
+            request.id.as_deref().unwrap_or_default(),
+            message.map(|message| format!(": {message}")).unwrap_or_default()
+        );
+        RequestSkipped { reason: message.unwrap_or("skipped by the request handler").to_owned() }.into()
     }
 
     pub fn request_mut(&mut self) -> &mut Request {

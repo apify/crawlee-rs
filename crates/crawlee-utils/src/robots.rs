@@ -179,6 +179,11 @@ impl RobotsTxt {
         Self::parse(robots_url, "")
     }
 
+    /// A file that disallows everything, for a site whose robots.txt is unreachable (5xx).
+    pub fn disallow_all(robots_url: &str) -> Self {
+        Self::parse(robots_url, "User-agent: *\nDisallow: /")
+    }
+
     pub fn url(&self) -> &str {
         &self.url
     }
