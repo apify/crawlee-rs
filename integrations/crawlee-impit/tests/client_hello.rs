@@ -58,7 +58,7 @@ fn parse_client_hello(data: &[u8]) -> ClientHello {
 async fn capture(transport: impl Transport + 'static) -> ClientHello {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = Url::parse(&format!("https://127.0.0.1:{}/", listener.local_addr().unwrap().port())).unwrap();
-    let client = tokio::spawn(async move {
+    let client = tokio::task::spawn_local(async move {
         // The handshake cannot complete; only the ClientHello matters.
         let _ = transport.fetch(HttpRequest::get(url), &TransportOptions::default()).await;
     });
@@ -74,7 +74,7 @@ async fn capture(transport: impl Transport + 'static) -> ClientHello {
     parse_client_hello(&data)
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn impit_sends_browser_client_hellos() {
     let reqwest = capture(ReqwestTransport::new()).await;
     let chrome = capture(ImpitTransport::new(Browser::Chrome)).await;

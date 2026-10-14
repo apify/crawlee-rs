@@ -4,6 +4,12 @@ A port of [Crawlee](https://crawlee.dev) to Rust, focused on what Rust is better
 JavaScript for crawling: **fast HTTP crawling, HTML parsing and JSON processing**. It keeps
 Crawlee's architecture and behavior; the JavaScript and Python versions remain the reference.
 
+> **Branch `single-threaded`:** an experiment, everything on one thread. Crawlers run on tokio's
+> local runtime (`#[tokio::main(flavor = "local")]`), tasks are spawned with `spawn_local`, and
+> shared state uses `Rc`, `Cell` and `RefCell` instead of `Arc`, atomics and mutexes. tokio's
+> `Notify`, `OnceCell` and async `Mutex` are replaced by single-threaded versions in
+> `crawlee_core::local`. Dependencies (reqwest, hyper, rustls) keep their own synchronization.
+
 > Status: early. `BasicCrawler`, `HttpCrawler` and `HtmlCrawler` work end to end, and storage is
 > written to `./storage` in the same format as Crawlee for JS and Python. See
 > [What's not there yet](#whats-not-there-yet).
@@ -11,7 +17,7 @@ Crawlee's architecture and behavior; the JavaScript and Python versions remain t
 ```rust
 use crawlee::{EnqueueLinksOptions, HtmlContext, HtmlCrawler};
 
-#[tokio::main]
+#[tokio::main(flavor = "local")]
 async fn main() -> anyhow::Result<()> {
     let crawler = HtmlCrawler::builder()
         .max_requests_per_crawl(50)

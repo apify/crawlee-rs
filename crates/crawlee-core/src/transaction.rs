@@ -8,9 +8,9 @@
 //! `structuredClone` equivalent on this path.
 
 use bytes::Bytes;
-use parking_lot::Mutex;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use std::cell::RefCell;
 
 use crate::errors::StorageResult;
 use crate::storage::backend::{DatasetItem, KeyValueStoreRecord};
@@ -29,13 +29,13 @@ pub struct KeyValueWrite {
 struct Journal {
     datasets: Vec<(Dataset, Vec<DatasetItem>)>,
     key_value: Vec<KeyValueWrite>,
-    after_commit: Vec<Box<dyn FnOnce() + Send>>,
+    after_commit: Vec<Box<dyn FnOnce()>>,
 }
 
 /// The journal of one request handler attempt.
 #[derive(Default)]
 pub struct StorageTransaction {
-    journal: Mutex<Journal>,
+    journal: RefCell<Journal>,
 }
 
 impl std::fmt::Debug for StorageTransaction {
@@ -60,7 +60,7 @@ impl StorageTransaction {
     /// Journals items for `dataset`. The data is serialized (and validated) now.
     pub fn push_data<T: Serialize + ?Sized>(&self, dataset: &Dataset, data: &T) -> StorageResult<()> {
         let items = serialize_items(data)?;
-        let mut journal = self.journal.lock();
+        let mut journal = self.journal.borrow_mut();
         match journal.datasets.last_mut() {
             Some((last, pending)) if last.same_storage(dataset) => pending.extend(items),
             _ => journal.datasets.push((dataset.clone(), items)),
@@ -88,14 +88,14 @@ impl StorageTransaction {
     }
 
     fn record_write(&self, store: &KeyValueStore, key: &str, value: Option<(Bytes, String)>) {
-        self.journal.lock().key_value.push(KeyValueWrite { store: store.clone(), key: key.to_owned(), value });
+        self.journal.borrow_mut().key_value.push(KeyValueWrite { store: store.clone(), key: key.to_owned(), value });
     }
 
     /// Reads a JSON value, seeing this transaction's own uncommitted writes first.
     pub async fn get_value<T: DeserializeOwned>(&self, store: &KeyValueStore, key: &str) -> StorageResult<Option<T>> {
         let pending = self
             .journal
-            .lock()
+            .borrow_mut()
             .key_value
             .iter()
             .rev()
@@ -109,17 +109,17 @@ impl StorageTransaction {
     }
 
     /// Runs `callback` once the transaction has been committed; dropped on rollback.
-    pub fn after_commit(&self, callback: impl FnOnce() + Send + 'static) {
-        self.journal.lock().after_commit.push(Box::new(callback));
+    pub fn after_commit(&self, callback: impl FnOnce() + 'static) {
+        self.journal.borrow_mut().after_commit.push(Box::new(callback));
     }
 
     pub fn is_empty(&self) -> bool {
-        let journal = self.journal.lock();
+        let journal = self.journal.borrow_mut();
         journal.datasets.is_empty() && journal.key_value.is_empty()
     }
 
     pub fn view(&self) -> TransactionView {
-        let journal = self.journal.lock();
+        let journal = self.journal.borrow_mut();
         TransactionView {
             dataset_items: journal
                 .datasets
@@ -137,7 +137,7 @@ impl StorageTransaction {
 
     /// Applies the journal to the storages, in the order the writes were made.
     pub async fn commit(&self) -> StorageResult<()> {
-        let journal = std::mem::take(&mut *self.journal.lock());
+        let journal = std::mem::take(&mut *self.journal.borrow_mut());
 
         for (dataset, items) in journal.datasets {
             if !items.is_empty() {
@@ -164,7 +164,7 @@ impl StorageTransaction {
 
     /// Discards the journal.
     pub fn rollback(&self) {
-        *self.journal.lock() = Journal::default();
+        *self.journal.borrow_mut() = Journal::default();
     }
 }
 
@@ -174,10 +174,10 @@ mod tests {
     use crate::storage::backend::StorageIdentifier;
     use crate::storage::memory::MemoryStorageBackend;
     use serde_json::json;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::cell::Cell;
+    use std::rc::Rc;
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn commit_applies_and_rollback_discards() {
         let storage = MemoryStorageBackend::new();
         let dataset = Dataset::open(&storage, &StorageIdentifier::Default).await.unwrap();
@@ -195,13 +195,13 @@ mod tests {
         assert_eq!(tx.get_value::<serde_json::Value>(&store, "STATE").await.unwrap(), Some(json!({ "n": 1 })));
         assert!(store.get_record("STATE").await.unwrap().is_none());
 
-        let committed = Arc::new(AtomicBool::new(false));
+        let committed = Rc::new(Cell::new(false));
         let flag = committed.clone();
-        tx.after_commit(move || flag.store(true, Ordering::SeqCst));
+        tx.after_commit(move || flag.set(true));
         assert_eq!(tx.view().dataset_items, vec![json!({ "attempt": 2 })]);
 
         tx.commit().await.unwrap();
-        assert!(committed.load(Ordering::SeqCst));
+        assert!(committed.get());
         assert_eq!(dataset.get_all::<serde_json::Value>().await.unwrap(), vec![json!({ "attempt": 2 })]);
         assert_eq!(store.get_value::<serde_json::Value>("STATE").await.unwrap(), Some(json!({ "n": 1 })));
     }

@@ -1,7 +1,7 @@
 //! Read-only request sources ([`RequestLoader`]), the [`RequestManagerTandem`] that feeds one into
 //! a request queue, and the [`PacingSignal`]s a crawler sends its request manager.
 
-use std::sync::Arc;
+use std::rc::Rc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -42,8 +42,8 @@ pub enum LoaderStatus {
 /// A read-only source of requests, like a sitemap (`IRequestLoader` in JS). Crawlers use it
 /// through a [`RequestManagerTandem`], which moves its requests into a queue so they can be
 /// retried.
-#[async_trait]
-pub trait RequestLoader: Send + Sync {
+#[async_trait(?Send)]
+pub trait RequestLoader {
     async fn fetch_next_request(&self) -> StorageResult<Option<Request>>;
     async fn mark_request_as_handled(&self, request: &Request) -> StorageResult<()>;
     async fn status(&self) -> StorageResult<LoaderStatus>;
@@ -56,12 +56,12 @@ pub trait RequestLoader: Send + Sync {
 /// the loader to the front of the manager, then fetches from the manager. Retries, new links and
 /// persistence are therefore the manager's business, as in JS.
 pub struct RequestManagerTandem {
-    loader: Arc<dyn RequestLoader>,
-    manager: Arc<dyn RequestManager>,
+    loader: Rc<dyn RequestLoader>,
+    manager: Rc<dyn RequestManager>,
 }
 
 impl RequestManagerTandem {
-    pub fn new(loader: Arc<dyn RequestLoader>, manager: Arc<dyn RequestManager>) -> Self {
+    pub fn new(loader: Rc<dyn RequestLoader>, manager: Rc<dyn RequestManager>) -> Self {
         RequestManagerTandem { loader, manager }
     }
 
@@ -78,7 +78,7 @@ impl RequestManagerTandem {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl RequestManager for RequestManagerTandem {
     async fn add_requests(&self, requests: Vec<Request>, forefront: bool) -> StorageResult<BatchAddRequestsResult> {
         self.manager.add_requests(requests, forefront).await
@@ -122,45 +122,45 @@ impl RequestManager for RequestManagerTandem {
 
 #[cfg(test)]
 mod tests {
-    use parking_lot::Mutex;
+    use std::cell::RefCell;
 
     use super::*;
     use crate::storage::memory::MemoryStorageBackend;
     use crate::{RequestQueue, StorageIdentifier};
 
     struct ListLoader {
-        pending: Mutex<Vec<Request>>,
-        handled: Mutex<u64>,
+        pending: RefCell<Vec<Request>>,
+        handled: RefCell<u64>,
     }
 
-    #[async_trait]
+    #[async_trait(?Send)]
     impl RequestLoader for ListLoader {
         async fn fetch_next_request(&self) -> StorageResult<Option<Request>> {
-            Ok(self.pending.lock().pop())
+            Ok(self.pending.borrow_mut().pop())
         }
         async fn mark_request_as_handled(&self, _: &Request) -> StorageResult<()> {
-            *self.handled.lock() += 1;
+            *self.handled.borrow_mut() += 1;
             Ok(())
         }
         async fn status(&self) -> StorageResult<LoaderStatus> {
-            Ok(if self.pending.lock().is_empty() { LoaderStatus::Finished } else { LoaderStatus::Ready })
+            Ok(if self.pending.borrow_mut().is_empty() { LoaderStatus::Finished } else { LoaderStatus::Ready })
         }
         async fn handled_count(&self) -> StorageResult<u64> {
-            Ok(*self.handled.lock())
+            Ok(*self.handled.borrow_mut())
         }
         async fn pending_count(&self) -> StorageResult<u64> {
-            Ok(self.pending.lock().len() as u64)
+            Ok(self.pending.borrow_mut().len() as u64)
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn moves_loader_requests_into_the_queue() {
         let backend = MemoryStorageBackend::new();
-        let queue = Arc::new(RequestQueue::open(&backend, &StorageIdentifier::Default).await.unwrap());
+        let queue = Rc::new(RequestQueue::open(&backend, &StorageIdentifier::Default).await.unwrap());
         queue.add_requests(vec!["https://a.test/queued".into()], false).await.unwrap();
-        let loader = Arc::new(ListLoader {
-            pending: Mutex::new(vec!["https://a.test/2".into(), "https://a.test/1".into()]),
-            handled: Mutex::new(0),
+        let loader = Rc::new(ListLoader {
+            pending: RefCell::new(vec!["https://a.test/2".into(), "https://a.test/1".into()]),
+            handled: RefCell::new(0),
         });
         let tandem = RequestManagerTandem::new(loader.clone(), queue.clone());
 

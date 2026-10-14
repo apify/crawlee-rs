@@ -1,6 +1,6 @@
 //! [`KeyValueStore`]: records addressed by key, each with a content type.
 
-use std::sync::Arc;
+use std::rc::Rc;
 
 use bytes::Bytes;
 use serde::Serialize;
@@ -19,7 +19,7 @@ pub const CONTENT_TYPE_BINARY: &str = "application/octet-stream";
 /// Handle to a key-value store. Cloning is cheap and clones share the storage.
 #[derive(Clone)]
 pub struct KeyValueStore {
-    backend: Arc<dyn KeyValueStoreBackend>,
+    backend: Rc<dyn KeyValueStoreBackend>,
 }
 
 impl std::fmt::Debug for KeyValueStore {
@@ -62,16 +62,16 @@ impl KeyValueStore {
         Ok(KeyValueStore { backend: storage.create_key_value_store_backend(id).await? })
     }
 
-    pub fn from_backend(backend: Arc<dyn KeyValueStoreBackend>) -> Self {
+    pub fn from_backend(backend: Rc<dyn KeyValueStoreBackend>) -> Self {
         KeyValueStore { backend }
     }
 
-    pub fn backend(&self) -> &Arc<dyn KeyValueStoreBackend> {
+    pub fn backend(&self) -> &Rc<dyn KeyValueStoreBackend> {
         &self.backend
     }
 
     pub fn same_storage(&self, other: &KeyValueStore) -> bool {
-        Arc::ptr_eq(&self.backend, &other.backend)
+        Rc::ptr_eq(&self.backend, &other.backend)
     }
 
     /// Reads a JSON record into `T`. Returns `None` if the key does not exist.
@@ -185,7 +185,7 @@ mod tests {
     use crate::storage::memory::MemoryStorageBackend;
     use serde_json::json;
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn json_text_and_bytes() {
         let storage = MemoryStorageBackend::new();
         let store = KeyValueStore::open(&storage, &StorageIdentifier::Default).await.unwrap();

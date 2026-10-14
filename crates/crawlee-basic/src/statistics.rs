@@ -4,32 +4,33 @@
 //! `CRAWLEE_CRAWLER_STATISTICS_{id}` in the default key-value store, in the record format of
 //! Crawlee for JS, and picks it up again when a crawl resumes.
 
+use crawlee_core::local::CellExt as _;
+use std::cell::Cell;
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use crawlee_core::recoverable_state::{BoxError, PersistedState};
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::cell::RefCell;
 
 /// Live counters, updated concurrently by request tasks.
 #[derive(Debug)]
 pub struct Statistics {
     id: String,
-    times: Mutex<Times>,
+    times: RefCell<Times>,
     /// The instance start was taken from a saved record, so `start()` keeps it.
-    restored: AtomicBool,
-    succeeded: AtomicU64,
-    failed: AtomicU64,
-    retries: AtomicU64,
-    skipped: AtomicU64,
-    succeeded_millis: AtomicU64,
-    failed_millis: AtomicU64,
-    min_millis: AtomicU64,
-    max_millis: AtomicU64,
-    detail: Mutex<Detail>,
+    restored: Cell<bool>,
+    succeeded: Cell<u64>,
+    failed: Cell<u64>,
+    retries: Cell<u64>,
+    skipped: Cell<u64>,
+    succeeded_millis: Cell<u64>,
+    failed_millis: Cell<u64>,
+    min_millis: Cell<u64>,
+    max_millis: Cell<u64>,
+    detail: RefCell<Detail>,
 }
 
 #[derive(Debug, Default)]
@@ -128,17 +129,17 @@ impl Statistics {
     pub fn with_id(id: impl Into<String>) -> Self {
         Statistics {
             id: id.into(),
-            times: Mutex::new(Times::default()),
-            restored: AtomicBool::new(false),
-            succeeded: AtomicU64::new(0),
-            failed: AtomicU64::new(0),
-            retries: AtomicU64::new(0),
-            skipped: AtomicU64::new(0),
-            succeeded_millis: AtomicU64::new(0),
-            failed_millis: AtomicU64::new(0),
-            min_millis: AtomicU64::new(u64::MAX),
-            max_millis: AtomicU64::new(0),
-            detail: Mutex::new(Detail::default()),
+            times: RefCell::new(Times::default()),
+            restored: Cell::new(false),
+            succeeded: Cell::new(0),
+            failed: Cell::new(0),
+            retries: Cell::new(0),
+            skipped: Cell::new(0),
+            succeeded_millis: Cell::new(0),
+            failed_millis: Cell::new(0),
+            min_millis: Cell::new(u64::MAX),
+            max_millis: Cell::new(0),
+            detail: RefCell::new(Detail::default()),
         }
     }
 
@@ -153,8 +154,8 @@ impl Statistics {
 
     pub fn start(&self) {
         let now = Utc::now();
-        let mut times = self.times.lock();
-        if !self.restored.load(Ordering::Acquire) || times.instance_start_millis.is_none() {
+        let mut times = self.times.borrow_mut();
+        if !self.restored.get() || times.instance_start_millis.is_none() {
             times.instance_start_millis = Some(now.timestamp_millis());
         }
         // A restored record keeps the start of the run it belongs to.
@@ -163,46 +164,46 @@ impl Statistics {
     }
 
     pub fn finish(&self) {
-        self.times.lock().finished_at = Some(Utc::now());
+        self.times.borrow_mut().finished_at = Some(Utc::now());
     }
     pub fn record_success(&self, duration: Duration, retry_count: u32) {
-        self.succeeded.fetch_add(1, Ordering::Relaxed);
+        self.succeeded.fetch_add(1);
         self.record_duration(duration, &self.succeeded_millis);
         self.record_retries(retry_count);
     }
 
     pub fn record_failure(&self, duration: Duration, retry_count: u32) {
-        self.failed.fetch_add(1, Ordering::Relaxed);
+        self.failed.fetch_add(1);
         self.record_duration(duration, &self.failed_millis);
         self.record_retries(retry_count);
     }
 
     pub fn record_skipped(&self) {
-        self.skipped.fetch_add(1, Ordering::Relaxed);
+        self.skipped.fetch_add(1);
     }
 
     pub fn record_retry(&self, message: &str) {
-        self.retries.fetch_add(1, Ordering::Relaxed);
-        *self.detail.lock().retry_errors.entry(error_group(message)).or_default() += 1;
+        self.retries.fetch_add(1);
+        *self.detail.borrow_mut().retry_errors.entry(error_group(message)).or_default() += 1;
     }
 
     pub fn record_error(&self, message: &str) {
-        *self.detail.lock().errors.entry(error_group(message)).or_default() += 1;
+        *self.detail.borrow_mut().errors.entry(error_group(message)).or_default() += 1;
     }
 
     pub fn record_status_code(&self, status: u16) {
-        *self.detail.lock().status_codes.entry(status).or_default() += 1;
+        *self.detail.borrow_mut().status_codes.entry(status).or_default() += 1;
     }
 
-    fn record_duration(&self, duration: Duration, total: &AtomicU64) {
+    fn record_duration(&self, duration: Duration, total: &Cell<u64>) {
         let ms = millis(duration);
-        total.fetch_add(ms, Ordering::Relaxed);
-        self.min_millis.fetch_min(ms, Ordering::Relaxed);
-        self.max_millis.fetch_max(ms, Ordering::Relaxed);
+        total.fetch_add(ms);
+        self.min_millis.fetch_min(ms);
+        self.max_millis.fetch_max(ms);
     }
 
     fn record_retries(&self, retry_count: u32) {
-        let mut detail = self.detail.lock();
+        let mut detail = self.detail.borrow_mut();
         let index = retry_count as usize;
         if detail.retry_histogram.len() <= index {
             detail.retry_histogram.resize(index + 1, 0);
@@ -211,22 +212,22 @@ impl Statistics {
     }
 
     pub fn requests_succeeded(&self) -> u64 {
-        self.succeeded.load(Ordering::Relaxed)
+        self.succeeded.get()
     }
 
     pub fn requests_failed(&self) -> u64 {
-        self.failed.load(Ordering::Relaxed)
+        self.failed.get()
     }
 
     /// Requests finished either way (skipped ones included).
     pub fn requests_finished(&self) -> u64 {
-        self.requests_succeeded() + self.requests_failed() + self.skipped.load(Ordering::Relaxed)
+        self.requests_succeeded() + self.requests_failed() + self.skipped.get()
     }
 
     /// Runtime so far: until `finish()`, or until now while running. It spans every run of a
     /// resumed crawl.
     fn runtime_millis(&self) -> u64 {
-        let times = self.times.lock();
+        let times = self.times.borrow_mut();
         let Some(start) = times.instance_start_millis else {
             return 0;
         };
@@ -243,28 +244,27 @@ impl Statistics {
         let per_minute = |count: u64, round: fn(f64) -> f64| {
             if minutes > 0.0 { round(count as f64 / minutes) as u64 } else { 0 }
         };
-        let avg = |total: &AtomicU64, count: u64| {
-            if count > 0 { (total.load(Ordering::Relaxed) as f64 / count as f64).round() as u64 } else { 0 }
+        let avg = |total: &Cell<u64>, count: u64| {
+            if count > 0 { (total.get() as f64 / count as f64).round() as u64 } else { 0 }
         };
-        let detail = self.detail.lock();
+        let detail = self.detail.borrow_mut();
 
         FinalStatistics {
             requests_succeeded: succeeded,
             requests_failed: failed,
-            requests_skipped: self.skipped.load(Ordering::Relaxed),
+            requests_skipped: self.skipped.get(),
             requests_total: succeeded + failed,
-            requests_retries: self.retries.load(Ordering::Relaxed),
+            requests_retries: self.retries.get(),
             request_avg_succeeded_duration_millis: avg(&self.succeeded_millis, succeeded),
             request_avg_failed_duration_millis: avg(&self.failed_millis, failed),
-            request_min_duration_millis: match self.min_millis.load(Ordering::Relaxed) {
+            request_min_duration_millis: match self.min_millis.get() {
                 u64::MAX => 0,
                 min => min,
             },
-            request_max_duration_millis: self.max_millis.load(Ordering::Relaxed),
+            request_max_duration_millis: self.max_millis.get(),
             requests_succeeded_per_minute: per_minute(succeeded, f64::round),
             requests_failed_per_minute: per_minute(failed, f64::floor),
-            request_total_duration_millis: self.succeeded_millis.load(Ordering::Relaxed)
-                + self.failed_millis.load(Ordering::Relaxed),
+            request_total_duration_millis: self.succeeded_millis.get() + self.failed_millis.get(),
             crawler_runtime_millis: runtime_millis,
             retry_histogram: detail.retry_histogram.clone(),
             status_codes: detail.status_codes.clone(),
@@ -275,7 +275,7 @@ impl Statistics {
 
     fn record(&self) -> StatisticsRecord {
         let stats = self.snapshot();
-        let times = self.times.lock();
+        let times = self.times.borrow_mut();
         let non_zero = |value: u64| (value > 0).then_some(value);
         StatisticsRecord {
             requests_succeeded: stats.requests_succeeded,
@@ -285,8 +285,8 @@ impl Statistics {
             requests_succeeded_per_minute: Some(stats.requests_succeeded_per_minute),
             request_min_duration_millis: (stats.requests_total > 0).then_some(stats.request_min_duration_millis),
             request_max_duration_millis: stats.request_max_duration_millis,
-            request_total_failed_duration_millis: self.failed_millis.load(Ordering::Relaxed),
-            request_total_succeeded_duration_millis: self.succeeded_millis.load(Ordering::Relaxed),
+            request_total_failed_duration_millis: self.failed_millis.get(),
+            request_total_succeeded_duration_millis: self.succeeded_millis.get(),
             crawler_started_at: times.started_at.map(iso),
             crawler_finished_at: times.finished_at.map(iso),
             stats_persisted_at: iso(Utc::now()),
@@ -322,26 +322,26 @@ impl PersistedState for Statistics {
         let status_codes =
             record.requests_with_status_code.iter().filter_map(|(code, n)| Some((code.parse().ok()?, *n))).collect();
 
-        self.succeeded.store(record.requests_succeeded, Ordering::Relaxed);
-        self.failed.store(record.requests_failed, Ordering::Relaxed);
-        self.retries.store(record.requests_retries, Ordering::Relaxed);
-        self.succeeded_millis.store(record.request_total_succeeded_duration_millis, Ordering::Relaxed);
-        self.failed_millis.store(record.request_total_failed_duration_millis, Ordering::Relaxed);
-        self.min_millis.store(record.request_min_duration_millis.unwrap_or(u64::MAX), Ordering::Relaxed);
-        self.max_millis.store(record.request_max_duration_millis, Ordering::Relaxed);
-        *self.detail.lock() = Detail {
+        self.succeeded.set(record.requests_succeeded);
+        self.failed.set(record.requests_failed);
+        self.retries.set(record.requests_retries);
+        self.succeeded_millis.set(record.request_total_succeeded_duration_millis);
+        self.failed_millis.set(record.request_total_failed_duration_millis);
+        self.min_millis.set(record.request_min_duration_millis.unwrap_or(u64::MAX));
+        self.max_millis.set(record.request_max_duration_millis);
+        *self.detail.borrow_mut() = Detail {
             retry_histogram: record.request_retry_histogram.iter().map(|count| count.unwrap_or(0)).collect(),
             status_codes,
             errors: serde_json::from_value(record.errors).unwrap_or_default(),
             retry_errors: serde_json::from_value(record.retry_errors).unwrap_or_default(),
         };
-        let mut times = self.times.lock();
+        let mut times = self.times.borrow_mut();
         // Rebased so the runtime continues from where the saved run was.
         times.instance_start_millis =
             Some(Utc::now().timestamp_millis() - (persisted_at - record.crawler_last_start_timestamp));
         times.started_at = started_at;
         times.finished_at = finished_at;
-        self.restored.store(true, Ordering::Release);
+        self.restored.set(true);
         Ok(())
     }
 
@@ -355,12 +355,12 @@ impl PersistedState for Statistics {
             &self.failed_millis,
             &self.max_millis,
         ] {
-            counter.store(0, Ordering::Relaxed);
+            counter.set(0);
         }
-        self.min_millis.store(u64::MAX, Ordering::Relaxed);
-        *self.detail.lock() = Detail::default();
-        *self.times.lock() = Times::default();
-        self.restored.store(false, Ordering::Release);
+        self.min_millis.set(u64::MAX);
+        *self.detail.borrow_mut() = Detail::default();
+        *self.times.borrow_mut() = Times::default();
+        self.restored.set(false);
     }
 }
 

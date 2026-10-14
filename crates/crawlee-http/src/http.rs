@@ -2,8 +2,8 @@
 
 use std::collections::HashSet;
 use std::ops::{Deref, DerefMut};
+use std::rc::Rc;
 use std::str::FromStr as _;
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -23,9 +23,9 @@ use crawlee_utils::{extract_charset_from_html_bytes, matches_enqueue_strategy};
 use crate::body::{Body, encoding_for_label};
 
 /// Called before the request is sent; may change it (headers, method, body).
-pub type PreNavigationHook = Arc<dyn Fn(&BasicContext, &mut HttpRequest) -> anyhow::Result<()> + Send + Sync>;
+pub type PreNavigationHook = Rc<dyn Fn(&BasicContext, &mut HttpRequest) -> anyhow::Result<()>>;
 /// Called after the response arrived, before the handler; may reject it by returning an error.
-pub type PostNavigationHook = Arc<dyn Fn(&HttpContext) -> anyhow::Result<()> + Send + Sync>;
+pub type PostNavigationHook = Rc<dyn Fn(&HttpContext) -> anyhow::Result<()>>;
 
 pub const MIME_HTML: &str = "text/html";
 pub const MIME_XHTML: &str = "application/xhtml+xml";
@@ -91,17 +91,14 @@ impl std::fmt::Debug for HttpCrawlerOptions {
 impl HttpCrawlerOptions {
     pub fn pre_navigation_hook(
         mut self,
-        hook: impl Fn(&BasicContext, &mut HttpRequest) -> anyhow::Result<()> + Send + Sync + 'static,
+        hook: impl Fn(&BasicContext, &mut HttpRequest) -> anyhow::Result<()> + 'static,
     ) -> Self {
-        self.pre_navigation_hooks.push(Arc::new(hook));
+        self.pre_navigation_hooks.push(Rc::new(hook));
         self
     }
 
-    pub fn post_navigation_hook(
-        mut self,
-        hook: impl Fn(&HttpContext) -> anyhow::Result<()> + Send + Sync + 'static,
-    ) -> Self {
-        self.post_navigation_hooks.push(Arc::new(hook));
+    pub fn post_navigation_hook(mut self, hook: impl Fn(&HttpContext) -> anyhow::Result<()> + 'static) -> Self {
+        self.post_navigation_hooks.push(Rc::new(hook));
         self
     }
 }
@@ -149,7 +146,7 @@ pub struct HttpContext {
     url: Url,
     redirects: Vec<Url>,
     content_type: ContentType,
-    body: Arc<Body>,
+    body: Rc<Body>,
 }
 
 impl std::fmt::Debug for HttpContext {
@@ -210,7 +207,7 @@ impl HttpContext {
         self.body.bytes()
     }
 
-    pub fn body_handle(&self) -> &Arc<Body> {
+    pub fn body_handle(&self) -> &Rc<Body> {
         &self.body
     }
 
@@ -228,8 +225,8 @@ impl HttpContext {
 /// The HTTP step of the pipeline: `BasicContext` in, `HttpContext` out.
 #[derive(Clone, Debug)]
 pub struct HttpPipeline {
-    options: Arc<HttpCrawlerOptions>,
-    supported_mime_types: Arc<HashSet<String>>,
+    options: Rc<HttpCrawlerOptions>,
+    supported_mime_types: Rc<HashSet<String>>,
 }
 
 impl HttpPipeline {
@@ -237,7 +234,7 @@ impl HttpPipeline {
         let mut supported: HashSet<String> =
             [MIME_HTML, MIME_XHTML, MIME_XML, MIME_TEXT_XML, MIME_JSON].into_iter().map(str::to_owned).collect();
         supported.extend(options.additional_mime_types.iter().map(|m| m.to_ascii_lowercase()));
-        HttpPipeline { options: Arc::new(options), supported_mime_types: Arc::new(supported) }
+        HttpPipeline { options: Rc::new(options), supported_mime_types: Rc::new(supported) }
     }
 
     pub fn options(&self) -> &HttpCrawlerOptions {
@@ -330,7 +327,7 @@ impl Default for HttpPipeline {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl Middleware<BasicContext> for HttpPipeline {
     type Out = HttpContext;
 
@@ -344,7 +341,7 @@ impl Middleware<BasicContext> for HttpPipeline {
             if self.options.save_response_cookies {
                 session.cookie_jar().clone()
             } else {
-                Arc::new((**session.cookie_jar()).clone())
+                Rc::new((**session.cookie_jar()).clone())
             }
         });
         let send_options = SendOptions {
@@ -412,7 +409,7 @@ impl Middleware<BasicContext> for HttpPipeline {
             url: response.url,
             redirects: response.redirects,
             content_type,
-            body: Arc::new(Body::new(response.body, encoding)),
+            body: Rc::new(Body::new(response.body, encoding)),
         };
         for hook in &self.options.post_navigation_hooks {
             hook(&http_ctx)?;

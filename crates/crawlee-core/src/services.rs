@@ -7,7 +7,7 @@
 
 use std::any::Any;
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::rc::Rc;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -24,14 +24,14 @@ use crate::storage::request_queue::RequestQueue;
 
 #[derive(Clone)]
 pub struct Services {
-    pub configuration: Arc<Configuration>,
-    pub storage: Arc<dyn StorageBackend>,
+    pub configuration: Rc<Configuration>,
+    pub storage: Rc<dyn StorageBackend>,
     pub events: EventManager,
     /// Values of [`auto_saved_value`](Self::auto_saved_value), by key.
-    auto_saved: Arc<tokio::sync::Mutex<HashMap<String, Arc<dyn Any + Send + Sync>>>>,
+    auto_saved: Rc<crate::local::Mutex<HashMap<String, Rc<dyn Any>>>>,
     /// Set once the run-scoped storages were purged, so that they are purged once per backend
     /// even when several crawlers run one after another.
-    purged: Arc<tokio::sync::OnceCell<()>>,
+    purged: Rc<crate::local::OnceCell<()>>,
 }
 
 impl std::fmt::Debug for Services {
@@ -40,7 +40,11 @@ impl std::fmt::Debug for Services {
     }
 }
 
-static GLOBAL: OnceLock<Services> = OnceLock::new();
+thread_local! {
+    /// The services of the thread, which is the process's: everything runs on one thread. Leaked
+    /// once, so that they can be handed out as `&'static`.
+    static GLOBAL: std::cell::OnceCell<&'static Services> = const { std::cell::OnceCell::new() };
+}
 
 #[derive(Debug, thiserror::Error)]
 #[error("the global services were already initialized; set them before first use")]
@@ -48,23 +52,23 @@ pub struct ServiceConflictError;
 
 impl Services {
     /// Services with the default [`Configuration`] and the given storage.
-    pub fn new(storage: Arc<dyn StorageBackend>) -> Self {
+    pub fn new(storage: Rc<dyn StorageBackend>) -> Self {
         Services::with_configuration(Configuration::default(), storage)
     }
 
     /// Services with the given storage and the local event manager (see [`EventManager::local`]).
-    pub fn with_configuration(configuration: Configuration, storage: Arc<dyn StorageBackend>) -> Self {
+    pub fn with_configuration(configuration: Configuration, storage: Rc<dyn StorageBackend>) -> Self {
         let events = EventManager::local(&configuration);
         Services::from_parts(configuration, storage, events)
     }
 
-    pub fn from_parts(configuration: Configuration, storage: Arc<dyn StorageBackend>, events: EventManager) -> Self {
+    pub fn from_parts(configuration: Configuration, storage: Rc<dyn StorageBackend>, events: EventManager) -> Self {
         Services {
-            configuration: Arc::new(configuration),
+            configuration: Rc::new(configuration),
             storage,
             events,
-            auto_saved: Arc::default(),
-            purged: Arc::default(),
+            auto_saved: Rc::default(),
+            purged: Rc::default(),
         }
     }
 
@@ -76,33 +80,40 @@ impl Services {
         #[cfg(feature = "fs-storage")]
         if configuration.persist_storage {
             let storage =
-                Arc::new(crate::storage::file_system::FileSystemStorageBackend::new(configuration.storage_dir.clone()));
+                Rc::new(crate::storage::file_system::FileSystemStorageBackend::new(configuration.storage_dir.clone()));
             return Services::with_configuration(configuration, storage);
         }
-        Services::with_configuration(configuration, Arc::new(MemoryStorageBackend::new()))
+        Services::with_configuration(configuration, Rc::new(MemoryStorageBackend::new()))
     }
 
     /// Services backed by a fresh in-memory storage, with the default configuration.
     pub fn in_memory() -> Self {
-        Services::new(Arc::new(MemoryStorageBackend::new()))
+        Services::new(Rc::new(MemoryStorageBackend::new()))
     }
 
     /// The process-wide services. Unless [`set_global`](Self::set_global) was called first, they
     /// are created on first use from [`Configuration::from_env`]: with the defaults, storages are
     /// files under `./storage`, as in Crawlee for JS.
     pub fn global() -> &'static Services {
-        GLOBAL.get_or_init(|| Services::from_configuration(Configuration::from_env()))
+        GLOBAL.with(|global| {
+            *global.get_or_init(|| Box::leak(Box::new(Services::from_configuration(Configuration::from_env()))))
+        })
     }
 
     /// Whether the process-wide services exist yet (read or set). An SDK that installs its own
     /// services checks this to detect storages used before it was initialized.
     pub fn is_global_set() -> bool {
-        GLOBAL.get().is_some()
+        GLOBAL.with(|global| global.get().is_some())
     }
 
     /// Sets the process-wide services. Fails once they have been read or set.
     pub fn set_global(services: Services) -> Result<(), ServiceConflictError> {
-        GLOBAL.set(services).map_err(|_| ServiceConflictError)
+        GLOBAL.with(|global| {
+            if global.get().is_some() {
+                return Err(ServiceConflictError);
+            }
+            global.set(Box::leak(Box::new(services))).map_err(|_| ServiceConflictError)
+        })
     }
 
     /// Empties the run-scoped storages (the default and aliased ones) if
@@ -122,10 +133,10 @@ impl Services {
     pub async fn auto_saved_value<T>(
         &self,
         key: &str,
-        default: impl Fn() -> T + Send + Sync + 'static,
-    ) -> StorageResult<Arc<SerdeState<T>>>
+        default: impl Fn() -> T + 'static,
+    ) -> StorageResult<Rc<SerdeState<T>>>
     where
-        T: Serialize + DeserializeOwned + Send + Sync + 'static,
+        T: Serialize + DeserializeOwned + 'static,
     {
         let mut values = self.auto_saved.lock().await;
         if let Some(value) = values.get(key) {
@@ -133,7 +144,7 @@ impl Services {
                 StorageError::InvalidArgument(format!("the value saved under '{key}' is used with another type"))
             });
         }
-        let state = Arc::new(SerdeState::new(default));
+        let state = Rc::new(SerdeState::new(default));
         // Never torn down: the final `PersistState` of `EventManager::close` saves it.
         RecoverableState::new(self, key, state.clone(), true).initialize().await?;
         values.insert(key.to_owned(), state.clone());

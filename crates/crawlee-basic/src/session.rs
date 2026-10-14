@@ -7,14 +7,15 @@
 //! in the record format of Crawlee for JS (cookies included, in tough-cookie's format), so a
 //! resumed crawl keeps its sessions.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use crawlee_core::local::CellExt as _;
+use std::cell::Cell;
+use std::rc::Rc;
 use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
-use parking_lot::Mutex;
 use rand::Rng as _;
 use serde_json::{Map, Value, json};
+use std::cell::RefCell;
 use url::Url;
 
 use crawlee_core::recoverable_state::{BoxError, PersistedState};
@@ -57,13 +58,13 @@ struct SessionState {
 #[derive(Debug)]
 pub struct Session {
     id: String,
-    cookie_jar: Arc<CookieJar>,
+    cookie_jar: Rc<CookieJar>,
     proxy_info: Option<ProxyInfo>,
     created_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
     options: SessionOptions,
-    user_data: Mutex<Map<String, Value>>,
-    state: Mutex<SessionState>,
+    user_data: RefCell<Map<String, Value>>,
+    state: RefCell<SessionState>,
 }
 
 fn iso(time: DateTime<Utc>) -> String {
@@ -86,24 +87,24 @@ impl Session {
         let expires_at = created_at + chrono::Duration::from_std(options.max_age).unwrap_or(chrono::Duration::MAX);
         Session {
             id,
-            cookie_jar: Arc::new(CookieJar::new()),
+            cookie_jar: Rc::new(CookieJar::new()),
             proxy_info,
             created_at,
             expires_at,
             options,
-            user_data: Mutex::new(Map::new()),
-            state: Mutex::new(SessionState { error_score: 0.0, usage_count: 0, retired: false }),
+            user_data: RefCell::new(Map::new()),
+            state: RefCell::new(SessionState { error_score: 0.0, usage_count: 0, retired: false }),
         }
     }
 
     /// The session as Crawlee for JS saves it (`Session.getState()`).
     pub fn to_state(&self) -> Value {
-        let state = self.state.lock();
+        let state = self.state.borrow_mut();
         json!({
             "id": self.id,
             "cookieJar": self.cookie_jar.to_json(),
             "proxyInfo": self.proxy_info.as_ref().map(proxy_info_json),
-            "userData": *self.user_data.lock(),
+            "userData": *self.user_data.borrow_mut(),
             "fingerprint": null,
             "maxErrorScore": self.options.max_error_score,
             "errorScoreDecrement": self.options.error_score_decrement,
@@ -141,13 +142,13 @@ impl Session {
         }
         Ok(Session {
             id,
-            cookie_jar: Arc::new(CookieJar::from_json(&record["cookieJar"])),
+            cookie_jar: Rc::new(CookieJar::from_json(&record["cookieJar"])),
             proxy_info,
             created_at,
             expires_at,
             options,
-            user_data: Mutex::new(record["userData"].as_object().cloned().unwrap_or_default()),
-            state: Mutex::new(SessionState {
+            user_data: RefCell::new(record["userData"].as_object().cloned().unwrap_or_default()),
+            state: RefCell::new(SessionState {
                 error_score: record["errorScore"].as_f64().unwrap_or(0.0),
                 usage_count: record["usageCount"].as_u64().map_or(0, |n| u32::try_from(n).unwrap_or(u32::MAX)),
                 retired: record["retired"].as_bool().unwrap_or(false),
@@ -156,15 +157,15 @@ impl Session {
     }
 
     /// Custom data kept with the session (and saved with it).
-    pub fn user_data(&self) -> parking_lot::MutexGuard<'_, Map<String, Value>> {
-        self.user_data.lock()
+    pub fn user_data(&self) -> std::cell::RefMut<'_, Map<String, Value>> {
+        self.user_data.borrow_mut()
     }
 
     pub fn id(&self) -> &str {
         &self.id
     }
 
-    pub fn cookie_jar(&self) -> &Arc<CookieJar> {
+    pub fn cookie_jar(&self) -> &Rc<CookieJar> {
         &self.cookie_jar
     }
 
@@ -173,15 +174,15 @@ impl Session {
     }
 
     pub fn error_score(&self) -> f64 {
-        self.state.lock().error_score
+        self.state.borrow_mut().error_score
     }
 
     pub fn usage_count(&self) -> u32 {
-        self.state.lock().usage_count
+        self.state.borrow_mut().usage_count
     }
 
     pub fn is_retired(&self) -> bool {
-        self.state.lock().retired
+        self.state.borrow_mut().retired
     }
 
     pub fn is_expired(&self) -> bool {
@@ -189,16 +190,16 @@ impl Session {
     }
 
     pub fn is_blocked(&self) -> bool {
-        self.state.lock().error_score >= self.options.max_error_score
+        self.state.borrow_mut().error_score >= self.options.max_error_score
     }
 
     pub fn is_max_usage_reached(&self) -> bool {
-        self.state.lock().usage_count >= self.options.max_usage_count
+        self.state.borrow_mut().usage_count >= self.options.max_usage_count
     }
 
     /// Whether the pool may hand this session out.
     pub fn is_usable(&self) -> bool {
-        let state = self.state.lock();
+        let state = self.state.borrow_mut();
         !state.retired
             && state.error_score < self.options.max_error_score
             && state.usage_count < self.options.max_usage_count
@@ -207,21 +208,21 @@ impl Session {
 
     /// The request succeeded: count the use and lower the error score.
     pub fn mark_good(&self) {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         state.usage_count += 1;
         state.error_score = (state.error_score - self.options.error_score_decrement).max(0.0);
     }
 
     /// The request failed: count the use and raise the error score.
     pub fn mark_bad(&self) {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         state.usage_count += 1;
         state.error_score += 1.0;
     }
 
     /// Takes the session out of rotation for good.
     pub fn retire(&self) {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         state.retired = true;
         state.usage_count += 1;
     }
@@ -251,8 +252,8 @@ pub enum SessionPoolError {
 pub struct SessionPool {
     id: String,
     options: SessionPoolOptions,
-    proxies: Option<Arc<dyn ProxySource>>,
-    sessions: Mutex<Vec<Arc<Session>>>,
+    proxies: Option<Rc<dyn ProxySource>>,
+    sessions: RefCell<Vec<Rc<Session>>>,
 }
 
 impl std::fmt::Debug for SessionPool {
@@ -263,13 +264,15 @@ impl std::fmt::Debug for SessionPool {
 
 impl SessionPool {
     /// A pool with the next process-wide id: `"0"` for the first pool, as in JS.
-    pub fn new(options: SessionPoolOptions, proxies: Option<Arc<dyn ProxySource>>) -> Self {
-        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
-        Self::with_id(NEXT_ID.fetch_add(1, Ordering::Relaxed).to_string(), options, proxies)
+    pub fn new(options: SessionPoolOptions, proxies: Option<Rc<dyn ProxySource>>) -> Self {
+        thread_local! {
+            static NEXT_ID: Cell<u64> = const { Cell::new(0) };
+        }
+        Self::with_id(NEXT_ID.with(|id| id.fetch_add(1)).to_string(), options, proxies)
     }
 
-    pub fn with_id(id: impl Into<String>, options: SessionPoolOptions, proxies: Option<Arc<dyn ProxySource>>) -> Self {
-        SessionPool { id: id.into(), options, proxies, sessions: Mutex::new(Vec::new()) }
+    pub fn with_id(id: impl Into<String>, options: SessionPoolOptions, proxies: Option<Rc<dyn ProxySource>>) -> Self {
+        SessionPool { id: id.into(), options, proxies, sessions: RefCell::new(Vec::new()) }
     }
 
     pub fn id(&self) -> &str {
@@ -281,21 +284,21 @@ impl SessionPool {
         format!("CRAWLEE_SESSION_POOL_STATE_{}", self.id)
     }
 
-    fn create_session(&self) -> Arc<Session> {
+    fn create_session(&self) -> Rc<Session> {
         let id = format!("session_{}", crawlee_core::request::crypto_random_object_id(10));
         let proxy = self.proxies.as_ref().and_then(|proxies| proxies.new_proxy_info(&id));
-        Arc::new(Session::new(id, proxy, self.options.session_options.clone()))
+        Rc::new(Session::new(id, proxy, self.options.session_options.clone()))
     }
 
     /// A new session, with a new proxy, that the pool does not keep: for crawlers without a
     /// session pool.
-    pub fn detached_session(&self) -> Arc<Session> {
+    pub fn detached_session(&self) -> Rc<Session> {
         self.create_session()
     }
 
     /// A session for the next request.
-    pub fn get_session(&self) -> Arc<Session> {
-        let mut sessions = self.sessions.lock();
+    pub fn get_session(&self) -> Rc<Session> {
+        let mut sessions = self.sessions.borrow_mut();
         if sessions.len() < self.options.max_pool_size.max(1) {
             let session = self.create_session();
             sessions.push(session.clone());
@@ -317,8 +320,8 @@ impl SessionPool {
     ///
     /// A session with the same id is replaced when it is no longer usable (retired, expired or used
     /// up), otherwise [`SessionPoolError::AlreadyExists`] is returned.
-    pub fn add_session(&self, session: Session) -> Result<Arc<Session>, SessionPoolError> {
-        let mut sessions = self.sessions.lock();
+    pub fn add_session(&self, session: Session) -> Result<Rc<Session>, SessionPoolError> {
+        let mut sessions = self.sessions.borrow_mut();
         if let Some(index) = sessions.iter().position(|existing| existing.id() == session.id()) {
             if sessions[index].is_usable() {
                 return Err(SessionPoolError::AlreadyExists(session.id));
@@ -326,28 +329,28 @@ impl SessionPool {
             let removed = sessions.remove(index);
             tracing::debug!("Removed Session - {}", removed.id());
         }
-        let session = Arc::new(session);
+        let session = Rc::new(session);
         sessions.push(session.clone());
         Ok(session)
     }
 
     /// The usable session with this id, if any.
-    pub fn get_session_by_id(&self, id: &str) -> Option<Arc<Session>> {
-        self.sessions.lock().iter().find(|session| session.id() == id && session.is_usable()).cloned()
+    pub fn get_session_by_id(&self, id: &str) -> Option<Rc<Session>> {
+        self.sessions.borrow_mut().iter().find(|session| session.id() == id && session.is_usable()).cloned()
     }
 
     pub fn usable_count(&self) -> usize {
-        self.sessions.lock().iter().filter(|session| session.is_usable()).count()
+        self.sessions.borrow_mut().iter().filter(|session| session.is_usable()).count()
     }
 
     pub fn retired_count(&self) -> usize {
-        self.sessions.lock().iter().filter(|session| !session.is_usable()).count()
+        self.sessions.borrow_mut().iter().filter(|session| !session.is_usable()).count()
     }
 }
 
 impl PersistedState for SessionPool {
     fn to_record(&self) -> Value {
-        let sessions = self.sessions.lock();
+        let sessions = self.sessions.borrow_mut();
         let usable = sessions.iter().filter(|session| session.is_usable()).count();
         json!({
             "usableSessionsCount": usable,
@@ -372,15 +375,15 @@ impl PersistedState for SessionPool {
                 };
             }
         }
-        let usable: Vec<Arc<Session>> =
-            sessions.into_iter().filter(|session| session.is_usable()).map(Arc::new).collect();
+        let usable: Vec<Rc<Session>> =
+            sessions.into_iter().filter(|session| session.is_usable()).map(Rc::new).collect();
         tracing::debug!("{} active sessions loaded from the key-value store", usable.len());
-        *self.sessions.lock() = usable;
+        *self.sessions.borrow_mut() = usable;
         Ok(())
     }
 
     fn reset(&self) {
-        self.sessions.lock().clear();
+        self.sessions.borrow_mut().clear();
     }
 }
 
@@ -433,8 +436,8 @@ mod tests {
 
         pinned.retire();
         let replacement = pool.add_session(Session::new("pinned".into(), None, SessionOptions::default())).unwrap();
-        assert!(!Arc::ptr_eq(&pinned, &replacement));
-        assert!(Arc::ptr_eq(&pool.get_session_by_id("pinned").unwrap(), &replacement));
+        assert!(!Rc::ptr_eq(&pinned, &replacement));
+        assert!(Rc::ptr_eq(&pool.get_session_by_id("pinned").unwrap(), &replacement));
         assert_eq!(pool.retired_count(), 0, "the retired session is gone");
     }
 
@@ -458,7 +461,7 @@ mod tests {
         .unwrap();
         let record = pool.to_record();
 
-        let restored = SessionPool::with_id("0", SessionPoolOptions::default(), Some(Arc::new(Refresh)));
+        let restored = SessionPool::with_id("0", SessionPoolOptions::default(), Some(Rc::new(Refresh)));
         restored.restore(record).unwrap();
         assert_eq!(restored.get_session_by_id("s").unwrap().proxy_info().unwrap().hostname, "new");
     }

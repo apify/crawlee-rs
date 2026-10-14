@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
+use std::rc::Rc;
 
 use serde::de::DeserializeOwned;
 
@@ -12,7 +12,7 @@ use crate::context::CrawlingContext;
 use crate::errors::MissingRouteError;
 use crate::handler::{BoxFuture, RequestHandler};
 
-type Route<C> = Arc<dyn RequestHandler<C>>;
+type Route<C> = Rc<dyn RequestHandler<C>>;
 
 /// Dispatches requests to handlers by label, falling back to the default handler.
 ///
@@ -52,12 +52,12 @@ impl<C: CrawlingContext> Router<C> {
     }
 
     pub fn add_handler(&mut self, label: impl Into<String>, handler: impl RequestHandler<C>) -> &mut Self {
-        self.routes.insert(label.into(), Arc::new(handler));
+        self.routes.insert(label.into(), Rc::new(handler));
         self
     }
 
     pub fn add_default_handler(&mut self, handler: impl RequestHandler<C>) -> &mut Self {
-        self.default = Some(Arc::new(handler));
+        self.default = Some(Rc::new(handler));
         self
     }
 
@@ -66,13 +66,13 @@ impl<C: CrawlingContext> Router<C> {
     /// Crawlee for JS.
     pub fn add_typed_handler<T, F, Fut>(&mut self, label: impl Into<String>, handler: F) -> &mut Self
     where
-        T: DeserializeOwned + Send + 'static,
-        F: Fn(C, T) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
+        T: DeserializeOwned + 'static,
+        F: Fn(C, T) -> Fut + 'static,
+        Fut: Future<Output = anyhow::Result<()>> + 'static,
     {
         let label = label.into();
         let route_label = label.clone();
-        let handler = Arc::new(handler);
+        let handler = Rc::new(handler);
         self.add_handler(label, move |ctx: C| {
             let handler = handler.clone();
             let parsed = ctx.basic().request().user_data_as::<T>();

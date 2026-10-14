@@ -1,7 +1,8 @@
 //! Proxy rotation. Each new session gets the next proxy; a session keeps its proxy for life, so
 //! rotating a blocked session also rotates its proxy.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use crawlee_core::local::CellExt as _;
+use std::cell::Cell;
 
 use url::Url;
 
@@ -28,7 +29,7 @@ impl ProxyInfo {
 }
 
 /// Source of proxies for new sessions.
-pub trait ProxySource: Send + Sync {
+pub trait ProxySource {
     /// The proxy for a new session, or `None` to connect directly.
     fn new_proxy_info(&self, session_id: &str) -> Option<ProxyInfo>;
 
@@ -46,7 +47,7 @@ pub trait ProxySource: Send + Sync {
 #[derive(Debug)]
 pub struct ProxyConfiguration {
     urls: Vec<Url>,
-    next: AtomicUsize,
+    next: Cell<usize>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -79,7 +80,7 @@ impl ProxyConfiguration {
                 Ok(url)
             })
             .collect::<Result<Vec<_>, _>>()?;
-        Ok(ProxyConfiguration { urls, next: AtomicUsize::new(0) })
+        Ok(ProxyConfiguration { urls, next: Cell::new(0) })
     }
 }
 
@@ -88,7 +89,7 @@ impl ProxySource for ProxyConfiguration {
         if self.urls.is_empty() {
             return None;
         }
-        let index = self.next.fetch_add(1, Ordering::Relaxed) % self.urls.len();
+        let index = self.next.fetch_add(1) % self.urls.len();
         Some(ProxyInfo::from_url(self.urls[index].clone()))
     }
 }

@@ -1,7 +1,7 @@
 //! Enqueueing found URLs: strategy and pattern filtering, depth limits and request creation.
 
 use std::collections::HashSet;
-use std::sync::Arc;
+use std::rc::Rc;
 
 use serde_json::{Map, Value};
 use url::Url;
@@ -15,7 +15,7 @@ use crawlee_utils::{EnqueueStrategy, UrlFilter, UrlPattern, matches_enqueue_stra
 use crate::context::BasicContext;
 
 /// Changes a request before it is enqueued, or drops it by returning `None`.
-pub type RequestTransform = Arc<dyn Fn(Request) -> Option<Request> + Send + Sync>;
+pub type RequestTransform = Rc<dyn Fn(Request) -> Option<Request>>;
 
 /// Options of `enqueue_links`, mirroring `EnqueueLinksOptions` of Crawlee for JS.
 #[derive(Clone, Default)]
@@ -108,8 +108,8 @@ impl EnqueueLinksOptions {
         self
     }
 
-    pub fn transform(mut self, transform: impl Fn(Request) -> Option<Request> + Send + Sync + 'static) -> Self {
-        self.transform = Some(Arc::new(transform));
+    pub fn transform(mut self, transform: impl Fn(Request) -> Option<Request> + 'static) -> Self {
+        self.transform = Some(Rc::new(transform));
         self
     }
 }

@@ -7,7 +7,7 @@
 //! serialized once, in the request handler, and a backend that talks to an HTTP API (such as the
 //! Apify platform) can send those bytes as they are.
 
-use std::sync::Arc;
+use std::rc::Rc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -108,8 +108,8 @@ pub struct PaginatedList<T> {
 /// A dataset item as JSON text. Backends store it verbatim.
 pub type DatasetItem = Box<RawValue>;
 
-#[async_trait]
-pub trait DatasetBackend: Send + Sync {
+#[async_trait(?Send)]
+pub trait DatasetBackend {
     async fn get_metadata(&self) -> StorageResult<DatasetInfo>;
     /// Removes the dataset and its items.
     async fn drop_storage(&self) -> StorageResult<()>;
@@ -154,8 +154,8 @@ pub struct KeyValueStoreListKeysResult {
     pub next_exclusive_start_key: Option<String>,
 }
 
-#[async_trait]
-pub trait KeyValueStoreBackend: Send + Sync {
+#[async_trait(?Send)]
+pub trait KeyValueStoreBackend {
     async fn get_metadata(&self) -> StorageResult<KeyValueStoreInfo>;
     async fn drop_storage(&self) -> StorageResult<()>;
     async fn purge(&self) -> StorageResult<()>;
@@ -205,8 +205,8 @@ pub struct QueueOperationInfo {
 
 /// Operations on one request queue. The backend owns all bookkeeping (pending, in progress,
 /// handled) and any locking needed when several clients share a queue.
-#[async_trait]
-pub trait RequestQueueBackend: Send + Sync {
+#[async_trait(?Send)]
+pub trait RequestQueueBackend {
     async fn get_metadata(&self) -> StorageResult<RequestQueueInfo>;
     async fn drop_storage(&self) -> StorageResult<()>;
     async fn purge(&self) -> StorageResult<()>;
@@ -238,15 +238,14 @@ pub trait RequestQueueBackend: Send + Sync {
 }
 
 /// Factory of storage backends: opens (or creates) a storage by its identifier.
-#[async_trait]
-pub trait StorageBackend: Send + Sync {
-    async fn create_dataset_backend(&self, id: &StorageIdentifier) -> StorageResult<Arc<dyn DatasetBackend>>;
+#[async_trait(?Send)]
+pub trait StorageBackend {
+    async fn create_dataset_backend(&self, id: &StorageIdentifier) -> StorageResult<Rc<dyn DatasetBackend>>;
     async fn create_key_value_store_backend(
         &self,
         id: &StorageIdentifier,
-    ) -> StorageResult<Arc<dyn KeyValueStoreBackend>>;
-    async fn create_request_queue_backend(&self, id: &StorageIdentifier)
-    -> StorageResult<Arc<dyn RequestQueueBackend>>;
+    ) -> StorageResult<Rc<dyn KeyValueStoreBackend>>;
+    async fn create_request_queue_backend(&self, id: &StorageIdentifier) -> StorageResult<Rc<dyn RequestQueueBackend>>;
     async fn storage_exists(&self, _id: &str, _kind: StorageKind) -> StorageResult<bool> {
         Ok(false)
     }

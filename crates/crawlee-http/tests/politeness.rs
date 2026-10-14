@@ -4,7 +4,7 @@
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use axum::Router as AxumRouter;
@@ -12,7 +12,7 @@ use axum::extract::{Path, State};
 use axum::http::{StatusCode, header};
 use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
-use parking_lot::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crawlee_basic::{SitemapRequestLoader, SitemapRequestLoaderOptions};
 use crawlee_core::{RequestManagerTandem, Services, StorageIdentifier};
@@ -27,18 +27,18 @@ struct Site {
 
 impl Site {
     fn hit(&self, path: &str) -> usize {
-        let mut hits = self.hits.lock();
+        let mut hits = self.hits.lock().unwrap();
         let count = hits.entry(path.to_owned()).or_default();
         *count += 1;
         *count
     }
 
     fn hits(&self, path: &str) -> usize {
-        self.hits.lock().get(path).copied().unwrap_or(0)
+        self.hits.lock().unwrap().get(path).copied().unwrap_or(0)
     }
 
     fn base(&self) -> String {
-        format!("http://{}", self.addr.lock().unwrap())
+        format!("http://{}", self.addr.lock().unwrap().unwrap())
     }
 }
 
@@ -100,8 +100,8 @@ async fn serve(robots: Option<&'static str>) -> Site {
         .route("/sitemaps/{name}", get(sitemap))
         .with_state(site.clone());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    *site.addr.lock() = Some(listener.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    *site.addr.lock().unwrap() = Some(listener.local_addr().unwrap());
+    tokio::task::spawn_local(async move { axum::serve(listener, app).await.unwrap() });
     site
 }
 
@@ -113,7 +113,7 @@ fn titles_crawler(services: Services) -> crawlee_basic::BasicCrawlerBuilder<craw
     })
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn robots_txt_is_respected() {
     let site = serve(Some("User-agent: *\nDisallow: /private/\n")).await;
     let crawler = titles_crawler(Services::in_memory()).respect_robots_txt(true).build().unwrap();
@@ -127,7 +127,7 @@ async fn robots_txt_is_respected() {
     assert_eq!(site.hits("/robots.txt"), 1, "fetched once per origin");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn missing_robots_txt_allows_everything_and_is_cached() {
     let site = serve(None).await;
     let crawler = titles_crawler(Services::in_memory()).respect_robots_txt(true).build().unwrap();
@@ -136,7 +136,7 @@ async fn missing_robots_txt_allows_everything_and_is_cached() {
     assert_eq!(site.hits("/robots.txt"), 1, "a 404 is cached as allow-all");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn rate_limited_requests_wait_for_retry_after() {
     let site = serve(None).await;
     let crawler = titles_crawler(Services::in_memory()).same_domain_delay(Duration::from_millis(1)).build().unwrap();
@@ -148,7 +148,7 @@ async fn rate_limited_requests_wait_for_retry_after() {
     assert!(started.elapsed() >= Duration::from_secs(1), "Retry-After: 1 was honoured");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn crawls_the_pages_of_sitemaps() {
     let site = serve(None).await;
     let base = site.base();
@@ -156,11 +156,11 @@ async fn crawls_the_pages_of_sitemaps() {
     let mut options = SitemapRequestLoaderOptions::new([format!("{base}/sitemaps/index.xml")]);
     options.exclude = vec![crawlee_utils::UrlPattern::glob("**/excluded")];
     let loader = SitemapRequestLoader::open(options, &services, crawlee_http_client::default_client()).await.unwrap();
-    let queue = Arc::new(services.open_request_queue(&StorageIdentifier::Default).await.unwrap());
+    let queue = Rc::new(services.open_request_queue(&StorageIdentifier::Default).await.unwrap());
 
     let crawler = HtmlCrawler::builder()
         .services(services)
-        .request_manager(Arc::new(RequestManagerTandem::new(loader.clone(), queue)))
+        .request_manager(Rc::new(RequestManagerTandem::new(loader.clone(), queue)))
         .request_handler(|ctx: HtmlContext| async move {
             ctx.push_data(&serde_json::json!({ "url": ctx.request().url }))?;
             Ok(())

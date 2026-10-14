@@ -13,7 +13,7 @@
 //! queue, which handles retries:
 //!
 //! ```no_run
-//! # use std::sync::Arc;
+//! # use std::rc::Rc;
 //! # use crawlee_basic::sitemap_loader::{SitemapRequestLoader, SitemapRequestLoaderOptions};
 //! # use crawlee_core::{RequestManagerTandem, Services, StorageIdentifier};
 //! # async fn run(services: Services) -> anyhow::Result<()> {
@@ -23,21 +23,21 @@
 //!     crawlee_http_client::default_client(),
 //! )
 //! .await?;
-//! let queue = Arc::new(services.open_request_queue(&StorageIdentifier::Default).await?);
-//! let manager = Arc::new(RequestManagerTandem::new(loader, queue));
+//! let queue = Rc::new(services.open_request_queue(&StorageIdentifier::Default).await?);
+//! let manager = Rc::new(RequestManagerTandem::new(loader, queue));
 //! # Ok(()) }
 //! ```
 
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::sync::Arc;
+use std::rc::Rc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use crawlee_core::local::Notify;
 use indexmap::IndexSet;
-use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::Notify;
+use std::cell::RefCell;
 use tokio::task::JoinHandle;
 
 use crawlee_core::recoverable_state::{BoxError, PersistedState};
@@ -130,7 +130,7 @@ impl LoaderState {
 }
 
 struct Shared {
-    state: Mutex<LoaderState>,
+    state: RefCell<LoaderState>,
     /// Woken when the buffer has room or the loader closes.
     space: Notify,
     filter: UrlFilter,
@@ -141,7 +141,7 @@ struct Shared {
 
 impl PersistedState for Shared {
     fn to_record(&self) -> Value {
-        let state = self.state.lock();
+        let state = self.state.borrow_mut();
         let record = Record {
             sitemap_parsing_progress: Progress {
                 pending_sitemap_urls: state.pending_sitemaps.iter().cloned().collect(),
@@ -159,7 +159,7 @@ impl PersistedState for Shared {
 
     fn restore(&self, record: Value) -> Result<(), BoxError> {
         let record: Record = serde_json::from_value(record)?;
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         *state = LoaderState {
             queue: record.url_queue.into(),
             request_data: record.request_data.into_iter().collect(),
@@ -174,7 +174,7 @@ impl PersistedState for Shared {
     }
 
     fn reset(&self) {
-        *self.state.lock() =
+        *self.state.borrow_mut() =
             LoaderState { pending_sitemaps: self.initial_sitemaps.iter().cloned().collect(), ..LoaderState::default() };
     }
 }
@@ -190,7 +190,7 @@ impl Shared {
             tokio::pin!(space);
             space.as_mut().enable();
             {
-                let mut state = self.state.lock();
+                let mut state = self.state.borrow_mut();
                 if state.closed {
                     return;
                 }
@@ -203,11 +203,11 @@ impl Shared {
         }
     }
 
-    async fn load(&self, client: Arc<dyn HttpClient>, options: SitemapOptions) {
+    async fn load(&self, client: Rc<dyn HttpClient>, options: SitemapOptions) {
         let options = SitemapOptions { max_depth: Some(0), enqueue_strategy: self.strategy, ..options };
         loop {
             let sitemap = {
-                let mut state = self.state.lock();
+                let mut state = self.state.borrow_mut();
                 if state.abort_loading {
                     break;
                 }
@@ -218,9 +218,9 @@ impl Shared {
             };
 
             if let Some(contents) = fetch_sitemap(&sitemap, client.as_ref(), &options).await {
-                self.state.lock().pending_sitemaps.extend(contents.nested_sitemaps);
+                self.state.borrow_mut().pending_sitemaps.extend(contents.nested_sitemaps);
                 for page in contents.pages {
-                    let seen = !self.state.lock().in_progress_entries.insert(page.loc.clone());
+                    let seen = !self.state.borrow_mut().in_progress_entries.insert(page.loc.clone());
                     if !seen {
                         self.push_url(page.loc).await;
                     }
@@ -229,7 +229,7 @@ impl Shared {
                 tracing::error!("Error loading sitemap contents: {sitemap}");
             }
 
-            let mut state = self.state.lock();
+            let mut state = self.state.borrow_mut();
             state.pending_sitemaps.shift_remove(&sitemap);
             state.in_progress_entries.clear();
             state.in_progress_sitemap = None;
@@ -239,7 +239,7 @@ impl Shared {
 
 /// Crawls the pages of sitemaps; see the [module documentation](self).
 pub struct SitemapRequestLoader {
-    shared: Arc<Shared>,
+    shared: Rc<Shared>,
     persistence: RecoverableState<Shared>,
     tasks: Vec<JoinHandle<()>>,
 }
@@ -249,10 +249,10 @@ impl SitemapRequestLoader {
     pub async fn open(
         options: SitemapRequestLoaderOptions,
         services: &Services,
-        client: Arc<dyn HttpClient>,
-    ) -> Result<Arc<Self>, SitemapLoaderError> {
-        let shared = Arc::new(Shared {
-            state: Mutex::new(LoaderState::default()),
+        client: Rc<dyn HttpClient>,
+    ) -> Result<Rc<Self>, SitemapLoaderError> {
+        let shared = Rc::new(Shared {
+            state: RefCell::new(LoaderState::default()),
             space: Notify::new(),
             filter: UrlFilter::new(&options.include, &options.exclude)?,
             strategy: options.enqueue_strategy,
@@ -272,26 +272,26 @@ impl SitemapRequestLoader {
 
         let mut tasks = Vec::new();
         let loader = shared.clone();
-        tasks.push(tokio::spawn(async move { loader.load(client, options.sitemap).await }));
+        tasks.push(tokio::task::spawn_local(async move { loader.load(client, options.sitemap).await }));
         if let Some(timeout) = options.timeout {
             let shared = shared.clone();
-            tasks.push(tokio::spawn(async move {
+            tasks.push(tokio::task::spawn_local(async move {
                 tokio::time::sleep(timeout).await;
-                shared.state.lock().abort_loading = true;
+                shared.state.borrow_mut().abort_loading = true;
             }));
         }
-        Ok(Arc::new(SitemapRequestLoader { shared, persistence, tasks }))
+        Ok(Rc::new(SitemapRequestLoader { shared, persistence, tasks }))
     }
 
     /// Whether every sitemap has been loaded.
     pub fn is_sitemap_fully_loaded(&self) -> bool {
-        self.shared.state.lock().fully_loaded()
+        self.shared.state.borrow_mut().fully_loaded()
     }
 
     /// Stops loading and saves the state.
     pub async fn teardown(&self) {
         {
-            let mut state = self.shared.state.lock();
+            let mut state = self.shared.state.borrow_mut();
             state.closed = true;
             state.abort_loading = true;
         }
@@ -316,11 +316,11 @@ pub enum SitemapLoaderError {
     Storage(#[from] crawlee_core::StorageError),
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl RequestLoader for SitemapRequestLoader {
     async fn fetch_next_request(&self) -> StorageResult<Option<Request>> {
         let request = {
-            let mut state = self.shared.state.lock();
+            let mut state = self.shared.state.borrow_mut();
             if state.closed {
                 return Ok(None);
             }
@@ -345,7 +345,7 @@ impl RequestLoader for SitemapRequestLoader {
     }
 
     async fn mark_request_as_handled(&self, request: &Request) -> StorageResult<()> {
-        let mut state = self.shared.state.lock();
+        let mut state = self.shared.state.borrow_mut();
         state.handled += 1;
         state.in_progress.shift_remove(&request.url);
         state.request_data.remove(&request.url);
@@ -353,7 +353,7 @@ impl RequestLoader for SitemapRequestLoader {
     }
 
     async fn status(&self) -> StorageResult<LoaderStatus> {
-        let state = self.shared.state.lock();
+        let state = self.shared.state.borrow_mut();
         Ok(if !state.queue.is_empty() && !state.closed {
             LoaderStatus::Ready
         } else if !state.fully_loaded() && !state.abort_loading {
@@ -366,11 +366,11 @@ impl RequestLoader for SitemapRequestLoader {
     }
 
     async fn handled_count(&self) -> StorageResult<u64> {
-        Ok(self.shared.state.lock().handled)
+        Ok(self.shared.state.borrow_mut().handled)
     }
 
     async fn pending_count(&self) -> StorageResult<u64> {
-        let state = self.shared.state.lock();
+        let state = self.shared.state.borrow_mut();
         Ok((state.queue.len() + state.in_progress.len()) as u64)
     }
 }
@@ -381,7 +381,7 @@ mod tests {
 
     fn shared() -> Shared {
         let shared = Shared {
-            state: Mutex::new(LoaderState::default()),
+            state: RefCell::new(LoaderState::default()),
             space: Notify::new(),
             filter: UrlFilter::new(&[], &[]).unwrap(),
             strategy: EnqueueStrategy::SameHostname,
@@ -396,7 +396,7 @@ mod tests {
     fn record_has_the_js_shape_and_round_trips() {
         let original = shared();
         {
-            let mut state = original.state.lock();
+            let mut state = original.state.borrow_mut();
             state.queue.push_back("https://a.test/2".into());
             state.in_progress.insert("https://a.test/1".into());
             state.request_data.insert("https://a.test/1".into(), Request::new("https://a.test/1"));
@@ -412,7 +412,7 @@ mod tests {
 
         let restored = shared();
         restored.restore(record).unwrap();
-        let state = restored.state.lock();
+        let state = restored.state.borrow_mut();
         assert_eq!(state.queue, ["https://a.test/1", "https://a.test/2"], "in-progress pages are queued again");
         assert!(state.request_data.contains_key("https://a.test/1"));
         assert!(!state.fully_loaded());

@@ -1,13 +1,14 @@
 //! The crawling context handed to request handlers.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use crawlee_core::local::CellExt as _;
+use std::cell::Cell;
+use std::rc::Rc;
 use std::time::Duration;
 
-use parking_lot::Mutex;
+use crawlee_core::local::Notify;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
-use tokio::sync::Notify;
+use std::cell::RefCell;
 
 use crawlee_core::storage::backend::BatchAddRequestsResult;
 use crawlee_core::{
@@ -25,11 +26,11 @@ use crate::statistics::Statistics;
 /// Everything request tasks of one crawler share.
 pub struct CrawlerShared {
     pub services: Services,
-    pub request_manager: Arc<dyn RequestManager>,
+    pub request_manager: Rc<dyn RequestManager>,
     pub dataset: Dataset,
     pub key_value_store: KeyValueStore,
-    pub http_client: Arc<dyn HttpClient>,
-    pub statistics: Arc<Statistics>,
+    pub http_client: Rc<dyn HttpClient>,
+    pub statistics: Rc<Statistics>,
     pub max_crawl_depth: Option<u32>,
     /// Timeout for `send_request` from handlers.
     pub send_request_timeout: Duration,
@@ -39,17 +40,17 @@ pub struct CrawlerShared {
     /// with an explicit id.
     pub(crate) state_key: String,
     /// Set by `pause()`: the task loop starts no new requests.
-    pub(crate) paused: AtomicBool,
+    pub(crate) paused: Cell<bool>,
     /// Woken by `resume()`.
     pub(crate) resumed: Notify,
     /// Requests being processed right now.
-    pub(crate) in_flight: AtomicUsize,
+    pub(crate) in_flight: Cell<usize>,
     /// Woken when `in_flight` drops to zero.
     pub(crate) drained: Notify,
     /// robots.txt files, when the crawler respects them.
     pub(crate) robots: Option<RobotsCache>,
     /// Domains already warned about (unpaced 429s and crawl delays).
-    pub(crate) warned: Mutex<std::collections::HashSet<String>>,
+    pub(crate) warned: RefCell<std::collections::HashSet<String>>,
 }
 
 fn hostname_of(url: &str) -> String {
@@ -58,7 +59,7 @@ fn hostname_of(url: &str) -> String {
 
 impl CrawlerShared {
     fn warn_once(&self, key: String, message: impl FnOnce() -> String) {
-        if self.warned.lock().insert(key) {
+        if self.warned.borrow_mut().insert(key) {
             tracing::warn!("{}", message());
         }
     }
@@ -112,7 +113,7 @@ impl CrawlerShared {
             let drained = self.drained.notified();
             tokio::pin!(drained);
             drained.as_mut().enable();
-            if self.in_flight.load(Ordering::Acquire) == 0 {
+            if self.in_flight.get() == 0 {
                 return;
             }
             drained.await;
@@ -121,18 +122,18 @@ impl CrawlerShared {
 }
 
 /// Counts a request as in flight while alive.
-pub(crate) struct InFlight(pub(crate) Arc<CrawlerShared>);
+pub(crate) struct InFlight(pub(crate) Rc<CrawlerShared>);
 
 impl InFlight {
-    pub(crate) fn new(shared: Arc<CrawlerShared>) -> Self {
-        shared.in_flight.fetch_add(1, Ordering::AcqRel);
+    pub(crate) fn new(shared: Rc<CrawlerShared>) -> Self {
+        shared.in_flight.fetch_add(1);
         InFlight(shared)
     }
 }
 
 impl Drop for InFlight {
     fn drop(&mut self) {
-        if self.0.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+        if self.0.in_flight.fetch_sub(1) == 1 {
             self.0.drained.notify_waiters();
         }
     }
@@ -140,20 +141,20 @@ impl Drop for InFlight {
 
 /// Per-request state shared between the crawler and the context.
 pub struct RequestScope {
-    pub(crate) shared: Arc<CrawlerShared>,
-    pub(crate) session: Option<Arc<Session>>,
+    pub(crate) shared: Rc<CrawlerShared>,
+    pub(crate) session: Option<Rc<Session>>,
     pub(crate) transaction: StorageTransaction,
     /// The context hands its request back here when it is dropped.
-    returned: Mutex<Option<Request>>,
+    returned: RefCell<Option<Request>>,
 }
 
 impl RequestScope {
-    pub(crate) fn new(shared: Arc<CrawlerShared>, session: Option<Arc<Session>>) -> Arc<Self> {
-        Arc::new(RequestScope { shared, session, transaction: StorageTransaction::new(), returned: Mutex::new(None) })
+    pub(crate) fn new(shared: Rc<CrawlerShared>, session: Option<Rc<Session>>) -> Rc<Self> {
+        Rc::new(RequestScope { shared, session, transaction: StorageTransaction::new(), returned: RefCell::new(None) })
     }
 
     pub(crate) fn take_returned(&self) -> Option<Request> {
-        self.returned.lock().take()
+        self.returned.borrow_mut().take()
     }
 }
 
@@ -167,7 +168,7 @@ impl RequestScope {
 /// applied only if the handler succeeds.
 pub struct BasicContext {
     request: Option<Request>,
-    scope: Arc<RequestScope>,
+    scope: Rc<RequestScope>,
 }
 
 impl std::fmt::Debug for BasicContext {
@@ -179,7 +180,7 @@ impl std::fmt::Debug for BasicContext {
 impl Drop for BasicContext {
     fn drop(&mut self) {
         if let Some(request) = self.request.take() {
-            *self.scope.returned.lock() = Some(request);
+            *self.scope.returned.borrow_mut() = Some(request);
         }
     }
 }
@@ -187,7 +188,7 @@ impl Drop for BasicContext {
 const PRESENT: &str = "the request is present until the context is dropped";
 
 impl BasicContext {
-    pub(crate) fn new(request: Request, scope: Arc<RequestScope>) -> Self {
+    pub(crate) fn new(request: Request, scope: Rc<RequestScope>) -> Self {
         BasicContext { request: Some(request), scope }
     }
 
@@ -214,7 +215,7 @@ impl BasicContext {
         self.request.as_mut().expect(PRESENT)
     }
 
-    pub fn session(&self) -> Option<&Arc<Session>> {
+    pub fn session(&self) -> Option<&Rc<Session>> {
         self.scope.session.as_ref()
     }
 
@@ -240,11 +241,11 @@ impl BasicContext {
         &self.scope.shared.statistics
     }
 
-    pub fn http_client(&self) -> &Arc<dyn HttpClient> {
+    pub fn http_client(&self) -> &Rc<dyn HttpClient> {
         &self.scope.shared.http_client
     }
 
-    pub fn request_manager(&self) -> &Arc<dyn RequestManager> {
+    pub fn request_manager(&self) -> &Rc<dyn RequestManager> {
         &self.scope.shared.request_manager
     }
 
@@ -253,7 +254,7 @@ impl BasicContext {
         &self.scope.transaction
     }
 
-    pub(crate) fn scope_shared(&self) -> &Arc<CrawlerShared> {
+    pub(crate) fn scope_shared(&self) -> &Rc<CrawlerShared> {
         &self.scope.shared
     }
 
@@ -286,7 +287,7 @@ impl BasicContext {
     }
 
     /// Runs `callback` after this attempt's storage writes were committed.
-    pub fn after_storage_commit(&self, callback: impl FnOnce() + Send + 'static) {
+    pub fn after_storage_commit(&self, callback: impl FnOnce() + 'static) {
         self.scope.transaction.after_commit(callback);
     }
 
@@ -330,12 +331,9 @@ impl BasicContext {
     /// state.lock().push(ctx.request().url.clone());
     /// # Ok(()) }
     /// ```
-    pub async fn use_state<T>(
-        &self,
-        default: impl Fn() -> T + Send + Sync + 'static,
-    ) -> anyhow::Result<Arc<SerdeState<T>>>
+    pub async fn use_state<T>(&self, default: impl Fn() -> T + 'static) -> anyhow::Result<Rc<SerdeState<T>>>
     where
-        T: Serialize + DeserializeOwned + Send + Sync + 'static,
+        T: Serialize + DeserializeOwned + 'static,
     {
         Ok(self.scope.shared.services.auto_saved_value(&self.scope.shared.state_key, default).await?)
     }
@@ -359,7 +357,7 @@ impl BasicContext {
 
 /// Implemented by every crawler's context, so generic code (such as the [`Router`](crate::Router))
 /// can reach the basic context.
-pub trait CrawlingContext: Send + 'static {
+pub trait CrawlingContext: 'static {
     fn basic(&self) -> &BasicContext;
     fn basic_mut(&mut self) -> &mut BasicContext;
 }

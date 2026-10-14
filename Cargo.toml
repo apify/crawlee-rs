@@ -45,7 +45,7 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls", "h
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "aws_lc_rs"] }
 # The range of reqwest, so that both use one version.
 rustls-platform-verifier = ">=0.6, <0.8"
-scraper = { version = "0.27", features = ["atomic"] }
+scraper = "0.27"
 selectors = "0.26"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
@@ -53,7 +53,7 @@ sha2 = "0.10"
 simdutf8 = "0.1"
 sysinfo = { version = "0.38", default-features = false, features = ["system"] }
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt", "macros", "time"] }
 tracing = "0.1"
 url = "2"
 web_atoms = "0.2"

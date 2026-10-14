@@ -6,15 +6,15 @@
 //! looks like. For plain serde types, [`SerdeState`] does that. The statistics and the session
 //! pool implement it themselves, so their records keep the exact shape Crawlee for JS writes.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::cell::Cell;
+use std::rc::Rc;
 use std::time::Duration;
 
-use parking_lot::{Mutex, MutexGuard};
+use crate::local::OnceCell;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use tokio::sync::OnceCell;
+use std::cell::{RefCell, RefMut};
 
 use crate::errors::{StorageError, StorageResult};
 use crate::events::{EventKind, ListenerId};
@@ -29,7 +29,7 @@ const PERSISTENCE_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// State a [`RecoverableState`] can save and restore. Implementations use interior mutability:
 /// the state is shared between whoever updates it and the persistence listener.
-pub trait PersistedState: Send + Sync + 'static {
+pub trait PersistedState: 'static {
     /// The record to save, as JSON.
     fn to_record(&self) -> Value;
     /// Replaces the state with a saved record. An error leaves the state as it was.
@@ -40,52 +40,52 @@ pub trait PersistedState: Send + Sync + 'static {
 
 /// A [`PersistedState`] for any serde type: the record is the value's JSON.
 pub struct SerdeState<T> {
-    value: Mutex<T>,
-    default: Box<dyn Fn() -> T + Send + Sync>,
+    value: RefCell<T>,
+    default: Box<dyn Fn() -> T>,
 }
 
 impl<T> SerdeState<T> {
-    pub fn new(default: impl Fn() -> T + Send + Sync + 'static) -> Self {
-        SerdeState { value: Mutex::new(default()), default: Box::new(default) }
+    pub fn new(default: impl Fn() -> T + 'static) -> Self {
+        SerdeState { value: RefCell::new(default()), default: Box::new(default) }
     }
 
     /// Locks the value for reading or changing it. Keep the guard short-lived; it blocks
     /// persisting the value too.
-    pub fn lock(&self) -> MutexGuard<'_, T> {
-        self.value.lock()
+    pub fn lock(&self) -> RefMut<'_, T> {
+        self.value.borrow_mut()
     }
 }
 
-impl<T: Serialize + DeserializeOwned + Send + 'static> PersistedState for SerdeState<T> {
+impl<T: Serialize + DeserializeOwned + 'static> PersistedState for SerdeState<T> {
     fn to_record(&self) -> Value {
-        serde_json::to_value(&*self.value.lock()).unwrap_or(Value::Null)
+        serde_json::to_value(&*self.value.borrow_mut()).unwrap_or(Value::Null)
     }
 
     fn restore(&self, record: Value) -> Result<(), BoxError> {
-        *self.value.lock() = serde_json::from_value(record)?;
+        *self.value.borrow_mut() = serde_json::from_value(record)?;
         Ok(())
     }
 
     fn reset(&self) {
-        *self.value.lock() = (self.default)();
+        *self.value.borrow_mut() = (self.default)();
     }
 }
 
 struct Inner<S> {
     key: String,
     persistence_enabled: bool,
-    state: Arc<S>,
+    state: Rc<S>,
     services: Services,
     store_identifier: StorageIdentifier,
     store: OnceCell<KeyValueStore>,
-    listener: Mutex<Option<ListenerId>>,
-    initialized: AtomicBool,
-    loaded: AtomicBool,
+    listener: RefCell<Option<ListenerId>>,
+    initialized: Cell<bool>,
+    loaded: Cell<bool>,
 }
 
 /// State saved under `key` in a key-value store (the default one unless set otherwise).
 pub struct RecoverableState<S> {
-    inner: Arc<Inner<S>>,
+    inner: Rc<Inner<S>>,
 }
 
 impl<S> Clone for RecoverableState<S> {
@@ -102,7 +102,7 @@ impl<S> std::fmt::Debug for RecoverableState<S> {
 
 impl<S: PersistedState> RecoverableState<S> {
     /// With `persistence_enabled: false`, the state is never saved or loaded, only kept in memory.
-    pub fn new(services: &Services, key: impl Into<String>, state: Arc<S>, persistence_enabled: bool) -> Self {
+    pub fn new(services: &Services, key: impl Into<String>, state: Rc<S>, persistence_enabled: bool) -> Self {
         Self::in_store(services, StorageIdentifier::Default, key, state, persistence_enabled)
     }
 
@@ -111,20 +111,20 @@ impl<S: PersistedState> RecoverableState<S> {
         services: &Services,
         store: StorageIdentifier,
         key: impl Into<String>,
-        state: Arc<S>,
+        state: Rc<S>,
         persistence_enabled: bool,
     ) -> Self {
         RecoverableState {
-            inner: Arc::new(Inner {
+            inner: Rc::new(Inner {
                 key: key.into(),
                 persistence_enabled,
                 state,
                 services: services.clone(),
                 store_identifier: store,
                 store: OnceCell::new(),
-                listener: Mutex::new(None),
-                initialized: AtomicBool::new(false),
-                loaded: AtomicBool::new(false),
+                listener: RefCell::new(None),
+                initialized: Cell::new(false),
+                loaded: Cell::new(false),
             }),
         }
     }
@@ -133,7 +133,7 @@ impl<S: PersistedState> RecoverableState<S> {
         &self.inner.key
     }
 
-    pub fn state(&self) -> &Arc<S> {
+    pub fn state(&self) -> &Rc<S> {
         &self.inner.state
     }
 
@@ -144,14 +144,14 @@ impl<S: PersistedState> RecoverableState<S> {
 
     /// Loads the saved record (once), then starts saving on every `PersistState` event.
     pub async fn initialize(&self) -> StorageResult<()> {
-        if self.inner.initialized.swap(true, Ordering::AcqRel) || !self.inner.persistence_enabled {
+        if self.inner.initialized.replace(true) || !self.inner.persistence_enabled {
             return Ok(());
         }
         let store = self.store().await?;
 
         // Load first, then listen: an event arriving in between would otherwise save the
         // initial state over the record before it is read.
-        if !self.inner.loaded.swap(true, Ordering::AcqRel) {
+        if !self.inner.loaded.replace(true) {
             let record: Option<Value> = tokio::time::timeout(PERSISTENCE_TIMEOUT, store.get_value(&self.inner.key))
                 .await
                 .map_err(|_| self.timeout_error("Loading"))??;
@@ -167,14 +167,14 @@ impl<S: PersistedState> RecoverableState<S> {
             let this = this.clone();
             async move { this.persist_quietly().await }
         });
-        *self.inner.listener.lock() = Some(id);
+        *self.inner.listener.borrow_mut() = Some(id);
         Ok(())
     }
 
     /// Stops saving on events and saves one last time.
     pub async fn teardown(&self) {
-        self.inner.initialized.store(false, Ordering::Release);
-        if let Some(id) = self.inner.listener.lock().take() {
+        self.inner.initialized.set(false);
+        if let Some(id) = self.inner.listener.borrow_mut().take() {
             self.inner.services.events.off(id);
         }
         self.persist_quietly().await;
@@ -188,7 +188,7 @@ impl<S: PersistedState> RecoverableState<S> {
     /// Deletes the saved record. Fails while the state is being saved on events, which would
     /// write it straight back.
     pub async fn reset_store(&self) -> StorageResult<()> {
-        if self.inner.listener.lock().is_some() {
+        if self.inner.listener.borrow_mut().is_some() {
             return Err(StorageError::InvalidArgument(format!(
                 "Cannot clear the state persisted under key '{}' while it is still being persisted; call teardown() first",
                 self.inner.key
@@ -242,10 +242,10 @@ mod tests {
         count: u32,
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn saves_on_events_and_restores() {
         let services = Services::in_memory();
-        let state = RecoverableState::new(&services, "COUNTER", Arc::new(SerdeState::new(Counter::default)), true);
+        let state = RecoverableState::new(&services, "COUNTER", Rc::new(SerdeState::new(Counter::default)), true);
         state.initialize().await.unwrap();
         state.state().lock().count = 5;
 
@@ -255,7 +255,7 @@ mod tests {
         assert_eq!(store.get_value::<Counter>("COUNTER").await.unwrap(), Some(Counter { count: 5 }));
 
         // A second instance, as after a restart, picks the record up.
-        let restored = RecoverableState::new(&services, "COUNTER", Arc::new(SerdeState::new(Counter::default)), true);
+        let restored = RecoverableState::new(&services, "COUNTER", Rc::new(SerdeState::new(Counter::default)), true);
         restored.initialize().await.unwrap();
         assert_eq!(restored.state().lock().count, 5);
 
@@ -270,11 +270,11 @@ mod tests {
     /// A key-value store in which a `PersistState` event arrives while a record is being read,
     /// as the first periodic event of an `EventManager` can.
     struct EventDuringRead {
-        inner: Arc<dyn crate::storage::backend::KeyValueStoreBackend>,
+        inner: Rc<dyn crate::storage::backend::KeyValueStoreBackend>,
         events: crate::EventManager,
     }
 
-    #[async_trait::async_trait]
+    #[async_trait::async_trait(?Send)]
     impl crate::storage::backend::KeyValueStoreBackend for EventDuringRead {
         async fn get_metadata(&self) -> StorageResult<crate::storage::backend::KeyValueStoreInfo> {
             self.inner.get_metadata().await
@@ -307,14 +307,14 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn an_event_during_loading_does_not_overwrite_the_saved_record() {
         let services = Services::in_memory();
         let store = services.open_key_value_store(&StorageIdentifier::Default).await.unwrap();
         store.set_value("COUNTER", &Counter { count: 5 }).await.unwrap();
 
-        let racing = Arc::new(EventDuringRead { inner: store.backend().clone(), events: services.events.clone() });
-        let state = RecoverableState::new(&services, "COUNTER", Arc::new(SerdeState::new(Counter::default)), true);
+        let racing = Rc::new(EventDuringRead { inner: store.backend().clone(), events: services.events.clone() });
+        let state = RecoverableState::new(&services, "COUNTER", Rc::new(SerdeState::new(Counter::default)), true);
         state.inner.store.set(KeyValueStore::from_backend(racing)).unwrap();
         state.initialize().await.unwrap();
 
@@ -322,10 +322,10 @@ mod tests {
         assert_eq!(store.get_value::<Counter>("COUNTER").await.unwrap(), Some(Counter { count: 5 }));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn disabled_persistence_stays_in_memory() {
         let services = Services::in_memory();
-        let state = RecoverableState::new(&services, "X", Arc::new(SerdeState::new(Counter::default)), false);
+        let state = RecoverableState::new(&services, "X", Rc::new(SerdeState::new(Counter::default)), false);
         state.initialize().await.unwrap();
         state.state().lock().count = 1;
         state.teardown().await;

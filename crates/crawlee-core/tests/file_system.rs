@@ -17,7 +17,7 @@ fn read_json(path: impl AsRef<Path>) -> Value {
     serde_json::from_str(&text).unwrap()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn dataset_items_are_numbered_files() {
     let dir = tempfile::tempdir().unwrap();
     let backend = FileSystemStorageBackend::new(dir.path());
@@ -39,7 +39,7 @@ async fn dataset_items_are_numbered_files() {
     assert_eq!(dataset.get_info().await.unwrap().item_count, 2);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn key_value_store_records_and_adopted_files() {
     let dir = tempfile::tempdir().unwrap();
     // A file put there by hand, without a metadata sidecar.
@@ -67,7 +67,7 @@ async fn key_value_store_records_and_adopted_files() {
     assert!(store.get_public_url("OUTPUT").await.unwrap().unwrap().starts_with("file://"));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn request_queue_survives_a_restart() {
     let dir = tempfile::tempdir().unwrap();
     {
@@ -109,7 +109,7 @@ async fn request_queue_survives_a_restart() {
     assert!(second["handledAt"].is_string());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn purge_empties_run_scoped_storages_only() {
     let dir = tempfile::tempdir().unwrap();
     {
@@ -134,7 +134,7 @@ async fn purge_empties_run_scoped_storages_only() {
     assert!(dir.path().join("datasets/kept/000000001.json").exists());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn input_keys_are_adopted_and_kept_on_purge() {
     let dir = tempfile::tempdir().unwrap();
     let default = dir.path().join("key_value_stores/default");
@@ -162,7 +162,7 @@ async fn input_keys_are_adopted_and_kept_on_purge() {
     assert!(store.record_exists("INPUT").await.unwrap());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn storages_are_cached_and_found_by_id() {
     let dir = tempfile::tempdir().unwrap();
     let backend = FileSystemStorageBackend::new(dir.path());

@@ -151,15 +151,13 @@ fn collect_hrefs(
 /// Finds a `<meta charset>` declaration in the first 1024 bytes of an HTML document, like
 /// `extractCharsetFromHtmlBytes` in Crawlee for JS. Returns the raw label, if any.
 pub fn extract_charset_from_html_bytes(bytes: &[u8]) -> Option<String> {
-    use std::sync::OnceLock;
-
-    static META_CHARSET: OnceLock<regex::bytes::Regex> = OnceLock::new();
-    let regex = META_CHARSET.get_or_init(|| {
-        regex::bytes::Regex::new(r#"(?i-u)<meta[^>]+\bcharset\s*=\s*["']?\s*([^"'\s;>]+)"#).expect("valid regex")
-    });
+    thread_local! {
+        static META_CHARSET: regex::bytes::Regex =
+            regex::bytes::Regex::new(r#"(?i-u)<meta[^>]+\bcharset\s*=\s*["']?\s*([^"'\s;>]+)"#).expect("valid regex");
+    }
 
     let prescan = &bytes[..bytes.len().min(1024)];
-    let label = regex.captures(prescan)?.get(1)?.as_bytes();
+    let label = META_CHARSET.with(|regex| regex.captures(prescan)?.get(1).map(|label| label.as_bytes().to_vec()))?;
     // Latin-1 decoding, as the JS version does, maps every byte to one char.
     Some(label.iter().map(|&b| b as char).collect())
 }

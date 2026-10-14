@@ -4,8 +4,8 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use cookie_store::{CookieDomain, CookieExpiration, CookieStore, RawCookie};
-use parking_lot::Mutex;
 use serde_json::{Map, Value, json};
+use std::cell::RefCell;
 use url::Url;
 
 /// `(domain, path, name)` identifies a cookie in the store.
@@ -61,12 +61,12 @@ impl Inner {
 /// Cookies of one session. Shared between concurrent requests of that session.
 #[derive(Debug, Default)]
 pub struct CookieJar {
-    inner: Mutex<Inner>,
+    inner: RefCell<Inner>,
 }
 
 impl Clone for CookieJar {
     fn clone(&self) -> Self {
-        CookieJar { inner: Mutex::new(self.inner.lock().clone()) }
+        CookieJar { inner: RefCell::new(self.inner.borrow_mut().clone()) }
     }
 }
 
@@ -77,7 +77,7 @@ impl CookieJar {
 
     /// The `Cookie` header value for `url`, or `None` when no cookie applies.
     pub fn cookie_header(&self, url: &Url) -> Option<String> {
-        let inner = self.inner.lock();
+        let inner = self.inner.borrow_mut();
         let mut header = String::new();
         for (name, value) in inner.ordered_matches(url) {
             if !header.is_empty() {
@@ -92,7 +92,7 @@ impl CookieJar {
 
     /// Stores a cookie given in `Set-Cookie` syntax, as if `url` had set it.
     pub fn set_cookie(&self, cookie: &str, url: &Url) -> bool {
-        let mut inner = self.inner.lock();
+        let mut inner = self.inner.borrow_mut();
         let stored = inner.store.parse(cookie, url).is_ok();
         inner.record_new_cookies();
         stored
@@ -105,7 +105,7 @@ impl CookieJar {
         if cookies.is_empty() {
             return;
         }
-        let mut inner = self.inner.lock();
+        let mut inner = self.inner.borrow_mut();
         // One at a time, so cookies of one response get creation times in header order.
         for cookie in cookies {
             inner.store.store_response_cookies(std::iter::once(cookie), url);
@@ -116,7 +116,7 @@ impl CookieJar {
     /// `(name, value)` pairs that would be sent to `url`, in `Cookie` header order.
     pub fn cookies_for(&self, url: &Url) -> Vec<(String, String)> {
         self.inner
-            .lock()
+            .borrow_mut()
             .ordered_matches(url)
             .into_iter()
             .map(|(name, value)| (name.to_owned(), value.to_owned()))
@@ -124,7 +124,7 @@ impl CookieJar {
     }
 
     pub fn clear(&self) {
-        let mut inner = self.inner.lock();
+        let mut inner = self.inner.borrow_mut();
         inner.store.clear();
         inner.created.clear();
     }
@@ -148,7 +148,7 @@ impl CookieJar {
     /// The jar in the JSON format of tough-cookie's `CookieJar.toJSON()`, which Crawlee for JS
     /// persists sessions in. Expired cookies are left out.
     pub fn to_json(&self) -> Value {
-        let inner = self.inner.lock();
+        let inner = self.inner.borrow_mut();
         let mut cookies: Vec<(u64, Value)> = inner
             .store
             .iter_unexpired()
@@ -206,7 +206,7 @@ impl CookieJar {
         // Oldest first, so the creation order survives.
         cookies.sort_by_key(|cookie| cookie["creation"].as_str().unwrap_or_default().to_owned());
         let now = Utc::now();
-        let mut inner = jar.inner.lock();
+        let mut inner = jar.inner.borrow_mut();
         for cookie in cookies {
             let (Some(name), Some(domain)) = (cookie["key"].as_str(), cookie["domain"].as_str()) else {
                 continue;
