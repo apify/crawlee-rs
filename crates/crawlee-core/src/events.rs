@@ -14,14 +14,15 @@
 //! [`close`](EventManager::close) emits a final `PersistState` and waits until every listener has
 //! finished, so the final state is on disk when it returns.
 
+use crate::local::CellExt as _;
+use std::cell::Cell;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::rc::Rc;
 use std::time::Duration;
 
-use parking_lot::Mutex;
-use tokio::sync::Notify;
+use crate::local::Notify;
+use std::cell::RefCell;
 use tokio::task::JoinHandle;
 
 use crate::configuration::Configuration;
@@ -95,8 +96,8 @@ impl Event {
     }
 }
 
-type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
-type Listener = Arc<dyn Fn(Event) -> BoxFuture + Send + Sync>;
+type BoxFuture = Pin<Box<dyn Future<Output = ()>>>;
+type Listener = Rc<dyn Fn(Event) -> BoxFuture>;
 
 /// Returned by [`EventManager::on`]; pass it to [`EventManager::off`] to remove the listener.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -116,14 +117,14 @@ struct SystemInfoOptions {
 }
 
 struct Inner {
-    listeners: Mutex<Vec<Registered>>,
-    next_id: AtomicU64,
+    listeners: RefCell<Vec<Registered>>,
+    next_id: Cell<u64>,
     /// Listener invocations that have not finished yet.
-    in_flight: AtomicUsize,
+    in_flight: Cell<usize>,
     idle: Notify,
-    intervals: Mutex<Option<JoinHandle<()>>>,
+    intervals: RefCell<Option<JoinHandle<()>>>,
     /// Set by `stop_periodic_persist_state`: periodic `PersistState` events stop.
-    persist_state_stopped: AtomicBool,
+    persist_state_stopped: Cell<bool>,
     persist_state_interval: Duration,
     system_info: Option<SystemInfoOptions>,
 }
@@ -131,7 +132,7 @@ struct Inner {
 /// Emits events to async listeners. Cloning is cheap and clones share the manager.
 #[derive(Clone)]
 pub struct EventManager {
-    inner: Arc<Inner>,
+    inner: Rc<Inner>,
 }
 
 impl std::fmt::Debug for EventManager {
@@ -143,13 +144,13 @@ impl std::fmt::Debug for EventManager {
 impl EventManager {
     fn with_options(persist_state_interval: Duration, system_info: Option<SystemInfoOptions>) -> Self {
         EventManager {
-            inner: Arc::new(Inner {
-                listeners: Mutex::new(Vec::new()),
-                next_id: AtomicU64::new(0),
-                in_flight: AtomicUsize::new(0),
+            inner: Rc::new(Inner {
+                listeners: RefCell::new(Vec::new()),
+                next_id: Cell::new(0),
+                in_flight: Cell::new(0),
                 idle: Notify::new(),
-                intervals: Mutex::new(None),
-                persist_state_stopped: AtomicBool::new(false),
+                intervals: RefCell::new(None),
+                persist_state_stopped: Cell::new(false),
                 persist_state_interval,
                 system_info,
             }),
@@ -178,21 +179,21 @@ impl EventManager {
     /// Adds a listener for events of `kind`.
     pub fn on<F, Fut>(&self, kind: EventKind, listener: F) -> ListenerId
     where
-        F: Fn(Event) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = ()> + Send + 'static,
+        F: Fn(Event) -> Fut + 'static,
+        Fut: Future<Output = ()> + 'static,
     {
-        let id = ListenerId(self.inner.next_id.fetch_add(1, Ordering::Relaxed));
-        let listener: Listener = Arc::new(move |event| Box::pin(listener(event)));
-        self.inner.listeners.lock().push(Registered { id, kind, listener });
+        let id = ListenerId(self.inner.next_id.fetch_add(1));
+        let listener: Listener = Rc::new(move |event| Box::pin(listener(event)));
+        self.inner.listeners.borrow_mut().push(Registered { id, kind, listener });
         id
     }
 
     pub fn off(&self, id: ListenerId) {
-        self.inner.listeners.lock().retain(|registered| registered.id != id);
+        self.inner.listeners.borrow_mut().retain(|registered| registered.id != id);
     }
 
     pub fn listener_count(&self, kind: EventKind) -> usize {
-        self.inner.listeners.lock().iter().filter(|registered| registered.kind == kind).count()
+        self.inner.listeners.borrow_mut().iter().filter(|registered| registered.kind == kind).count()
     }
 
     /// Runs every listener of the event's kind. Returns right away; the listeners run as tasks.
@@ -202,7 +203,7 @@ impl EventManager {
         let listeners: Vec<Listener> = self
             .inner
             .listeners
-            .lock()
+            .borrow_mut()
             .iter()
             .filter(|registered| registered.kind == kind)
             .map(|registered| registered.listener.clone())
@@ -210,15 +211,15 @@ impl EventManager {
         if listeners.is_empty() {
             return;
         }
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        if tokio::runtime::Handle::try_current().is_err() {
             tracing::debug!(?kind, "No tokio runtime; the event is not delivered.");
             return;
-        };
+        }
         for listener in listeners {
-            self.inner.in_flight.fetch_add(1, Ordering::AcqRel);
+            self.inner.in_flight.fetch_add(1);
             let inner = self.inner.clone();
             let future = listener(event.clone());
-            runtime.spawn(async move {
+            tokio::task::spawn_local(async move {
                 // Counted down even if the listener panics.
                 let _done = InFlightGuard(inner);
                 future.await;
@@ -232,7 +233,7 @@ impl EventManager {
             let idle = self.inner.idle.notified();
             tokio::pin!(idle);
             idle.as_mut().enable();
-            if self.inner.in_flight.load(Ordering::Acquire) == 0 {
+            if self.inner.in_flight.get() == 0 {
                 return;
             }
             idle.await;
@@ -240,17 +241,17 @@ impl EventManager {
     }
 
     pub fn is_initialized(&self) -> bool {
-        self.inner.intervals.lock().is_some()
+        self.inner.intervals.borrow_mut().is_some()
     }
 
     /// Starts the periodic events. Does nothing when already initialized.
     pub async fn init(&self) {
-        let mut intervals = self.inner.intervals.lock();
+        let mut intervals = self.inner.intervals.borrow_mut();
         if intervals.is_some() {
             return;
         }
         let manager = self.clone();
-        *intervals = Some(tokio::spawn(async move { manager.emit_periodically().await }));
+        *intervals = Some(tokio::task::spawn_local(async move { manager.emit_periodically().await }));
     }
 
     async fn emit_periodically(self) {
@@ -270,7 +271,7 @@ impl EventManager {
         loop {
             tokio::select! {
                 _ = persist.tick() => {
-                    if !self.inner.persist_state_stopped.load(Ordering::Acquire) {
+                    if !self.inner.persist_state_stopped.get() {
                         self.emit(Event::PersistState { is_migrating: false });
                     }
                 }
@@ -294,13 +295,13 @@ impl EventManager {
     /// Stops the periodic `PersistState` events, keeping the others. The platform does this when
     /// a run is about to migrate: state is saved once more (with `is_migrating`), then no more.
     pub fn stop_periodic_persist_state(&self) {
-        self.inner.persist_state_stopped.store(true, Ordering::Release);
+        self.inner.persist_state_stopped.set(true);
     }
 
     /// Stops the periodic events, emits a final `PersistState` and waits for all listeners.
     /// Does nothing when not initialized.
     pub async fn close(&self) {
-        let Some(intervals) = self.inner.intervals.lock().take() else {
+        let Some(intervals) = self.inner.intervals.borrow_mut().take() else {
             return;
         };
         intervals.abort();
@@ -309,11 +310,11 @@ impl EventManager {
     }
 }
 
-struct InFlightGuard(Arc<Inner>);
+struct InFlightGuard(Rc<Inner>);
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
-        if self.0.in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+        if self.0.in_flight.fetch_sub(1) == 1 {
             self.0.idle.notify_waiters();
         }
     }
@@ -323,7 +324,7 @@ impl Drop for InFlightGuard {
 mod tests {
     use super::*;
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test(flavor = "local", start_paused = true)]
     async fn periodic_events_and_close() {
         let configuration = Configuration {
             persist_state_interval: Duration::from_secs(60),
@@ -331,21 +332,21 @@ mod tests {
             ..Configuration::default()
         };
         let events = EventManager::local(&configuration);
-        let persisted = Arc::new(AtomicUsize::new(0));
-        let infos = Arc::new(AtomicUsize::new(0));
+        let persisted = Rc::new(Cell::new(0));
+        let infos = Rc::new(Cell::new(0));
         let counter = persisted.clone();
         events.on(EventKind::PersistState, move |_| {
             let counter = counter.clone();
             async move {
                 // A slow listener: close() has to wait for it.
                 tokio::time::sleep(Duration::from_millis(500)).await;
-                counter.fetch_add(1, Ordering::SeqCst);
+                counter.fetch_add(1);
             }
         });
         let counter = infos.clone();
         let info_listener = events.on(EventKind::SystemInfo, move |event| {
             assert!(matches!(event, Event::SystemInfo(_)));
-            counter.fetch_add(1, Ordering::SeqCst);
+            counter.fetch_add(1);
             async {}
         });
 
@@ -353,45 +354,45 @@ mod tests {
         events.init().await;
         tokio::time::sleep(Duration::from_millis(2500)).await;
         // Emitted right away, then every second.
-        assert_eq!(infos.load(Ordering::SeqCst), 3);
-        assert_eq!(persisted.load(Ordering::SeqCst), 1);
+        assert_eq!(infos.get(), 3);
+        assert_eq!(persisted.get(), 1);
 
         events.off(info_listener);
         assert_eq!(events.listener_count(EventKind::SystemInfo), 0);
         events.close().await;
-        assert_eq!(persisted.load(Ordering::SeqCst), 2, "close() waits for the final PersistState");
+        assert_eq!(persisted.get(), 2, "close() waits for the final PersistState");
         assert!(!events.is_initialized());
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test(flavor = "local", start_paused = true)]
     async fn custom_events_and_stopping_periodic_persist_state() {
         let events = EventManager::new(Duration::from_secs(10));
-        let persisted = Arc::new(AtomicUsize::new(0));
+        let persisted = Rc::new(Cell::new(0));
         let counter = persisted.clone();
         events.on(EventKind::PersistState, move |_| {
-            counter.fetch_add(1, Ordering::SeqCst);
+            counter.fetch_add(1);
             async {}
         });
-        let custom = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let custom = Rc::new(std::cell::RefCell::new(Vec::new()));
         let log = custom.clone();
         events.on(EventKind::Custom, move |event| {
             if let Event::Custom { name, .. } = event {
-                log.lock().push(name);
+                log.borrow_mut().push(name);
             }
             async {}
         });
 
         events.init().await;
         tokio::time::sleep(Duration::from_secs(15)).await;
-        assert_eq!(persisted.load(Ordering::SeqCst), 2, "right away and after 10 s");
+        assert_eq!(persisted.get(), 2, "right away and after 10 s");
         events.stop_periodic_persist_state();
         tokio::time::sleep(Duration::from_secs(30)).await;
-        assert_eq!(persisted.load(Ordering::SeqCst), 2);
+        assert_eq!(persisted.get(), 2);
 
         events.emit(Event::Custom { name: "cpuInfo".into(), data: serde_json::json!({ "isCpuOverloaded": false }) });
         events.wait_for_all_listeners_to_complete().await;
-        assert_eq!(*custom.lock(), ["cpuInfo"]);
+        assert_eq!(*custom.borrow_mut(), ["cpuInfo"]);
         events.close().await;
-        assert_eq!(persisted.load(Ordering::SeqCst), 3, "close() still saves once more");
+        assert_eq!(persisted.get(), 3, "close() still saves once more");
     }
 }

@@ -3,10 +3,11 @@
 //! The site is reachable as both `127.0.0.1` and `localhost`, which gives two hostnames on one
 //! server for testing enqueue strategies and redirects that leave the scope.
 
+use crawlee_core::local::CellExt as _;
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::rc::Rc;
 
 use axum::Router as AxumRouter;
 use axum::extract::{Path, State};
@@ -21,14 +22,14 @@ use crawlee_core::Services;
 use crawlee_http::{EnqueueLinksOptions, HtmlContext, HtmlCrawler, HttpContext, HttpCrawler};
 
 #[derive(Clone, Default)]
-struct Hits(Arc<parking_lot::Mutex<BTreeMap<String, usize>>>);
+struct Hits(std::sync::Arc<std::sync::Mutex<BTreeMap<String, usize>>>);
 
 impl Hits {
     fn hit(&self, path: &str) {
-        *self.0.lock().entry(path.to_owned()).or_default() += 1;
+        *self.0.lock().unwrap().entry(path.to_owned()).or_default() += 1;
     }
     fn get(&self, path: &str) -> usize {
-        self.0.lock().get(path).copied().unwrap_or(0)
+        self.0.lock().unwrap().get(path).copied().unwrap_or(0)
     }
 }
 
@@ -133,7 +134,7 @@ async fn serve() -> (SocketAddr, Hits) {
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    tokio::task::spawn_local(async move { axum::serve(listener, app).await.unwrap() });
     (addr, hits)
 }
 
@@ -141,7 +142,7 @@ async fn items(dataset: crawlee_core::Dataset) -> Vec<Value> {
     dataset.get_all().await.unwrap()
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn html_crawl_follows_same_hostname_links() {
     let (addr, hits) = serve().await;
     let crawler = HtmlCrawler::builder()
@@ -175,10 +176,10 @@ async fn html_crawl_follows_same_hostname_links() {
     assert_eq!(b["query"], "x=1&y=2", "attribute entities are decoded");
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn enqueue_options_filter_and_label() {
     let (addr, hits) = serve().await;
-    let seen = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let seen = Rc::new(std::cell::RefCell::new(Vec::new()));
     let log = seen.clone();
 
     let mut router = crawlee_basic::Router::<HtmlContext>::new();
@@ -197,7 +198,7 @@ async fn enqueue_options_filter_and_label() {
     router.add_handler("DETAIL", move |ctx: HtmlContext| {
         let log = log.clone();
         async move {
-            log.lock().push(ctx.url().to_string());
+            log.borrow_mut().push(ctx.url().to_string());
             Ok(())
         }
     });
@@ -205,7 +206,7 @@ async fn enqueue_options_filter_and_label() {
     let crawler = HtmlCrawler::builder().services(Services::in_memory()).router(router).build().unwrap();
     crawler.run([format!("http://{addr}/page/start")]).await.unwrap();
 
-    let mut seen = seen.lock().clone();
+    let mut seen = seen.borrow_mut().clone();
     seen.sort();
     let port = addr.port();
     assert_eq!(
@@ -219,7 +220,7 @@ async fn enqueue_options_filter_and_label() {
     assert_eq!(hits.get("/page/error"), 0);
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn blocked_unsupported_and_error_statuses() {
     let (addr, hits) = serve().await;
     let crawler = HttpCrawler::builder()
@@ -229,7 +230,7 @@ async fn blocked_unsupported_and_error_statuses() {
             ctx.push_data(&json!({ "path": ctx.url().path(), "status": ctx.status().as_u16() }))?;
             Ok(())
         })
-        .failed_request_handler(|ctx: crawlee_basic::BasicContext, _e: Arc<anyhow::Error>| async move {
+        .failed_request_handler(|ctx: crawlee_basic::BasicContext, _e: Rc<anyhow::Error>| async move {
             ctx.push_data(&json!({ "failed": ctx.request().url, "errors": ctx.request().error_messages }))?;
             Ok(())
         })
@@ -262,7 +263,7 @@ async fn blocked_unsupported_and_error_statuses() {
     assert!(items.iter().any(|i| i["path"] == "/missing" && i["status"] == 404));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn typed_json_legacy_charsets_and_cookies() {
     #[derive(Deserialize)]
     struct Listing {
@@ -308,17 +309,17 @@ async fn typed_json_legacy_charsets_and_cookies() {
     assert!(items.contains(&json!({ "title": "Private", "encoding": "UTF-8" })));
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "local")]
 async fn redirect_outside_the_enqueue_strategy_is_skipped() {
     let (addr, hits) = serve().await;
-    let handled = Arc::new(AtomicUsize::new(0));
+    let handled = Rc::new(Cell::new(0));
     let counter = handled.clone();
     let crawler = HtmlCrawler::builder()
         .services(Services::in_memory())
         .request_handler(move |_ctx: HtmlContext| {
             let counter = counter.clone();
             async move {
-                counter.fetch_add(1, Ordering::SeqCst);
+                counter.fetch_add(1);
                 Ok(())
             }
         })
@@ -331,7 +332,7 @@ async fn redirect_outside_the_enqueue_strategy_is_skipped() {
         .unwrap();
     let stats = crawler.run([request]).await.unwrap();
 
-    assert_eq!(handled.load(Ordering::SeqCst), 0);
+    assert_eq!(handled.get(), 0);
     assert_eq!(stats.requests_skipped, 1);
     assert_eq!(hits.get("/page/elsewhere"), 1, "the redirect itself was followed");
 }

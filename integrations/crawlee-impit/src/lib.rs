@@ -4,14 +4,14 @@
 //! Safari), which many anti-bot systems check. It is the default HTTP client of Crawlee for JS.
 //!
 //! ```no_run
-//! use std::sync::Arc;
+//! use std::rc::Rc;
 //!
 //! use crawlee::http_client::{HttpClient, RedirectingClient};
 //! use crawlee::{HtmlContext, HtmlCrawler};
 //! use crawlee_impit::{Browser, ImpitTransport};
 //!
 //! # async fn run() -> anyhow::Result<()> {
-//! let client: Arc<dyn HttpClient> = Arc::new(RedirectingClient::new(ImpitTransport::new(Browser::Chrome)));
+//! let client: Rc<dyn HttpClient> = Rc::new(RedirectingClient::new(ImpitTransport::new(Browser::Chrome)));
 //! let crawler = HtmlCrawler::builder()
 //!     .http_client(client)
 //!     .request_handler(|ctx: HtmlContext| async move { Ok(()) })
@@ -23,7 +23,7 @@
 //! [`RedirectingClient`](crawlee_http_client::RedirectingClient), like for every other transport.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::rc::Rc;
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -33,7 +33,7 @@ use impit::fingerprint::BrowserFingerprint;
 use impit::fingerprint::database as fingerprints;
 use impit::impit::{Impit, RedirectBehavior};
 use impit::request::{ImpitBody, RequestOptions};
-use parking_lot::Mutex;
+use std::cell::RefCell;
 
 use crawlee_http_client::{HttpClientError, HttpRequest, HttpResponse, Transport, TransportOptions};
 
@@ -62,7 +62,7 @@ type ClientKey = (Option<String>, bool);
 /// so connections are reused.
 pub struct ImpitTransport {
     browser: Browser,
-    clients: Mutex<HashMap<ClientKey, Arc<Impit<reqwest::cookie::Jar>>>>,
+    clients: RefCell<HashMap<ClientKey, Rc<Impit<reqwest::cookie::Jar>>>>,
 }
 
 impl std::fmt::Debug for ImpitTransport {
@@ -79,16 +79,16 @@ impl Default for ImpitTransport {
 
 impl ImpitTransport {
     pub fn new(browser: Browser) -> Self {
-        ImpitTransport { browser, clients: Mutex::new(HashMap::new()) }
+        ImpitTransport { browser, clients: RefCell::new(HashMap::new()) }
     }
 
     pub fn browser(&self) -> Browser {
         self.browser
     }
 
-    fn client(&self, options: &TransportOptions) -> Result<Arc<Impit<reqwest::cookie::Jar>>, HttpClientError> {
+    fn client(&self, options: &TransportOptions) -> Result<Rc<Impit<reqwest::cookie::Jar>>, HttpClientError> {
         let key = (options.proxy_url.as_ref().map(|u| u.to_string()), options.ignore_tls_errors);
-        if let Some(client) = self.clients.lock().get(&key) {
+        if let Some(client) = self.clients.borrow_mut().get(&key) {
             return Ok(client.clone());
         }
 
@@ -100,8 +100,8 @@ impl ImpitTransport {
         if let Some(proxy) = &options.proxy_url {
             builder = builder.with_proxy(proxy.to_string());
         }
-        let client = Arc::new(builder.build().map_err(|err| map_error(err, options.proxy_url.is_some()))?);
-        Ok(self.clients.lock().entry(key).or_insert(client).clone())
+        let client = Rc::new(builder.build().map_err(|err| map_error(err, options.proxy_url.is_some()))?);
+        Ok(self.clients.borrow_mut().entry(key).or_insert(client).clone())
     }
 }
 
@@ -119,11 +119,11 @@ fn map_error(err: ImpitError, via_proxy: bool) -> HttpClientError {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl Transport for ImpitTransport {
     fn release_proxy(&self, proxy_url: &url::Url) {
         let proxy_url = proxy_url.as_str();
-        self.clients.lock().retain(|(proxy, _), _| proxy.as_deref() != Some(proxy_url));
+        self.clients.borrow_mut().retain(|(proxy, _), _| proxy.as_deref() != Some(proxy_url));
     }
 
     async fn fetch(&self, request: HttpRequest, options: &TransportOptions) -> Result<HttpResponse, HttpClientError> {

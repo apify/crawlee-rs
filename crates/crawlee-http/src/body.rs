@@ -1,7 +1,7 @@
 //! Response bodies: bytes plus the encoding they are in, decoded lazily and without copying when
 //! they already are valid UTF-8 (the common case).
 
-use std::sync::OnceLock;
+use std::cell::OnceCell;
 
 use bytes::Bytes;
 use encoding_rs::{Encoding, UTF_8};
@@ -12,14 +12,14 @@ pub struct Body {
     bytes: Bytes,
     encoding: &'static Encoding,
     /// `None`: the bytes (minus a UTF-8 BOM) are valid UTF-8 and are borrowed as they are.
-    decoded: OnceLock<Option<String>>,
+    decoded: OnceCell<Option<String>>,
 }
 
 const UTF8_BOM: &[u8] = b"\xEF\xBB\xBF";
 
 impl Body {
     pub fn new(bytes: Bytes, encoding: &'static Encoding) -> Self {
-        Body { bytes, encoding, decoded: OnceLock::new() }
+        Body { bytes, encoding, decoded: OnceCell::new() }
     }
 
     pub fn bytes(&self) -> &Bytes {

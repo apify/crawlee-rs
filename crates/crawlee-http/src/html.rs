@@ -7,10 +7,10 @@
 
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
-use std::sync::{Arc, OnceLock};
+use std::rc::Rc;
 
 use async_trait::async_trait;
-use parking_lot::Mutex;
+use std::cell::RefCell;
 use url::Url;
 
 use crawlee_basic::enqueue::EnqueueError;
@@ -37,20 +37,28 @@ pub struct SelectorError {
 
 const SELECTOR_CACHE_CAPACITY: usize = 1024;
 
-/// Compiled selectors, shared by every page: handlers use the same few selectors on every page,
-/// so each one is compiled once per process instead of once per call.
-fn compiled_selector(css: &str) -> Result<Arc<scraper::Selector>, SelectorError> {
-    static CACHE: OnceLock<Mutex<HashMap<String, Arc<scraper::Selector>>>> = OnceLock::new();
-    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+thread_local! {
+    /// Compiled selectors, shared by every page: handlers use the same few selectors on every
+    /// page, so each one is compiled once per process instead of once per call.
+    static SELECTOR_CACHE: RefCell<HashMap<String, Rc<scraper::Selector>>> = RefCell::new(HashMap::new());
+}
 
-    if let Some(selector) = cache.lock().get(css) {
+fn compiled_selector(css: &str) -> Result<Rc<scraper::Selector>, SelectorError> {
+    SELECTOR_CACHE.with(|cache| cached_selector(cache, css))
+}
+
+fn cached_selector(
+    cache: &RefCell<HashMap<String, Rc<scraper::Selector>>>,
+    css: &str,
+) -> Result<Rc<scraper::Selector>, SelectorError> {
+    if let Some(selector) = cache.borrow_mut().get(css) {
         return Ok(selector.clone());
     }
-    let selector = Arc::new(
+    let selector = Rc::new(
         scraper::Selector::parse(css)
             .map_err(|err| SelectorError { selector: css.to_owned(), message: err.to_string() })?,
     );
-    let mut cache = cache.lock();
+    let mut cache = cache.borrow_mut();
     if cache.len() >= SELECTOR_CACHE_CAPACITY {
         cache.clear();
     }
@@ -203,9 +211,8 @@ impl<'a> Element<'a> {
 /// The context of [`HtmlCrawler`]: the HTTP context plus a lazily parsed [`Document`].
 pub struct HtmlContext {
     http: HttpContext,
-    /// Parsed on first use, on the blocking pool. `scraper` is built with atomic tendrils, so the
-    /// document is `Send` and can move between the pool and this context.
-    document: Arc<Mutex<Option<Document>>>,
+    /// Parsed on first use, on the runtime's thread.
+    document: Rc<RefCell<Option<Document>>>,
 }
 
 impl std::fmt::Debug for HtmlContext {
@@ -236,8 +243,8 @@ impl CrawlingContext for HtmlContext {
     }
 }
 
-fn with_document<R>(body: &Body, slot: &Mutex<Option<Document>>, f: impl FnOnce(&Document) -> R) -> R {
-    let mut slot = slot.lock();
+fn with_document<R>(body: &Body, slot: &RefCell<Option<Document>>, f: impl FnOnce(&Document) -> R) -> R {
+    let mut slot = slot.borrow_mut();
     let document = slot.get_or_insert_with(|| Document::parse(body.text()));
     f(document)
 }
@@ -257,16 +264,14 @@ impl HtmlContext {
     /// ```
     pub async fn with_html<R, F>(&self, f: F) -> anyhow::Result<R>
     where
-        F: FnOnce(&Document) -> R + Send + 'static,
-        R: Send + 'static,
+        F: FnOnce(&Document) -> R + 'static,
+        R: 'static,
     {
-        let body = self.http.body_handle().clone();
-        let slot = self.document.clone();
-        Ok(tokio::task::spawn_blocking(move || with_document(&body, &slot, f)).await?)
+        // On the one thread of the runtime, as in Node: there is no other to parse on.
+        Ok(self.with_html_inline(f))
     }
 
-    /// Like [`with_html`](Self::with_html), but on the current thread. Fine for small pages;
-    /// large documents are better parsed with `with_html`.
+    /// Like [`with_html`](Self::with_html), without the `Result`.
     pub fn with_html_inline<R>(&self, f: impl FnOnce(&Document) -> R) -> R {
         with_document(self.http.body_handle(), &self.document, f)
     }
@@ -319,11 +324,11 @@ impl HtmlContext {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct HtmlLayer;
 
-#[async_trait]
+#[async_trait(?Send)]
 impl Middleware<HttpContext> for HtmlLayer {
     type Out = HtmlContext;
     async fn run(&self, http: HttpContext) -> anyhow::Result<HtmlContext> {
-        Ok(HtmlContext { http, document: Arc::new(Mutex::new(None)) })
+        Ok(HtmlContext { http, document: Rc::new(RefCell::new(None)) })
     }
 }
 

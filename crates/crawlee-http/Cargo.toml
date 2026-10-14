@@ -33,7 +33,7 @@ url.workspace = true
 axum.workspace = true
 flate2.workspace = true
 encoding_rs.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }
+tokio = { workspace = true, features = ["macros", "net"] }
 
 [lints]
 workspace = true

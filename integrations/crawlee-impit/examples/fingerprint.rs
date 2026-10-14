@@ -5,13 +5,13 @@
 //! cargo run --example fingerprint
 //! ```
 
-use std::sync::Arc;
+use std::rc::Rc;
 
 use crawlee::http_client::{HttpClient, RedirectingClient, ReqwestTransport};
 use crawlee::{HttpContext, HttpCrawler, Services};
 use crawlee_impit::{Browser, ImpitTransport};
 
-async fn fingerprint(name: &str, client: Arc<dyn HttpClient>) -> anyhow::Result<()> {
+async fn fingerprint(name: &str, client: Rc<dyn HttpClient>) -> anyhow::Result<()> {
     let crawler = HttpCrawler::builder()
         .services(Services::in_memory())
         .http_client(client)
@@ -32,11 +32,11 @@ async fn fingerprint(name: &str, client: Arc<dyn HttpClient>) -> anyhow::Result<
     Ok(())
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "local")]
 async fn main() -> anyhow::Result<()> {
-    fingerprint("reqwest", Arc::new(RedirectingClient::new(ReqwestTransport::new()))).await?;
+    fingerprint("reqwest", Rc::new(RedirectingClient::new(ReqwestTransport::new()))).await?;
     for browser in [Browser::Chrome, Browser::Firefox] {
-        let client = Arc::new(RedirectingClient::new(ImpitTransport::new(browser)));
+        let client = Rc::new(RedirectingClient::new(ImpitTransport::new(browser)));
         fingerprint(&format!("{browser:?}"), client).await?;
     }
     Ok(())

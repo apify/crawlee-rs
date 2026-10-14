@@ -1,6 +1,6 @@
 //! [`Dataset`]: an append-only table of JSON objects, typically the crawl results.
 
-use std::sync::Arc;
+use std::rc::Rc;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -12,7 +12,7 @@ use crate::errors::{StorageError, StorageResult};
 /// Handle to a dataset. Cloning is cheap and clones share the storage.
 #[derive(Clone)]
 pub struct Dataset {
-    backend: Arc<dyn DatasetBackend>,
+    backend: Rc<dyn DatasetBackend>,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -34,17 +34,17 @@ impl Dataset {
         Ok(Dataset { backend: storage.create_dataset_backend(id).await? })
     }
 
-    pub fn from_backend(backend: Arc<dyn DatasetBackend>) -> Self {
+    pub fn from_backend(backend: Rc<dyn DatasetBackend>) -> Self {
         Dataset { backend }
     }
 
-    pub fn backend(&self) -> &Arc<dyn DatasetBackend> {
+    pub fn backend(&self) -> &Rc<dyn DatasetBackend> {
         &self.backend
     }
 
     /// Whether two handles point at the same storage.
     pub fn same_storage(&self, other: &Dataset) -> bool {
-        Arc::ptr_eq(&self.backend, &other.backend)
+        Rc::ptr_eq(&self.backend, &other.backend)
     }
 
     /// Appends one object, or every object of an array.
@@ -121,7 +121,7 @@ mod tests {
         title: String,
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn push_and_read_typed_items() {
         let storage = MemoryStorageBackend::new();
         let dataset = Dataset::open(&storage, &StorageIdentifier::Default).await.unwrap();

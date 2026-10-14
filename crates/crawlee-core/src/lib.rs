@@ -4,6 +4,7 @@
 pub mod configuration;
 pub mod errors;
 pub mod events;
+pub mod local;
 pub mod recoverable_state;
 pub mod request;
 pub mod services;

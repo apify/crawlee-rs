@@ -11,7 +11,7 @@ anyhow = "1"
 # Points at this checkout. `cargo generate` swaps in Cargo.generated.toml, which uses the git dependency.
 crawlee = { path = "../../crates/crawlee" }
 serde_json = "1"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["macros", "rt"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

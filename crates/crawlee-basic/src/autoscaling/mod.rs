@@ -16,12 +16,12 @@
 
 mod signals;
 
+use std::cell::Cell;
 use std::collections::VecDeque;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use parking_lot::Mutex;
+use std::cell::RefCell;
 use tokio::task::JoinHandle;
 
 use crawlee_core::Services;
@@ -39,7 +39,7 @@ pub struct LoadSignalsOptions {
     pub event_loop: Option<EventLoopLoadSignalOptions>,
     pub cpu: Option<CpuLoadSignalOptions>,
     pub storage: Option<StorageLoadSignalOptions>,
-    pub custom: Vec<Arc<dyn LoadSignal>>,
+    pub custom: Vec<Rc<dyn LoadSignal>>,
 }
 
 impl Default for LoadSignalsOptions {
@@ -143,7 +143,7 @@ impl SystemStatusInfo {
 
 /// Evaluates the signals over the current (5 s) and historical (30 s) windows.
 pub struct SystemStatus {
-    signals: Vec<Arc<dyn LoadSignal>>,
+    signals: Vec<Rc<dyn LoadSignal>>,
     current_history: Duration,
     history: Duration,
 }
@@ -151,7 +151,7 @@ pub struct SystemStatus {
 impl SystemStatus {
     /// Fails when two signals share a name.
     pub fn new(
-        signals: Vec<Arc<dyn LoadSignal>>,
+        signals: Vec<Rc<dyn LoadSignal>>,
         current_history: Duration,
         history: Duration,
     ) -> Result<Self, ConcurrencyError> {
@@ -220,16 +220,16 @@ impl State {
 /// Decides how many tasks run at once; see the [module documentation](self).
 pub struct ConcurrencySystem {
     options: ConcurrencyOptions,
-    state: Mutex<State>,
-    signals: Vec<Arc<dyn LoadSignal>>,
+    state: RefCell<State>,
+    signals: Vec<Rc<dyn LoadSignal>>,
     status: SystemStatus,
-    tasks: Mutex<Vec<JoinHandle<()>>>,
-    running: AtomicBool,
+    tasks: RefCell<Vec<JoinHandle<()>>>,
+    running: Cell<bool>,
 }
 
 impl std::fmt::Debug for ConcurrencySystem {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ConcurrencySystem").field("state", &*self.state.lock()).finish_non_exhaustive()
+        f.debug_struct("ConcurrencySystem").field("state", &*self.state.borrow_mut()).finish_non_exhaustive()
     }
 }
 
@@ -239,18 +239,18 @@ impl ConcurrencySystem {
             return Err(ConcurrencyError::InvalidBounds);
         }
         let signal_options = &options.load_signals;
-        let mut signals: Vec<Arc<dyn LoadSignal>> = Vec::new();
+        let mut signals: Vec<Rc<dyn LoadSignal>> = Vec::new();
         if let Some(memory) = signal_options.memory {
-            signals.push(Arc::new(MemoryLoadSignal::new(memory)));
+            signals.push(Rc::new(MemoryLoadSignal::new(memory)));
         }
         if let Some(event_loop) = signal_options.event_loop {
-            signals.push(Arc::new(EventLoopLoadSignal::new(event_loop)));
+            signals.push(Rc::new(EventLoopLoadSignal::new(event_loop)));
         }
         if let Some(cpu) = signal_options.cpu {
-            signals.push(Arc::new(CpuLoadSignal::new(cpu)));
+            signals.push(Rc::new(CpuLoadSignal::new(cpu)));
         }
         if let Some(storage) = signal_options.storage {
-            signals.push(Arc::new(StorageLoadSignal::new(storage)));
+            signals.push(Rc::new(StorageLoadSignal::new(storage)));
         }
         signals.extend(signal_options.custom.iter().cloned());
         let status = SystemStatus::new(signals.clone(), options.current_history, options.snapshot_history)?;
@@ -266,53 +266,53 @@ impl ConcurrencySystem {
         state.clamp_desired();
         Ok(ConcurrencySystem {
             options,
-            state: Mutex::new(state),
+            state: RefCell::new(state),
             signals,
             status,
-            tasks: Mutex::new(Vec::new()),
-            running: AtomicBool::new(false),
+            tasks: RefCell::new(Vec::new()),
+            running: Cell::new(false),
         })
     }
 
     pub fn desired_concurrency(&self) -> usize {
-        self.state.lock().desired
+        self.state.borrow_mut().desired
     }
 
     pub fn current_concurrency(&self) -> usize {
-        self.state.lock().current
+        self.state.borrow_mut().current
     }
 
     pub fn min_concurrency(&self) -> usize {
-        self.state.lock().min
+        self.state.borrow_mut().min
     }
 
     pub fn max_concurrency(&self) -> usize {
-        self.state.lock().max
+        self.state.borrow_mut().max
     }
 
     pub fn set_min_concurrency(&self, min: usize) {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         state.min = min.max(1);
         state.clamp_desired();
     }
 
     pub fn set_max_concurrency(&self, max: usize) {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         state.max = max.max(1);
         state.clamp_desired();
     }
 
     pub fn is_running(&self) -> bool {
-        self.running.load(Ordering::Acquire)
+        self.running.get()
     }
 
     /// Starts the load signals and the autoscaling. Does nothing when already running.
-    pub fn start(self: &Arc<Self>, services: &Services) {
-        if self.running.swap(true, Ordering::AcqRel) {
+    pub fn start(self: &Rc<Self>, services: &Services) {
+        if self.running.replace(true) {
             return;
         }
         {
-            let mut state = self.state.lock();
+            let mut state = self.state.borrow_mut();
             state.tasks_per_minute = VecDeque::from(vec![0; 60]);
             state.last_logged = None;
         }
@@ -320,10 +320,10 @@ impl ConcurrencySystem {
             signal.start(services, self.status.max_sample_window());
         }
 
-        let mut tasks = self.tasks.lock();
-        let system = Arc::downgrade(self);
+        let mut tasks = self.tasks.borrow_mut();
+        let system = Rc::downgrade(self);
         let interval = self.options.autoscale_interval;
-        tasks.push(tokio::spawn(async move {
+        tasks.push(tokio::task::spawn_local(async move {
             let mut ticker = tokio::time::interval(interval.max(Duration::from_millis(1)));
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
@@ -333,14 +333,14 @@ impl ConcurrencySystem {
             }
         }));
         if self.options.max_tasks_per_minute.is_some() {
-            let system = Arc::downgrade(self);
-            tasks.push(tokio::spawn(async move {
+            let system = Rc::downgrade(self);
+            tasks.push(tokio::task::spawn_local(async move {
                 let mut ticker = tokio::time::interval(Duration::from_secs(1));
                 ticker.tick().await;
                 loop {
                     ticker.tick().await;
                     let Some(system) = system.upgrade() else { return };
-                    let mut state = system.state.lock();
+                    let mut state = system.state.borrow_mut();
                     state.tasks_per_minute.push_front(0);
                     state.tasks_per_minute.pop_back();
                 }
@@ -349,10 +349,10 @@ impl ConcurrencySystem {
     }
 
     pub fn stop(&self) {
-        if !self.running.swap(false, Ordering::AcqRel) {
+        if !self.running.replace(false) {
             return;
         }
-        for task in self.tasks.lock().drain(..) {
+        for task in self.tasks.borrow_mut().drain(..) {
             task.abort();
         }
         for signal in &self.signals {
@@ -363,7 +363,7 @@ impl ConcurrencySystem {
     /// Whether a task may start now: fewer than `desired` are running, and the system is idle
     /// (or fewer than `min` are running).
     pub fn has_capacity_for_task(&self) -> bool {
-        let state = self.state.lock();
+        let state = self.state.borrow_mut();
         if state.current >= state.desired {
             return false;
         }
@@ -376,13 +376,14 @@ impl ConcurrencySystem {
 
     /// [`has_capacity_for_task`](Self::has_capacity_for_task), and the per-minute limit is not reached.
     pub fn can_start_task(&self) -> bool {
-        self.has_capacity_for_task() && !self.state.lock().over_max_tasks_per_minute(self.options.max_tasks_per_minute)
+        self.has_capacity_for_task()
+            && !self.state.borrow_mut().over_max_tasks_per_minute(self.options.max_tasks_per_minute)
     }
 
     /// Counts a task as started, whatever the capacity. Pair it with
     /// [`register_task_end`](Self::register_task_end).
     pub fn register_task_start(&self) {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         state.current += 1;
         if let Some(this_second) = state.tasks_per_minute.front_mut() {
             *this_second += 1;
@@ -399,7 +400,7 @@ impl ConcurrencySystem {
     }
 
     pub fn register_task_end(&self) {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         state.current = state.current.saturating_sub(1);
     }
 
@@ -410,7 +411,7 @@ impl ConcurrencySystem {
     /// One autoscaling step; runs every `autoscale_interval` while started.
     pub fn autoscale(&self) {
         let status = self.status.historical_status();
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         if state.over_max_tasks_per_minute(self.options.max_tasks_per_minute) {
             return;
         }
@@ -463,7 +464,7 @@ mod tests {
     /// A signal whose overload the test sets.
     #[derive(Default)]
     struct Switch {
-        overloaded: AtomicBool,
+        overloaded: Cell<bool>,
     }
 
     impl LoadSignal for Switch {
@@ -476,12 +477,12 @@ mod tests {
         fn start(&self, _: &Services, _: Duration) {}
         fn stop(&self) {}
         fn sample(&self, _: Option<Duration>) -> Vec<LoadSnapshot> {
-            vec![LoadSnapshot { created_at: Utc::now(), is_overloaded: self.overloaded.load(Ordering::SeqCst) }]
+            vec![LoadSnapshot { created_at: Utc::now(), is_overloaded: self.overloaded.get() }]
         }
     }
 
-    fn system(options: ConcurrencyOptions, switch: &Arc<Switch>) -> ConcurrencySystem {
-        let custom: Arc<dyn LoadSignal> = switch.clone();
+    fn system(options: ConcurrencyOptions, switch: &Rc<Switch>) -> ConcurrencySystem {
+        let custom: Rc<dyn LoadSignal> = switch.clone();
         ConcurrencySystem::new(ConcurrencyOptions {
             load_signals: LoadSignalsOptions {
                 memory: None,
@@ -497,7 +498,7 @@ mod tests {
 
     #[test]
     fn capacity_follows_desired_and_load() {
-        let switch = Arc::new(Switch::default());
+        let switch = Rc::new(Switch::default());
         let system = system(
             ConcurrencyOptions { min_concurrency: 2, desired_concurrency: Some(3), ..Default::default() },
             &switch,
@@ -508,14 +509,14 @@ mod tests {
         assert!(!system.try_register_task_start(), "desired concurrency reached");
         system.register_task_end();
         system.register_task_end();
-        switch.overloaded.store(true, Ordering::SeqCst);
+        switch.overloaded.set(true);
         assert!(system.try_register_task_start(), "below min, tasks start even when overloaded");
         assert!(!system.has_capacity_for_task(), "at min and overloaded");
     }
 
     #[test]
     fn scales_up_when_idle_and_busy_and_down_when_overloaded() {
-        let switch = Arc::new(Switch::default());
+        let switch = Rc::new(Switch::default());
         let system = system(ConcurrencyOptions { desired_concurrency: Some(10), ..Default::default() }, &switch);
 
         // Idle but only 8 of 10 in use (less than 90 %): no change.
@@ -529,7 +530,7 @@ mod tests {
         system.autoscale();
         assert_eq!(system.desired_concurrency(), 11, "ceil(10 * 0.05) = 1");
 
-        switch.overloaded.store(true, Ordering::SeqCst);
+        switch.overloaded.set(true);
         system.autoscale();
         assert_eq!(system.desired_concurrency(), 10);
         for _ in 0..20 {
@@ -540,7 +541,7 @@ mod tests {
 
     #[test]
     fn max_tasks_per_minute() {
-        let switch = Arc::new(Switch::default());
+        let switch = Rc::new(Switch::default());
         let system = system(
             ConcurrencyOptions { desired_concurrency: Some(10), max_tasks_per_minute: Some(2), ..Default::default() },
             &switch,
@@ -550,9 +551,9 @@ mod tests {
         assert!(system.try_register_task_start());
         system.register_task_end();
         assert!(!system.try_register_task_start(), "2 tasks started this minute");
-        system.state.lock().tasks_per_minute.rotate_right(59);
+        system.state.borrow_mut().tasks_per_minute.rotate_right(59);
         assert!(!system.try_register_task_start(), "still within the minute");
-        system.state.lock().tasks_per_minute = VecDeque::from(vec![0; 60]);
+        system.state.borrow_mut().tasks_per_minute = VecDeque::from(vec![0; 60]);
         assert!(system.try_register_task_start());
     }
 
@@ -562,8 +563,8 @@ mod tests {
             ConcurrencySystem::new(ConcurrencyOptions { min_concurrency: 5, max_concurrency: 2, ..Default::default() }),
             Err(ConcurrencyError::InvalidBounds)
         ));
-        let a: Arc<dyn LoadSignal> = Arc::new(Switch::default());
-        let b: Arc<dyn LoadSignal> = Arc::new(Switch::default());
+        let a: Rc<dyn LoadSignal> = Rc::new(Switch::default());
+        let b: Rc<dyn LoadSignal> = Rc::new(Switch::default());
         let options = ConcurrencyOptions {
             load_signals: LoadSignalsOptions { custom: vec![a, b], ..Default::default() },
             ..Default::default()
