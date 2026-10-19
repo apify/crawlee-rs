@@ -331,6 +331,24 @@ mod tests {
     }
 
     #[test]
+    fn cdata_surrounded_by_whitespace() {
+        let xml = "<urlset><url><loc>\n  <![CDATA[https://example.com/a]]>\n</loc>\n\
+<priority>\n<![CDATA[0.8]]>\n</priority></url></urlset>";
+        let items = parse_sitemap_xml(xml).unwrap();
+        assert_eq!(
+            items,
+            vec![SitemapItem::Url(SitemapUrl {
+                loc: "https://example.com/a".into(),
+                priority: Some(0.8),
+                ..Default::default()
+            })]
+        );
+        let index =
+            "<sitemapindex><sitemap><loc>\n<![CDATA[https://example.com/s.xml]]>\n</loc></sitemap></sitemapindex>";
+        assert_eq!(parse_sitemap_xml(index).unwrap(), vec![SitemapItem::Sitemap("https://example.com/s.xml".into())]);
+    }
+
+    #[test]
     fn sitemap_index_and_text() {
         let xml = "<sitemapindex><sitemap><loc>https://example.com/s1.xml</loc></sitemap>\
                    <sitemap><loc>https://example.com/s2.xml.gz</loc></sitemap></sitemapindex>";
