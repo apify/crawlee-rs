@@ -139,6 +139,9 @@ impl RequestManager for RequestQueue {
     async fn add_requests(&self, requests: Vec<Request>, forefront: bool) -> StorageResult<BatchAddRequestsResult> {
         let mut result = BatchAddRequestsResult::default();
         let mut to_add = Vec::with_capacity(requests.len());
+        // A batch keeps the first request of each unique key, as in Crawlee for JS: the Apify
+        // platform rejects a whole batch that repeats one.
+        let mut in_batch = std::collections::HashSet::with_capacity(requests.len());
         {
             let cache = self.added.lock();
             for request in requests {
@@ -150,7 +153,7 @@ impl RequestManager for RequestQueue {
                         was_already_present: true,
                         was_already_handled: false,
                     });
-                } else {
+                } else if in_batch.insert(request.unique_key.clone()) {
                     to_add.push(request);
                 }
             }
@@ -225,6 +228,80 @@ mod tests {
         assert!(request.handled_at.is_some());
         assert!(queue.is_finished().await.unwrap());
         assert_eq!(queue.handled_count().await.unwrap(), 1);
+    }
+
+    /// A backend that records the unique keys of each batch it gets, as the Apify platform sees them
+    /// (it rejects a batch that repeats one).
+    struct RecordingBackend {
+        inner: Arc<dyn RequestQueueBackend>,
+        batches: Mutex<Vec<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl RequestQueueBackend for RecordingBackend {
+        async fn get_metadata(&self) -> StorageResult<RequestQueueInfo> {
+            self.inner.get_metadata().await
+        }
+        async fn drop_storage(&self) -> StorageResult<()> {
+            self.inner.drop_storage().await
+        }
+        async fn purge(&self) -> StorageResult<()> {
+            self.inner.purge().await
+        }
+        async fn add_batch_of_requests(
+            &self,
+            requests: Vec<Request>,
+            forefront: bool,
+        ) -> StorageResult<BatchAddRequestsResult> {
+            self.batches.lock().push(requests.iter().map(|request| request.unique_key.clone()).collect());
+            self.inner.add_batch_of_requests(requests, forefront).await
+        }
+        async fn get_request(&self, unique_key: &str) -> StorageResult<Option<Request>> {
+            self.inner.get_request(unique_key).await
+        }
+        async fn fetch_next_request(&self) -> StorageResult<Option<Request>> {
+            self.inner.fetch_next_request().await
+        }
+        async fn mark_request_as_handled(&self, request: &Request) -> StorageResult<Option<QueueOperationInfo>> {
+            self.inner.mark_request_as_handled(request).await
+        }
+        async fn reclaim_request(
+            &self,
+            request: &Request,
+            forefront: bool,
+        ) -> StorageResult<Option<QueueOperationInfo>> {
+            self.inner.reclaim_request(request, forefront).await
+        }
+        async fn is_empty(&self) -> StorageResult<bool> {
+            self.inner.is_empty().await
+        }
+        async fn is_finished(&self) -> StorageResult<bool> {
+            self.inner.is_finished().await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_batch_reaches_the_backend_without_repeated_unique_keys() {
+        let storage = MemoryStorageBackend::new();
+        let inner = storage.create_request_queue_backend(&StorageIdentifier::Default).await.unwrap();
+        let backend = Arc::new(RecordingBackend { inner, batches: Mutex::new(Vec::new()) });
+        let queue = RequestQueue::from_backend(backend.clone());
+
+        for forefront in [false, true] {
+            let requests = ["https://example.com/a", "https://example.com/a/", "https://example.com/b"]
+                .map(|url| Request::new(format!("{url}?forefront={forefront}")));
+            let result = queue.add_requests(requests.to_vec(), forefront).await.unwrap();
+            assert!(result.unprocessed_requests.is_empty());
+        }
+
+        let batches = backend.batches.lock().clone();
+        assert_eq!(batches.len(), 2);
+        for batch in batches {
+            let mut unique = batch.clone();
+            unique.dedup();
+            assert_eq!(batch.len(), 2, "{batch:?}");
+            assert_eq!(unique, batch);
+        }
     }
 
     #[test]
