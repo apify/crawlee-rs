@@ -2,25 +2,25 @@
 
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::rc::Rc;
 
 use async_trait::async_trait;
 
 use crate::context::BasicContext;
 
-pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
+pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + 'static>>;
 
 /// Handles one request. Implemented for async closures `|ctx| async move { ... }` and for
 /// [`Router`](crate::Router).
-pub trait RequestHandler<C>: Send + Sync + 'static {
+pub trait RequestHandler<C>: 'static {
     fn handle(&self, ctx: C) -> BoxFuture<anyhow::Result<()>>;
 }
 
 impl<C, F, Fut> RequestHandler<C> for F
 where
-    C: Send + 'static,
-    F: Fn(C) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
+    C: 'static,
+    F: Fn(C) -> Fut + 'static,
+    Fut: Future<Output = anyhow::Result<()>> + 'static,
 {
     fn handle(&self, ctx: C) -> BoxFuture<anyhow::Result<()>> {
         Box::pin(self(ctx))
@@ -29,16 +29,16 @@ where
 
 /// Called with the basic context and the error, before a retry (`error_handler`) or after the
 /// last attempt failed (`failed_request_handler`). Changes to the request are kept.
-pub trait ErrorHandler: Send + Sync + 'static {
-    fn handle(&self, ctx: BasicContext, error: Arc<anyhow::Error>) -> BoxFuture<anyhow::Result<()>>;
+pub trait ErrorHandler: 'static {
+    fn handle(&self, ctx: BasicContext, error: Rc<anyhow::Error>) -> BoxFuture<anyhow::Result<()>>;
 }
 
 impl<F, Fut> ErrorHandler for F
 where
-    F: Fn(BasicContext, Arc<anyhow::Error>) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = anyhow::Result<()>> + Send + 'static,
+    F: Fn(BasicContext, Rc<anyhow::Error>) -> Fut + 'static,
+    Fut: Future<Output = anyhow::Result<()>> + 'static,
 {
-    fn handle(&self, ctx: BasicContext, error: Arc<anyhow::Error>) -> BoxFuture<anyhow::Result<()>> {
+    fn handle(&self, ctx: BasicContext, error: Rc<anyhow::Error>) -> BoxFuture<anyhow::Result<()>> {
         Box::pin(self(ctx, error))
     }
 }
@@ -49,9 +49,9 @@ where
 /// Middlewares compose with [`Then`]; the whole pipeline is a single `Middleware<BasicContext>`
 /// whose output is the context the request handler receives. Types are checked at compile time:
 /// a step can only follow a step whose output it accepts.
-#[async_trait]
-pub trait Middleware<In: Send + 'static>: Send + Sync + 'static {
-    type Out: Send + 'static;
+#[async_trait(?Send)]
+pub trait Middleware<In: 'static>: 'static {
+    type Out: 'static;
     async fn run(&self, input: In) -> anyhow::Result<Self::Out>;
 }
 
@@ -59,8 +59,8 @@ pub trait Middleware<In: Send + 'static>: Send + Sync + 'static {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Identity;
 
-#[async_trait]
-impl<In: Send + 'static> Middleware<In> for Identity {
+#[async_trait(?Send)]
+impl<In: 'static> Middleware<In> for Identity {
     type Out = In;
     async fn run(&self, input: In) -> anyhow::Result<In> {
         Ok(input)
@@ -71,10 +71,10 @@ impl<In: Send + 'static> Middleware<In> for Identity {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Then<A, B>(pub A, pub B);
 
-#[async_trait]
+#[async_trait(?Send)]
 impl<In, A, B> Middleware<In> for Then<A, B>
 where
-    In: Send + 'static,
+    In: 'static,
     A: Middleware<In>,
     B: Middleware<A::Out>,
 {
@@ -88,13 +88,13 @@ where
 /// A middleware from an async closure.
 pub struct FnMiddleware<F>(pub F);
 
-#[async_trait]
+#[async_trait(?Send)]
 impl<In, Out, F, Fut> Middleware<In> for FnMiddleware<F>
 where
-    In: Send + 'static,
-    Out: Send + 'static,
-    F: Fn(In) -> Fut + Send + Sync + 'static,
-    Fut: Future<Output = anyhow::Result<Out>> + Send + 'static,
+    In: 'static,
+    Out: 'static,
+    F: Fn(In) -> Fut + 'static,
+    Fut: Future<Output = anyhow::Result<Out>> + 'static,
 {
     type Out = Out;
     async fn run(&self, input: In) -> anyhow::Result<Out> {

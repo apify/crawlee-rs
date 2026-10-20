@@ -3,13 +3,14 @@
 //! State is guarded by synchronous mutexes that are never held across an `.await`, so operations
 //! are short critical sections rather than an async queue.
 
+use crate::local::CellExt as _;
+use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::rc::Rc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use parking_lot::Mutex;
+use std::cell::RefCell;
 
 use super::backend::*;
 use crate::errors::{StorageError, StorageResult};
@@ -73,7 +74,7 @@ impl StorageKey {
     }
 }
 
-type Registry<T> = Mutex<Vec<Arc<T>>>;
+type Registry<T> = RefCell<Vec<Rc<T>>>;
 
 /// Keeps every storage in process memory. Useful for tests and for crawls whose results are
 /// exported at the end.
@@ -100,9 +101,9 @@ fn open<T: Registered>(
     registry: &Registry<T>,
     identifier: &StorageIdentifier,
     create: impl FnOnce(StorageKey) -> T,
-) -> Arc<T> {
+) -> Rc<T> {
     let (is_alias, cache_key) = StorageKey::resolve(identifier);
-    let mut entries = registry.lock();
+    let mut entries = registry.borrow_mut();
     // A dropped storage is forgotten, so opening it again creates a fresh one.
     entries.retain(|entry| !entry.is_dropped());
     if let Some(found) = entries.iter().find(|entry| entry.key().matches(&cache_key)) {
@@ -113,54 +114,55 @@ fn open<T: Registered>(
         name: if is_alias { None } else { Some(cache_key.clone()) },
         cache_key,
     };
-    let created = Arc::new(create(key));
+    let created = Rc::new(create(key));
     entries.push(created.clone());
     created
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl StorageBackend for MemoryStorageBackend {
-    async fn create_dataset_backend(&self, id: &StorageIdentifier) -> StorageResult<Arc<dyn DatasetBackend>> {
-        let backend: Arc<MemoryDataset> = open(&self.datasets, id, MemoryDataset::new);
+    async fn create_dataset_backend(&self, id: &StorageIdentifier) -> StorageResult<Rc<dyn DatasetBackend>> {
+        let backend: Rc<MemoryDataset> = open(&self.datasets, id, MemoryDataset::new);
         Ok(backend)
     }
 
     async fn create_key_value_store_backend(
         &self,
         id: &StorageIdentifier,
-    ) -> StorageResult<Arc<dyn KeyValueStoreBackend>> {
-        let backend: Arc<MemoryKeyValueStore> = open(&self.key_value_stores, id, MemoryKeyValueStore::new);
+    ) -> StorageResult<Rc<dyn KeyValueStoreBackend>> {
+        let backend: Rc<MemoryKeyValueStore> = open(&self.key_value_stores, id, MemoryKeyValueStore::new);
         Ok(backend)
     }
 
-    async fn create_request_queue_backend(
-        &self,
-        id: &StorageIdentifier,
-    ) -> StorageResult<Arc<dyn RequestQueueBackend>> {
-        let backend: Arc<MemoryRequestQueue> = open(&self.request_queues, id, MemoryRequestQueue::new);
+    async fn create_request_queue_backend(&self, id: &StorageIdentifier) -> StorageResult<Rc<dyn RequestQueueBackend>> {
+        let backend: Rc<MemoryRequestQueue> = open(&self.request_queues, id, MemoryRequestQueue::new);
         Ok(backend)
     }
 
     async fn storage_exists(&self, id: &str, kind: StorageKind) -> StorageResult<bool> {
         Ok(match kind {
-            StorageKind::Dataset => self.datasets.lock().iter().any(|d| d.key.id == id && !d.is_dropped()),
+            StorageKind::Dataset => self.datasets.borrow_mut().iter().any(|d| d.key.id == id && !d.is_dropped()),
             StorageKind::KeyValueStore => {
-                self.key_value_stores.lock().iter().any(|s| s.key.id == id && !s.is_dropped())
+                self.key_value_stores.borrow_mut().iter().any(|s| s.key.id == id && !s.is_dropped())
             }
-            StorageKind::RequestQueue => self.request_queues.lock().iter().any(|q| q.key.id == id && !q.is_dropped()),
+            StorageKind::RequestQueue => {
+                self.request_queues.borrow_mut().iter().any(|q| q.key.id == id && !q.is_dropped())
+            }
         })
     }
 
     async fn purge(&self) -> StorageResult<()> {
-        let datasets: Vec<_> = self.datasets.lock().iter().filter(|d| d.key.is_run_scoped()).cloned().collect();
+        let datasets: Vec<_> = self.datasets.borrow_mut().iter().filter(|d| d.key.is_run_scoped()).cloned().collect();
         for dataset in datasets {
             dataset.purge_now();
         }
-        let stores: Vec<_> = self.key_value_stores.lock().iter().filter(|s| s.key.is_run_scoped()).cloned().collect();
+        let stores: Vec<_> =
+            self.key_value_stores.borrow_mut().iter().filter(|s| s.key.is_run_scoped()).cloned().collect();
         for store in stores {
             store.purge_now();
         }
-        let queues: Vec<_> = self.request_queues.lock().iter().filter(|q| q.key.is_run_scoped()).cloned().collect();
+        let queues: Vec<_> =
+            self.request_queues.borrow_mut().iter().filter(|q| q.key.is_run_scoped()).cloned().collect();
         for queue in queues {
             queue.purge_now();
         }
@@ -174,7 +176,7 @@ impl StorageBackend for MemoryStorageBackend {
 
 struct MemoryDataset {
     key: StorageKey,
-    state: Mutex<DatasetState>,
+    state: RefCell<DatasetState>,
 }
 
 struct DatasetState {
@@ -187,12 +189,12 @@ impl MemoryDataset {
     fn new(key: StorageKey) -> Self {
         MemoryDataset {
             key,
-            state: Mutex::new(DatasetState { items: Vec::new(), timestamps: Timestamps::new(), dropped: false }),
+            state: RefCell::new(DatasetState { items: Vec::new(), timestamps: Timestamps::new(), dropped: false }),
         }
     }
 
     fn purge_now(&self) {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         state.items.clear();
         state.timestamps.touch(true);
     }
@@ -202,10 +204,10 @@ fn gone(kind: &str, key: &StorageKey) -> StorageError {
     StorageError::NotFound(format!("{kind} '{}' was dropped", key.name.as_deref().unwrap_or(&key.id)))
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl DatasetBackend for MemoryDataset {
     async fn get_metadata(&self) -> StorageResult<DatasetInfo> {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         if state.dropped {
             return Err(gone("Dataset", &self.key));
         }
@@ -221,7 +223,7 @@ impl DatasetBackend for MemoryDataset {
     }
 
     async fn drop_storage(&self) -> StorageResult<()> {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         state.dropped = true;
         state.items = Vec::new();
         Ok(())
@@ -233,7 +235,7 @@ impl DatasetBackend for MemoryDataset {
     }
 
     async fn push_data(&self, items: Vec<DatasetItem>) -> StorageResult<()> {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         if state.dropped {
             return Err(gone("Dataset", &self.key));
         }
@@ -243,7 +245,7 @@ impl DatasetBackend for MemoryDataset {
     }
 
     async fn get_data(&self, options: DatasetListOptions) -> StorageResult<PaginatedList<DatasetItem>> {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         if state.dropped {
             return Err(gone("Dataset", &self.key));
         }
@@ -272,7 +274,7 @@ impl DatasetBackend for MemoryDataset {
 
 struct MemoryKeyValueStore {
     key: StorageKey,
-    state: Mutex<KeyValueStoreState>,
+    state: RefCell<KeyValueStoreState>,
 }
 
 struct KeyValueStoreState {
@@ -285,7 +287,7 @@ impl MemoryKeyValueStore {
     fn new(key: StorageKey) -> Self {
         MemoryKeyValueStore {
             key,
-            state: Mutex::new(KeyValueStoreState {
+            state: RefCell::new(KeyValueStoreState {
                 records: BTreeMap::new(),
                 timestamps: Timestamps::new(),
                 dropped: false,
@@ -294,16 +296,16 @@ impl MemoryKeyValueStore {
     }
 
     fn purge_now(&self) {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         state.records.clear();
         state.timestamps.touch(true);
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl KeyValueStoreBackend for MemoryKeyValueStore {
     async fn get_metadata(&self) -> StorageResult<KeyValueStoreInfo> {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         if state.dropped {
             return Err(gone("Key-value store", &self.key));
         }
@@ -318,7 +320,7 @@ impl KeyValueStoreBackend for MemoryKeyValueStore {
     }
 
     async fn drop_storage(&self) -> StorageResult<()> {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         state.dropped = true;
         state.records.clear();
         Ok(())
@@ -330,13 +332,13 @@ impl KeyValueStoreBackend for MemoryKeyValueStore {
     }
 
     async fn get_value(&self, key: &str) -> StorageResult<Option<KeyValueStoreRecord>> {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         state.timestamps.touch(false);
         Ok(state.records.get(key).cloned())
     }
 
     async fn set_value(&self, record: KeyValueStoreRecord) -> StorageResult<()> {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         if state.dropped {
             return Err(gone("Key-value store", &self.key));
         }
@@ -346,14 +348,14 @@ impl KeyValueStoreBackend for MemoryKeyValueStore {
     }
 
     async fn delete_value(&self, key: &str) -> StorageResult<()> {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         state.records.remove(key);
         state.timestamps.touch(true);
         Ok(())
     }
 
     async fn list_keys(&self, options: KeyValueStoreListKeysOptions) -> StorageResult<KeyValueStoreListKeysResult> {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         state.timestamps.touch(false);
         let limit = options.limit.unwrap_or(1000).max(1);
 
@@ -385,7 +387,7 @@ impl KeyValueStoreBackend for MemoryKeyValueStore {
     }
 
     async fn record_exists(&self, key: &str) -> StorageResult<bool> {
-        Ok(self.state.lock().records.contains_key(key))
+        Ok(self.state.borrow_mut().records.contains_key(key))
     }
 }
 
@@ -393,14 +395,16 @@ impl KeyValueStoreBackend for MemoryKeyValueStore {
 // Request queue
 // ---------------------------------------------------------------------------------------------
 
-/// Order numbers come from a process-wide counter rather than timestamps, so ordering is
-/// deterministic. Regular requests get increasing positive numbers (FIFO); forefront requests get
-/// decreasing negative numbers, so the most recent forefront request is served first, exactly as
-/// with the `±Date.now()` order numbers in Crawlee for JS.
-static ORDER_COUNTER: AtomicI64 = AtomicI64::new(1);
+thread_local! {
+    /// Order numbers come from a process-wide counter rather than timestamps, so ordering is
+    /// deterministic. Regular requests get increasing positive numbers (FIFO); forefront requests
+    /// get decreasing negative numbers, so the most recent forefront request is served first,
+    /// exactly as with the `±Date.now()` order numbers in Crawlee for JS.
+    static ORDER_COUNTER: Cell<i64> = const { Cell::new(1) };
+}
 
 fn next_order_no(forefront: bool) -> i64 {
-    let n = ORDER_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let n = ORDER_COUNTER.with(|counter| counter.fetch_add(1));
     if forefront { -n } else { n }
 }
 
@@ -428,14 +432,14 @@ impl QueueState {
 
 struct MemoryRequestQueue {
     key: StorageKey,
-    state: Mutex<QueueState>,
+    state: RefCell<QueueState>,
 }
 
 impl MemoryRequestQueue {
     fn new(key: StorageKey) -> Self {
         MemoryRequestQueue {
             key,
-            state: Mutex::new(QueueState {
+            state: RefCell::new(QueueState {
                 requests: HashMap::new(),
                 pending: BTreeMap::new(),
                 in_progress: HashSet::new(),
@@ -447,7 +451,7 @@ impl MemoryRequestQueue {
     }
 
     fn purge_now(&self) {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         state.requests.clear();
         state.pending.clear();
         state.in_progress.clear();
@@ -467,10 +471,10 @@ fn with_id(request: &Request, id: &str) -> StorageResult<Request> {
     Ok(request)
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl RequestQueueBackend for MemoryRequestQueue {
     async fn get_metadata(&self) -> StorageResult<RequestQueueInfo> {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         state.timestamps.touch(false);
         Ok(RequestQueueInfo {
             id: self.key.id.clone(),
@@ -486,7 +490,7 @@ impl RequestQueueBackend for MemoryRequestQueue {
 
     async fn drop_storage(&self) -> StorageResult<()> {
         self.purge_now();
-        self.state.lock().dropped = true;
+        self.state.borrow_mut().dropped = true;
         Ok(())
     }
 
@@ -500,7 +504,7 @@ impl RequestQueueBackend for MemoryRequestQueue {
         requests: Vec<Request>,
         forefront: bool,
     ) -> StorageResult<BatchAddRequestsResult> {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         let mut result = BatchAddRequestsResult::default();
 
         for request in requests {
@@ -540,13 +544,13 @@ impl RequestQueueBackend for MemoryRequestQueue {
 
     async fn get_request(&self, unique_key: &str) -> StorageResult<Option<Request>> {
         let id = unique_key_to_request_id(unique_key);
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         state.timestamps.touch(false);
         Ok(state.requests.get(&id).map(|stored| stored.request.clone()))
     }
 
     async fn fetch_next_request(&self) -> StorageResult<Option<Request>> {
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         state.timestamps.touch(false);
         let Some(id) = state.next_pending().cloned() else {
             return Ok(None);
@@ -557,7 +561,7 @@ impl RequestQueueBackend for MemoryRequestQueue {
 
     async fn mark_request_as_handled(&self, request: &Request) -> StorageResult<Option<QueueOperationInfo>> {
         let id = unique_key_to_request_id(&request.unique_key);
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         let Some(existing) = state.requests.get(&id) else {
             return Ok(None);
         };
@@ -584,7 +588,7 @@ impl RequestQueueBackend for MemoryRequestQueue {
 
     async fn reclaim_request(&self, request: &Request, forefront: bool) -> StorageResult<Option<QueueOperationInfo>> {
         let id = unique_key_to_request_id(&request.unique_key);
-        let mut state = self.state.lock();
+        let mut state = self.state.borrow_mut();
         let Some(previous_order_no) = state.requests.get(&id).and_then(|existing| existing.order_no) else {
             return Ok(None);
         };
@@ -601,11 +605,11 @@ impl RequestQueueBackend for MemoryRequestQueue {
     }
 
     async fn is_empty(&self) -> StorageResult<bool> {
-        Ok(self.state.lock().next_pending().is_none())
+        Ok(self.state.borrow_mut().next_pending().is_none())
     }
 
     async fn is_finished(&self) -> StorageResult<bool> {
-        Ok(self.state.lock().pending.is_empty())
+        Ok(self.state.borrow_mut().pending.is_empty())
     }
 }
 
@@ -614,7 +618,7 @@ impl Registered for MemoryDataset {
         &self.key
     }
     fn is_dropped(&self) -> bool {
-        self.state.lock().dropped
+        self.state.borrow_mut().dropped
     }
 }
 
@@ -623,7 +627,7 @@ impl Registered for MemoryKeyValueStore {
         &self.key
     }
     fn is_dropped(&self) -> bool {
-        self.state.lock().dropped
+        self.state.borrow_mut().dropped
     }
 }
 
@@ -632,7 +636,7 @@ impl Registered for MemoryRequestQueue {
         &self.key
     }
     fn is_dropped(&self) -> bool {
-        self.state.lock().dropped
+        self.state.borrow_mut().dropped
     }
 }
 
@@ -640,11 +644,11 @@ impl Registered for MemoryRequestQueue {
 mod tests {
     use super::*;
 
-    async fn queue() -> Arc<dyn RequestQueueBackend> {
+    async fn queue() -> Rc<dyn RequestQueueBackend> {
         MemoryStorageBackend::new().create_request_queue_backend(&StorageIdentifier::Default).await.unwrap()
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn fifo_with_forefront() {
         let queue = queue().await;
         queue
@@ -665,7 +669,7 @@ mod tests {
         assert!(queue.fetch_next_request().await.unwrap().is_none());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn dedup_handle_reclaim_and_finish() {
         let queue = queue().await;
         let added = queue
@@ -693,7 +697,7 @@ mod tests {
         assert!(again.processed_requests[0].was_already_handled);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn named_storages_are_shared_and_default_is_purged() {
         let backend = MemoryStorageBackend::new();
         let a = backend.create_dataset_backend(&StorageIdentifier::name("results")).await.unwrap();

@@ -15,11 +15,12 @@
 //!   request_queues/default/<request id>.json, ..., __metadata__.json
 //! ```
 
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::rc::Rc;
 use std::time::Duration;
 
+use crate::local::Mutex;
 use async_trait::async_trait;
 use bytes::Bytes;
 use crawlee_storage::dataset::FileSystemDatasetClient;
@@ -28,7 +29,6 @@ use crawlee_storage::models::{AdoptableFile, AdoptionCandidate, AdoptionRule, St
 use crawlee_storage::request_queue::FileSystemRequestQueueClient;
 use serde_json::Value;
 use serde_json::value::RawValue;
-use tokio::sync::Mutex;
 
 use super::backend::{
     BatchAddRequestsResult, DatasetBackend, DatasetInfo, DatasetItem, DatasetListOptions, KeyValueStoreBackend,
@@ -80,7 +80,7 @@ struct CacheEntry {
     id: String,
     name: Option<String>,
     cache_key: String,
-    dropped: AtomicBool,
+    dropped: Cell<bool>,
 }
 
 impl CacheEntry {
@@ -116,7 +116,7 @@ fn cache_entry(resolved: &Resolved, metadata: &StorageMetadata) -> CacheEntry {
         id: metadata.id.clone(),
         name: metadata.name.clone(),
         cache_key: resolved.cache_key.clone(),
-        dropped: AtomicBool::new(false),
+        dropped: Cell::new(false),
     }
 }
 
@@ -125,8 +125,8 @@ trait Cached {
 }
 
 /// Returns the opened storage `key` refers to, pruning dropped ones.
-fn find_cached<T: Cached>(cache: &mut Vec<Arc<T>>, key: &str) -> Option<Arc<T>> {
-    cache.retain(|storage| !storage.entry().dropped.load(Ordering::Relaxed));
+fn find_cached<T: Cached>(cache: &mut Vec<Rc<T>>, key: &str) -> Option<Rc<T>> {
+    cache.retain(|storage| !storage.entry().dropped.get());
     cache.iter().find(|storage| storage.entry().matches(key)).cloned()
 }
 
@@ -138,9 +138,9 @@ pub struct FileSystemStorageBackend {
     input_keys: Vec<String>,
     // Held across the `open` of a storage, so that two tasks opening the same storage get the
     // same client instead of racing two clients onto one directory.
-    datasets: Mutex<Vec<Arc<FsDataset>>>,
-    key_value_stores: Mutex<Vec<Arc<FsKeyValueStore>>>,
-    request_queues: Mutex<Vec<Arc<FsRequestQueue>>>,
+    datasets: Mutex<Vec<Rc<FsDataset>>>,
+    key_value_stores: Mutex<Vec<Rc<FsKeyValueStore>>>,
+    request_queues: Mutex<Vec<Rc<FsRequestQueue>>>,
 }
 
 impl std::fmt::Debug for FileSystemStorageBackend {
@@ -191,7 +191,7 @@ impl FileSystemStorageBackend {
         })
     }
 
-    async fn open_dataset(&self, identifier: &StorageIdentifier) -> StorageResult<Arc<FsDataset>> {
+    async fn open_dataset(&self, identifier: &StorageIdentifier) -> StorageResult<Rc<FsDataset>> {
         let resolved = resolve(identifier);
         let mut cache = self.datasets.lock().await;
         if let Some(found) = find_cached(&mut cache, &resolved.cache_key) {
@@ -205,12 +205,12 @@ impl FileSystemStorageBackend {
         )
         .await?;
         let entry = cache_entry(&resolved, &client.get_metadata().await.base);
-        let dataset = Arc::new(FsDataset { client, entry });
+        let dataset = Rc::new(FsDataset { client, entry });
         cache.push(dataset.clone());
         Ok(dataset)
     }
 
-    async fn open_key_value_store(&self, identifier: &StorageIdentifier) -> StorageResult<Arc<FsKeyValueStore>> {
+    async fn open_key_value_store(&self, identifier: &StorageIdentifier) -> StorageResult<Rc<FsKeyValueStore>> {
         let resolved = resolve(identifier);
         let mut cache = self.key_value_stores.lock().await;
         if let Some(found) = find_cached(&mut cache, &resolved.cache_key) {
@@ -249,12 +249,12 @@ impl FileSystemStorageBackend {
         )
         .await?;
         let entry = cache_entry(&resolved, &client.get_metadata().await.base);
-        let store = Arc::new(FsKeyValueStore { client, entry });
+        let store = Rc::new(FsKeyValueStore { client, entry });
         cache.push(store.clone());
         Ok(store)
     }
 
-    async fn open_request_queue(&self, identifier: &StorageIdentifier) -> StorageResult<Arc<FsRequestQueue>> {
+    async fn open_request_queue(&self, identifier: &StorageIdentifier) -> StorageResult<Rc<FsRequestQueue>> {
         let resolved = resolve(identifier);
         let mut cache = self.request_queues.lock().await;
         if let Some(found) = find_cached(&mut cache, &resolved.cache_key) {
@@ -270,7 +270,7 @@ impl FileSystemStorageBackend {
         )
         .await?;
         let entry = cache_entry(&resolved, &client.get_metadata().await.base);
-        let queue = Arc::new(FsRequestQueue { client, entry });
+        let queue = Rc::new(FsRequestQueue { client, entry });
         cache.push(queue.clone());
         Ok(queue)
     }
@@ -326,23 +326,20 @@ fn metadata_id(metadata: Value) -> Option<String> {
     metadata.get("id")?.as_str().map(str::to_owned)
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl StorageBackend for FileSystemStorageBackend {
-    async fn create_dataset_backend(&self, id: &StorageIdentifier) -> StorageResult<Arc<dyn DatasetBackend>> {
+    async fn create_dataset_backend(&self, id: &StorageIdentifier) -> StorageResult<Rc<dyn DatasetBackend>> {
         Ok(self.open_dataset(id).await?)
     }
 
     async fn create_key_value_store_backend(
         &self,
         id: &StorageIdentifier,
-    ) -> StorageResult<Arc<dyn KeyValueStoreBackend>> {
+    ) -> StorageResult<Rc<dyn KeyValueStoreBackend>> {
         Ok(self.open_key_value_store(id).await?)
     }
 
-    async fn create_request_queue_backend(
-        &self,
-        id: &StorageIdentifier,
-    ) -> StorageResult<Arc<dyn RequestQueueBackend>> {
+    async fn create_request_queue_backend(&self, id: &StorageIdentifier) -> StorageResult<Rc<dyn RequestQueueBackend>> {
         Ok(self.open_request_queue(id).await?)
     }
 
@@ -395,7 +392,7 @@ impl Cached for FsDataset {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl DatasetBackend for FsDataset {
     async fn get_metadata(&self) -> StorageResult<DatasetInfo> {
         let metadata = self.client.get_metadata().await;
@@ -412,7 +409,7 @@ impl DatasetBackend for FsDataset {
 
     async fn drop_storage(&self) -> StorageResult<()> {
         self.client.drop_storage().await?;
-        self.entry.dropped.store(true, Ordering::Relaxed);
+        self.entry.dropped.set(true);
         Ok(())
     }
 
@@ -454,7 +451,7 @@ impl Cached for FsKeyValueStore {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl KeyValueStoreBackend for FsKeyValueStore {
     async fn get_metadata(&self) -> StorageResult<KeyValueStoreInfo> {
         let base = self.client.get_metadata().await.base;
@@ -469,7 +466,7 @@ impl KeyValueStoreBackend for FsKeyValueStore {
 
     async fn drop_storage(&self) -> StorageResult<()> {
         self.client.drop_storage().await?;
-        self.entry.dropped.store(true, Ordering::Relaxed);
+        self.entry.dropped.set(true);
         Ok(())
     }
 
@@ -554,7 +551,7 @@ fn chrono_duration(duration: Duration) -> StorageResult<chrono::Duration> {
     chrono::Duration::from_std(duration).map_err(|err| StorageError::InvalidArgument(err.to_string()))
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl RequestQueueBackend for FsRequestQueue {
     async fn get_metadata(&self) -> StorageResult<RequestQueueInfo> {
         let metadata = self.client.get_metadata().await;
@@ -573,7 +570,7 @@ impl RequestQueueBackend for FsRequestQueue {
 
     async fn drop_storage(&self) -> StorageResult<()> {
         self.client.drop_storage().await?;
-        self.entry.dropped.store(true, Ordering::Relaxed);
+        self.entry.dropped.set(true);
         Ok(())
     }
 

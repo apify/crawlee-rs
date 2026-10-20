@@ -11,7 +11,7 @@ pub mod cookies;
 #[cfg(feature = "reqwest")]
 pub mod reqwest_transport;
 
-use std::sync::Arc;
+use std::rc::Rc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -66,7 +66,7 @@ pub struct SendOptions {
     pub proxy_url: Option<Url>,
     /// Cookies are read from and written to this jar. Without one, cookies still flow across
     /// redirects within the request.
-    pub cookie_jar: Option<Arc<CookieJar>>,
+    pub cookie_jar: Option<Rc<CookieJar>>,
     /// Timeout for the whole request, redirects and body included.
     pub timeout: Option<Duration>,
     pub ignore_tls_errors: bool,
@@ -108,8 +108,8 @@ impl HttpClientError {
 }
 
 /// An HTTP client usable by crawlers.
-#[async_trait]
-pub trait HttpClient: Send + Sync {
+#[async_trait(?Send)]
+pub trait HttpClient {
     async fn send_request(&self, request: HttpRequest, options: &SendOptions) -> Result<HttpResponse, HttpClientError>;
 
     /// Nothing sends through this proxy anymore (the session of a crawler without a session pool
@@ -118,8 +118,8 @@ pub trait HttpClient: Send + Sync {
 }
 
 /// A single request/response exchange, without following redirects or handling cookies.
-#[async_trait]
-pub trait Transport: Send + Sync {
+#[async_trait(?Send)]
+pub trait Transport {
     async fn fetch(&self, request: HttpRequest, options: &TransportOptions) -> Result<HttpResponse, HttpClientError>;
 
     /// See [`HttpClient::release_proxy`].
@@ -148,7 +148,7 @@ impl<T: Transport> RedirectingClient<T> {
     }
 
     async fn send_inner(&self, initial: HttpRequest, options: &SendOptions) -> Result<HttpResponse, HttpClientError> {
-        let jar = options.cookie_jar.clone().unwrap_or_else(|| Arc::new(CookieJar::new()));
+        let jar = options.cookie_jar.clone().unwrap_or_else(|| Rc::new(CookieJar::new()));
         let transport_options = TransportOptions {
             proxy_url: options.proxy_url.clone(),
             ignore_tls_errors: options.ignore_tls_errors,
@@ -217,7 +217,7 @@ fn apply_cookies(request: &mut HttpRequest, jar: &CookieJar) {
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl<T: Transport> HttpClient for RedirectingClient<T> {
     async fn send_request(&self, request: HttpRequest, options: &SendOptions) -> Result<HttpResponse, HttpClientError> {
         match options.timeout {
@@ -233,8 +233,8 @@ impl<T: Transport> HttpClient for RedirectingClient<T> {
     }
 }
 
-#[async_trait]
-impl<C: HttpClient + ?Sized> HttpClient for Arc<C> {
+#[async_trait(?Send)]
+impl<C: HttpClient + ?Sized> HttpClient for Rc<C> {
     async fn send_request(&self, request: HttpRequest, options: &SendOptions) -> Result<HttpResponse, HttpClientError> {
         (**self).send_request(request, options).await
     }
@@ -246,34 +246,34 @@ impl<C: HttpClient + ?Sized> HttpClient for Arc<C> {
 
 /// The default client: [`ReqwestTransport`] behind the shared redirect and cookie logic.
 #[cfg(feature = "reqwest")]
-pub fn default_client() -> Arc<dyn HttpClient> {
-    Arc::new(RedirectingClient::new(ReqwestTransport::new()))
+pub fn default_client() -> Rc<dyn HttpClient> {
+    Rc::new(RedirectingClient::new(ReqwestTransport::new()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use parking_lot::Mutex;
+    use std::cell::RefCell;
 
     type ScriptedResponse = (u16, Vec<(&'static str, &'static str)>);
 
     /// Serves scripted responses and records what it was asked for.
     #[derive(Default)]
     struct Scripted {
-        responses: Mutex<Vec<ScriptedResponse>>,
-        seen: Mutex<Vec<HttpRequest>>,
+        responses: RefCell<Vec<ScriptedResponse>>,
+        seen: RefCell<Vec<HttpRequest>>,
     }
 
-    #[async_trait]
+    #[async_trait(?Send)]
     impl Transport for Scripted {
         async fn fetch(&self, request: HttpRequest, _: &TransportOptions) -> Result<HttpResponse, HttpClientError> {
-            let (status, headers) = self.responses.lock().remove(0);
+            let (status, headers) = self.responses.borrow_mut().remove(0);
             let mut map = HeaderMap::new();
             for (name, value) in headers {
                 map.append(http::HeaderName::from_static(name), HeaderValue::from_static(value));
             }
             let url = request.url.clone();
-            self.seen.lock().push(request);
+            self.seen.borrow_mut().push(request);
             Ok(HttpResponse {
                 status: StatusCode::from_u16(status).unwrap(),
                 headers: map,
@@ -284,10 +284,10 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn follows_redirects_with_cookies_and_method_rewrites() {
         let transport = Scripted::default();
-        *transport.responses.lock() = vec![
+        *transport.responses.borrow_mut() = vec![
             (302, vec![("location", "/next"), ("set-cookie", "sid=1; Path=/")]),
             (301, vec![("location", "https://other.dev/final")]),
             (200, vec![]),
@@ -299,7 +299,7 @@ mod tests {
         request.body = Some(Bytes::from_static(b"q=1"));
         request.headers.insert(AUTHORIZATION, HeaderValue::from_static("secret"));
 
-        let jar = Arc::new(CookieJar::new());
+        let jar = Rc::new(CookieJar::new());
         let response = client
             .send_request(request, &SendOptions { cookie_jar: Some(jar.clone()), ..Default::default() })
             .await
@@ -308,7 +308,7 @@ mod tests {
         assert_eq!(response.url.as_str(), "https://other.dev/final");
         assert_eq!(response.redirects.len(), 2);
 
-        let seen = client.transport().seen.lock();
+        let seen = client.transport().seen.borrow_mut();
         assert_eq!(seen[1].method, Method::GET, "302 after POST becomes GET");
         assert!(seen[1].body.is_none());
         assert_eq!(seen[1].headers.get(COOKIE).unwrap(), "sid=1");
@@ -318,10 +318,10 @@ mod tests {
         assert_eq!(jar.cookie_header(&Url::parse("https://example.com/").unwrap()).as_deref(), Some("sid=1"));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn stops_after_too_many_redirects() {
         let transport = Scripted::default();
-        *transport.responses.lock() = (0..=MAX_REDIRECTS).map(|_| (302, vec![("location", "/loop")])).collect();
+        *transport.responses.borrow_mut() = (0..=MAX_REDIRECTS).map(|_| (302, vec![("location", "/loop")])).collect();
         let client = RedirectingClient::new(transport);
         let err = client
             .send_request(HttpRequest::get(Url::parse("https://example.com/").unwrap()), &SendOptions::default())

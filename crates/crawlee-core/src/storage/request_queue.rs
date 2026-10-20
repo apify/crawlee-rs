@@ -1,10 +1,10 @@
 //! [`RequestQueue`] and the [`RequestManager`] trait crawlers consume requests through.
 
-use std::sync::Arc;
+use std::rc::Rc;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use parking_lot::Mutex;
+use std::cell::RefCell;
 
 use super::backend::{
     BatchAddRequestsResult, ProcessedRequest, QueueOperationInfo, RequestQueueBackend, RequestQueueInfo,
@@ -15,8 +15,8 @@ use crate::request::{Request, unique_key_to_request_id};
 
 /// Source and sink of requests for a crawler. [`RequestQueue`] is the default implementation;
 /// other request sources (lists, sitemaps, per-domain throttling) implement it as well.
-#[async_trait]
-pub trait RequestManager: Send + Sync {
+#[async_trait(?Send)]
+pub trait RequestManager {
     async fn add_requests(&self, requests: Vec<Request>, forefront: bool) -> StorageResult<BatchAddRequestsResult>;
     async fn fetch_next_request(&self) -> StorageResult<Option<Request>>;
     async fn mark_request_as_handled(&self, request: &mut Request) -> StorageResult<Option<QueueOperationInfo>>;
@@ -85,8 +85,8 @@ impl DedupCache {
 /// the queue.
 #[derive(Clone)]
 pub struct RequestQueue {
-    backend: Arc<dyn RequestQueueBackend>,
-    added: Arc<Mutex<DedupCache>>,
+    backend: Rc<dyn RequestQueueBackend>,
+    added: Rc<RefCell<DedupCache>>,
 }
 
 impl std::fmt::Debug for RequestQueue {
@@ -100,11 +100,11 @@ impl RequestQueue {
         Ok(Self::from_backend(storage.create_request_queue_backend(id).await?))
     }
 
-    pub fn from_backend(backend: Arc<dyn RequestQueueBackend>) -> Self {
-        RequestQueue { backend, added: Arc::new(Mutex::new(DedupCache { slots: None })) }
+    pub fn from_backend(backend: Rc<dyn RequestQueueBackend>) -> Self {
+        RequestQueue { backend, added: Rc::new(RefCell::new(DedupCache { slots: None })) }
     }
 
-    pub fn backend(&self) -> &Arc<dyn RequestQueueBackend> {
+    pub fn backend(&self) -> &Rc<dyn RequestQueueBackend> {
         &self.backend
     }
 
@@ -129,12 +129,12 @@ impl RequestQueue {
     }
 
     pub async fn drop_storage(self) -> StorageResult<()> {
-        self.added.lock().clear();
+        self.added.borrow_mut().clear();
         self.backend.drop_storage().await
     }
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl RequestManager for RequestQueue {
     async fn add_requests(&self, requests: Vec<Request>, forefront: bool) -> StorageResult<BatchAddRequestsResult> {
         let mut result = BatchAddRequestsResult::default();
@@ -143,7 +143,7 @@ impl RequestManager for RequestQueue {
         // platform rejects a whole batch that repeats one.
         let mut in_batch = std::collections::HashSet::with_capacity(requests.len());
         {
-            let cache = self.added.lock();
+            let cache = self.added.borrow_mut();
             for request in requests {
                 // A forefront add of a known request is not skipped: it may be meant to reorder.
                 if !forefront && cache.contains(&request.unique_key) {
@@ -165,7 +165,7 @@ impl RequestManager for RequestQueue {
 
         let added = self.backend.add_batch_of_requests(to_add, forefront).await?;
         {
-            let mut cache = self.added.lock();
+            let mut cache = self.added.borrow_mut();
             for processed in &added.processed_requests {
                 cache.insert(&processed.unique_key);
             }
@@ -212,7 +212,7 @@ mod tests {
     use super::*;
     use crate::storage::memory::MemoryStorageBackend;
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn repeated_adds_are_served_from_the_cache() {
         let storage = MemoryStorageBackend::new();
         let queue = RequestQueue::open(&storage, &StorageIdentifier::Default).await.unwrap();

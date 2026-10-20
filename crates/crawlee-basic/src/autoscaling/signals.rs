@@ -3,11 +3,11 @@
 //! Crawlee for JS.
 
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::rc::Rc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use parking_lot::Mutex;
+use std::cell::RefCell;
 use tokio::task::JoinHandle;
 
 use crawlee_core::{Event, EventKind, EventManager, Services, SystemInfo};
@@ -32,7 +32,7 @@ pub struct LoadSignalInfo {
 /// A source of [`LoadSnapshot`]s. The built-in ones measure memory, CPU, runtime responsiveness
 /// and storage rate limiting; custom ones can be added through
 /// [`LoadSignalsOptions::custom`](super::LoadSignalsOptions::custom).
-pub trait LoadSignal: Send + Sync + 'static {
+pub trait LoadSignal: 'static {
     /// Unique among the signals of one concurrency system.
     fn name(&self) -> &str;
     /// Overloaded when more than this share of the sampled time was overloaded.
@@ -117,23 +117,23 @@ pub fn evaluate_sample(sample: &[LoadSnapshot], overloaded_ratio: f64) -> LoadSi
 
 /// The `SystemInfo` listener of a signal, removed on stop.
 #[derive(Default)]
-struct Subscription(Mutex<Option<(EventManager, crawlee_core::events::ListenerId)>>);
+struct Subscription(RefCell<Option<(EventManager, crawlee_core::events::ListenerId)>>);
 
 impl Subscription {
-    fn subscribe(&self, events: &EventManager, handle: impl Fn(SystemInfo) + Send + Sync + 'static) {
+    fn subscribe(&self, events: &EventManager, handle: impl Fn(SystemInfo) + 'static) {
         let id = events.on(EventKind::SystemInfo, move |event| {
             if let Event::SystemInfo(info) = event {
                 handle(info);
             }
             async {}
         });
-        if let Some((events, previous)) = self.0.lock().replace((events.clone(), id)) {
+        if let Some((events, previous)) = self.0.borrow_mut().replace((events.clone(), id)) {
             events.off(previous);
         }
     }
 
     fn unsubscribe(&self) {
-        if let Some((events, id)) = self.0.lock().take() {
+        if let Some((events, id)) = self.0.borrow_mut().take() {
             events.off(id);
         }
     }
@@ -141,11 +141,11 @@ impl Subscription {
 
 /// A task that takes snapshots on an interval, aborted on stop.
 #[derive(Default)]
-struct Ticker(Mutex<Option<JoinHandle<()>>>);
+struct Ticker(RefCell<Option<JoinHandle<()>>>);
 
 impl Ticker {
-    fn start(&self, interval: Duration, mut tick: impl FnMut() + Send + 'static) {
-        let task = tokio::spawn(async move {
+    fn start(&self, interval: Duration, mut tick: impl FnMut() + 'static) {
+        let task = tokio::task::spawn_local(async move {
             let mut interval = tokio::time::interval(interval.max(Duration::from_millis(1)));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
@@ -153,13 +153,13 @@ impl Ticker {
                 tick();
             }
         });
-        if let Some(previous) = self.0.lock().replace(task) {
+        if let Some(previous) = self.0.borrow_mut().replace(task) {
             previous.abort();
         }
     }
 
     fn stop(&self) {
-        if let Some(task) = self.0.lock().take() {
+        if let Some(task) = self.0.borrow_mut().take() {
             task.abort();
         }
     }
@@ -189,7 +189,7 @@ impl Default for MemoryLoadSignalOptions {
 /// [`available_memory_ratio`](crawlee_core::Configuration::available_memory_ratio) of the total.
 pub struct MemoryLoadSignal {
     options: MemoryLoadSignalOptions,
-    store: Arc<Mutex<SnapshotStore>>,
+    store: Rc<RefCell<SnapshotStore>>,
     subscription: Subscription,
 }
 
@@ -198,7 +198,7 @@ const RESERVE_MEMORY_RATIO: f64 = 0.5;
 
 impl MemoryLoadSignal {
     pub fn new(options: MemoryLoadSignalOptions) -> Self {
-        MemoryLoadSignal { options, store: Arc::default(), subscription: Subscription::default() }
+        MemoryLoadSignal { options, store: Rc::default(), subscription: Subscription::default() }
     }
 }
 
@@ -213,7 +213,7 @@ impl LoadSignal for MemoryLoadSignal {
 
     fn start(&self, services: &Services, max_sample_window: Duration) {
         {
-            let mut store = self.store.lock();
+            let mut store = self.store.borrow_mut();
             store.use_sample_window(max_sample_window);
             store.clear();
         }
@@ -229,17 +229,17 @@ impl LoadSignal for MemoryLoadSignal {
         }
         let max_used_ratio = self.options.max_used_ratio;
         let store = self.store.clone();
-        let last_warning: Mutex<Option<DateTime<Utc>>> = Mutex::new(None);
+        let last_warning: RefCell<Option<DateTime<Utc>>> = RefCell::new(None);
         self.subscription.subscribe(&services.events, move |info| {
             let (Some(used), Some(total)) = (info.mem_current_bytes, info.mem_total_bytes) else {
                 return;
             };
             let max_bytes = fixed_max_bytes.unwrap_or(ratio * total as f64);
             let used = used as f64;
-            store.lock().push(LoadSnapshot { created_at: info.created_at, is_overloaded: used / max_bytes > max_used_ratio });
+            store.borrow_mut().push(LoadSnapshot { created_at: info.created_at, is_overloaded: used / max_bytes > max_used_ratio });
 
             let critical = max_bytes * max_used_ratio + max_bytes * (1.0 - max_used_ratio) * RESERVE_MEMORY_RATIO;
-            let mut last_warning = last_warning.lock();
+            let mut last_warning = last_warning.borrow_mut();
             let rate_limited = last_warning.is_some_and(|at| info.created_at < at + CRITICAL_OVERLOAD_LOG_INTERVAL);
             if used > critical && !rate_limited {
                 let mb = |bytes: f64| (bytes / (1024.0 * 1024.0)).round();
@@ -259,7 +259,7 @@ impl LoadSignal for MemoryLoadSignal {
     }
 
     fn sample(&self, duration: Option<Duration>) -> Vec<LoadSnapshot> {
-        self.store.lock().sample(duration)
+        self.store.borrow_mut().sample(duration)
     }
 }
 
@@ -278,13 +278,13 @@ impl Default for CpuLoadSignalOptions {
 /// [`max_used_cpu_ratio`](crawlee_core::Configuration::max_used_cpu_ratio).
 pub struct CpuLoadSignal {
     options: CpuLoadSignalOptions,
-    store: Arc<Mutex<SnapshotStore>>,
+    store: Rc<RefCell<SnapshotStore>>,
     subscription: Subscription,
 }
 
 impl CpuLoadSignal {
     pub fn new(options: CpuLoadSignalOptions) -> Self {
-        CpuLoadSignal { options, store: Arc::default(), subscription: Subscription::default() }
+        CpuLoadSignal { options, store: Rc::default(), subscription: Subscription::default() }
     }
 }
 
@@ -299,13 +299,15 @@ impl LoadSignal for CpuLoadSignal {
 
     fn start(&self, services: &Services, max_sample_window: Duration) {
         {
-            let mut store = self.store.lock();
+            let mut store = self.store.borrow_mut();
             store.use_sample_window(max_sample_window);
             store.clear();
         }
         let store = self.store.clone();
         self.subscription.subscribe(&services.events, move |info| {
-            store.lock().push(LoadSnapshot { created_at: info.created_at, is_overloaded: info.is_cpu_overloaded });
+            store
+                .borrow_mut()
+                .push(LoadSnapshot { created_at: info.created_at, is_overloaded: info.is_cpu_overloaded });
         });
     }
 
@@ -314,7 +316,7 @@ impl LoadSignal for CpuLoadSignal {
     }
 
     fn sample(&self, duration: Option<Duration>) -> Vec<LoadSnapshot> {
-        self.store.lock().sample(duration)
+        self.store.borrow_mut().sample(duration)
     }
 }
 
@@ -341,13 +343,13 @@ impl Default for EventLoopLoadSignalOptions {
 /// handler code that does not yield).
 pub struct EventLoopLoadSignal {
     options: EventLoopLoadSignalOptions,
-    store: Arc<Mutex<SnapshotStore>>,
+    store: Rc<RefCell<SnapshotStore>>,
     ticker: Ticker,
 }
 
 impl EventLoopLoadSignal {
     pub fn new(options: EventLoopLoadSignalOptions) -> Self {
-        EventLoopLoadSignal { options, store: Arc::default(), ticker: Ticker::default() }
+        EventLoopLoadSignal { options, store: Rc::default(), ticker: Ticker::default() }
     }
 }
 
@@ -362,7 +364,7 @@ impl LoadSignal for EventLoopLoadSignal {
 
     fn start(&self, _services: &Services, max_sample_window: Duration) {
         {
-            let mut store = self.store.lock();
+            let mut store = self.store.borrow_mut();
             store.use_sample_window(max_sample_window);
             store.clear();
         }
@@ -373,7 +375,7 @@ impl LoadSignal for EventLoopLoadSignal {
             let now = tokio::time::Instant::now();
             let late = previous.map(|previous| now.duration_since(previous).saturating_sub(interval));
             previous = Some(now);
-            store.lock().push(LoadSnapshot {
+            store.borrow_mut().push(LoadSnapshot {
                 created_at: Utc::now(),
                 is_overloaded: late.is_some_and(|late| late > max_blocked),
             });
@@ -385,7 +387,7 @@ impl LoadSignal for EventLoopLoadSignal {
     }
 
     fn sample(&self, duration: Option<Duration>) -> Vec<LoadSnapshot> {
-        self.store.lock().sample(duration)
+        self.store.borrow_mut().sample(duration)
     }
 }
 
@@ -409,13 +411,13 @@ impl Default for StorageLoadSignalOptions {
 /// storages never report any; a platform storage does.
 pub struct StorageLoadSignal {
     options: StorageLoadSignalOptions,
-    store: Arc<Mutex<SnapshotStore>>,
+    store: Rc<RefCell<SnapshotStore>>,
     ticker: Ticker,
 }
 
 impl StorageLoadSignal {
     pub fn new(options: StorageLoadSignalOptions) -> Self {
-        StorageLoadSignal { options, store: Arc::default(), ticker: Ticker::default() }
+        StorageLoadSignal { options, store: Rc::default(), ticker: Ticker::default() }
     }
 }
 
@@ -430,7 +432,7 @@ impl LoadSignal for StorageLoadSignal {
 
     fn start(&self, services: &Services, max_sample_window: Duration) {
         {
-            let mut store = self.store.lock();
+            let mut store = self.store.borrow_mut();
             store.use_sample_window(max_sample_window);
             store.clear();
         }
@@ -442,7 +444,7 @@ impl LoadSignal for StorageLoadSignal {
             let errors = storage.rate_limit_errors();
             let delta = previous.map(|previous| errors.saturating_sub(previous));
             previous = Some(errors);
-            store.lock().push(LoadSnapshot {
+            store.borrow_mut().push(LoadSnapshot {
                 created_at: Utc::now(),
                 is_overloaded: delta.is_some_and(|delta| delta > max_errors),
             });
@@ -454,7 +456,7 @@ impl LoadSignal for StorageLoadSignal {
     }
 
     fn sample(&self, duration: Option<Duration>) -> Vec<LoadSnapshot> {
-        self.store.lock().sample(duration)
+        self.store.borrow_mut().sample(duration)
     }
 }
 

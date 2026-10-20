@@ -6,7 +6,7 @@
 //! ```no_run
 //! use crawlee::{EnqueueLinksOptions, HtmlContext, HtmlCrawler};
 //!
-//! #[tokio::main]
+//! #[tokio::main(flavor = "local")]
 //! async fn main() -> anyhow::Result<()> {
 //!     let crawler = HtmlCrawler::builder()
 //!         .max_requests_per_crawl(20)

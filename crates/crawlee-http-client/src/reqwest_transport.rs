@@ -6,14 +6,15 @@
 //! without a session pool, every request has a proxy URL of its own.
 
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use http::HeaderValue;
 use http::header::{ACCEPT, ACCEPT_LANGUAGE, USER_AGENT};
-use parking_lot::Mutex;
+use std::cell::RefCell;
 
 use crate::{HttpClientError, HttpRequest, HttpResponse, Transport, TransportOptions};
 
@@ -54,7 +55,7 @@ fn tls_config() -> Result<&'static rustls::ClientConfig, HttpClientError> {
 
 /// `reqwest`-based transport with transparent gzip, brotli and deflate decompression.
 pub struct ReqwestTransport {
-    clients: Mutex<HashMap<ClientKey, CachedClient>>,
+    clients: RefCell<HashMap<ClientKey, CachedClient>>,
     connect_timeout: Duration,
     pool_idle_timeout: Duration,
 }
@@ -74,7 +75,7 @@ impl Default for ReqwestTransport {
 impl ReqwestTransport {
     pub fn new() -> Self {
         ReqwestTransport {
-            clients: Mutex::new(HashMap::new()),
+            clients: RefCell::new(HashMap::new()),
             connect_timeout: Duration::from_secs(30),
             pool_idle_timeout: Duration::from_secs(90),
         }
@@ -90,7 +91,7 @@ impl ReqwestTransport {
     fn client(&self, options: &TransportOptions) -> Result<reqwest::Client, HttpClientError> {
         let key = (options.proxy_url.as_ref().map(|u| u.to_string()), options.ignore_tls_errors);
         let now = Instant::now();
-        if let Some(cached) = self.clients.lock().get_mut(&key) {
+        if let Some(cached) = self.clients.borrow_mut().get_mut(&key) {
             cached.last_used = now;
             return Ok(cached.client.clone());
         }
@@ -113,7 +114,7 @@ impl ReqwestTransport {
         }
         let client = builder.build().map_err(|err| HttpClientError::Other(err.to_string()))?;
 
-        let mut clients = self.clients.lock();
+        let mut clients = self.clients.borrow_mut();
         // Clients idle for longer than their connections are kept open have nothing left to
         // reuse: the session that used the proxy was retired, or it was a single request.
         let idle_timeout = self.pool_idle_timeout;
@@ -144,11 +145,11 @@ fn error_chain(err: &dyn std::error::Error) -> String {
     message
 }
 
-#[async_trait]
+#[async_trait(?Send)]
 impl Transport for ReqwestTransport {
     fn release_proxy(&self, proxy_url: &url::Url) {
         let proxy_url = proxy_url.as_str();
-        self.clients.lock().retain(|(proxy, _), _| proxy.as_deref() != Some(proxy_url));
+        self.clients.borrow_mut().retain(|(proxy, _), _| proxy.as_deref() != Some(proxy_url));
     }
 
     async fn fetch(&self, request: HttpRequest, options: &TransportOptions) -> Result<HttpResponse, HttpClientError> {
@@ -216,7 +217,7 @@ mod tests {
             .route("/big", get(|| async { "x".repeat(10_000) }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        tokio::task::spawn_local(async move { axum::serve(listener, app).await.unwrap() });
         Url::parse(&format!("http://{addr}/")).unwrap()
     }
 
@@ -235,10 +236,10 @@ mod tests {
         for n in 0..20 {
             transport.client(&via_proxy(n)).unwrap();
         }
-        assert_eq!(transport.clients.lock().len(), 20);
+        assert_eq!(transport.clients.borrow_mut().len(), 20);
         std::thread::sleep(Duration::from_millis(400));
         transport.client(&via_proxy(20)).unwrap();
-        assert_eq!(transport.clients.lock().len(), 1, "only the client just made is left");
+        assert_eq!(transport.clients.borrow_mut().len(), 1, "only the client just made is left");
     }
 
     /// A proxy that nothing will use again (the session of a crawler without a session pool
@@ -249,7 +250,7 @@ mod tests {
         transport.client(&via_proxy(0)).unwrap();
         transport.client(&via_proxy(1)).unwrap();
         transport.release_proxy(via_proxy(0).proxy_url.as_ref().unwrap());
-        let clients = transport.clients.lock();
+        let clients = transport.clients.borrow_mut();
         assert_eq!(clients.len(), 1);
         assert!(
             clients.keys().all(|(proxy, _)| proxy.as_deref() == Some("http://session-1:secret@proxy.example:8000/"))
@@ -265,11 +266,11 @@ mod tests {
         assert_eq!(tls_config().unwrap().alpn_protocols, [b"h2".to_vec(), b"http/1.1".to_vec()]);
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn real_http_roundtrip() {
         let base = serve().await;
         let client = RedirectingClient::new(ReqwestTransport::new());
-        let jar = std::sync::Arc::new(crate::CookieJar::new());
+        let jar = std::rc::Rc::new(crate::CookieJar::new());
 
         let response = client
             .send_request(

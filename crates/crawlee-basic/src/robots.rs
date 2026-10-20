@@ -1,11 +1,11 @@
 //! Fetching robots.txt files ([`RobotsTxtFile`]) and the per-origin cache crawlers keep of them
 //! for [`respect_robots_txt`](crate::BasicCrawlerBuilder::respect_robots_txt).
 
-use std::sync::Arc;
+use std::rc::Rc;
 use std::time::Duration;
 
 use indexmap::IndexMap;
-use parking_lot::Mutex;
+use std::cell::RefCell;
 use url::Url;
 
 use crawlee_http_client::{HttpClient, HttpRequest, SendOptions};
@@ -64,18 +64,18 @@ impl RobotsTxtFile {
 }
 
 /// One origin's robots.txt: loaded once even when several requests ask at the same time.
-type Slot = Arc<tokio::sync::OnceCell<Arc<RobotsTxt>>>;
+type Slot = Rc<crawlee_core::local::OnceCell<Rc<RobotsTxt>>>;
 
 /// robots.txt files by origin, least recently used evicted first. Failed fetches are not cached,
 /// so they are tried again.
 pub(crate) struct RobotsCache {
     user_agent: String,
-    files: Mutex<IndexMap<String, Slot>>,
+    files: RefCell<IndexMap<String, Slot>>,
 }
 
 impl RobotsCache {
     pub(crate) fn new(user_agent: String) -> Self {
-        RobotsCache { user_agent, files: Mutex::new(IndexMap::new()) }
+        RobotsCache { user_agent, files: RefCell::new(IndexMap::new()) }
     }
 
     pub(crate) fn user_agent(&self) -> &str {
@@ -84,10 +84,10 @@ impl RobotsCache {
 
     /// The robots.txt covering `url`, or `None` when it could not be loaded (then everything is
     /// allowed, as in JS).
-    pub(crate) async fn get(&self, url: &str, client: &dyn HttpClient) -> Option<Arc<RobotsTxt>> {
+    pub(crate) async fn get(&self, url: &str, client: &dyn HttpClient) -> Option<Rc<RobotsTxt>> {
         let origin = Url::parse(url).ok()?.origin().ascii_serialization();
         let slot: Slot = {
-            let mut files = self.files.lock();
+            let mut files = self.files.borrow_mut();
             match files.get_index_of(&origin) {
                 Some(index) => {
                     let last = files.len() - 1;
@@ -104,8 +104,7 @@ impl RobotsCache {
                 }
             }
         };
-        let loaded =
-            slot.get_or_try_init(|| async { RobotsTxtFile::find(url, client, None).await.map(Arc::new) }).await;
+        let loaded = slot.get_or_try_init(|| async { RobotsTxtFile::find(url, client, None).await.map(Rc::new) }).await;
         match loaded {
             Ok(robots) => Some(robots.clone()),
             Err(err) => {
@@ -124,7 +123,7 @@ mod tests {
 
     struct Status(u16);
 
-    #[async_trait::async_trait]
+    #[async_trait::async_trait(?Send)]
     impl HttpClient for Status {
         async fn send_request(&self, request: HttpRequest, _: &SendOptions) -> Result<HttpResponse, HttpClientError> {
             Ok(HttpResponse {
@@ -137,7 +136,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "local")]
     async fn missing_robots_txt_allows_all_and_unreachable_one_disallows_all() {
         let page = "https://a.test/some/page.html";
         for status in [401, 403, 404, 410] {

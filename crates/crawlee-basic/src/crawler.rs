@@ -1,12 +1,13 @@
 //! [`BasicCrawler`]: the task loop, retries and session handling every crawler builds on.
 
+use crawlee_core::local::CellExt as _;
+use std::cell::Cell;
 use std::panic::AssertUnwindSafe;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+use crawlee_core::local::{Notify, OnceCell};
 use futures::FutureExt as _;
-use tokio::sync::{Notify, OnceCell};
 use tokio::task::JoinSet;
 use tracing::Instrument as _;
 
@@ -37,8 +38,8 @@ const MAYBE_RUN_INTERVAL: Duration = Duration::from_millis(500);
 /// Releases the proxy of a session nothing will use again, once the attempt (with its error
 /// handlers) is over, however it ends.
 struct ReleaseProxy {
-    client: Arc<dyn HttpClient>,
-    session: Arc<Session>,
+    client: Rc<dyn HttpClient>,
+    session: Rc<Session>,
 }
 
 impl Drop for ReleaseProxy {
@@ -117,22 +118,22 @@ pub enum BuildError {
 
 struct Inner<P: Middleware<BasicContext>> {
     pipeline: P,
-    handler: Arc<dyn RequestHandler<P::Out>>,
-    error_handler: Option<Arc<dyn ErrorHandler>>,
-    failed_request_handler: Option<Arc<dyn ErrorHandler>>,
+    handler: Rc<dyn RequestHandler<P::Out>>,
+    error_handler: Option<Rc<dyn ErrorHandler>>,
+    failed_request_handler: Option<Rc<dyn ErrorHandler>>,
     options: CrawlerOptions,
     /// The explicit id, or the instantiation index.
     id: String,
     has_explicit_id: bool,
     services: Services,
-    request_manager: Option<Arc<dyn RequestManager>>,
-    http_client: Arc<dyn HttpClient>,
-    session_pool: Arc<SessionPool>,
-    statistics: Arc<Statistics>,
+    request_manager: Option<Rc<dyn RequestManager>>,
+    http_client: Rc<dyn HttpClient>,
+    session_pool: Rc<SessionPool>,
+    statistics: Rc<Statistics>,
     statistics_state: RecoverableState<Statistics>,
     session_pool_state: RecoverableState<SessionPool>,
-    concurrency: Arc<ConcurrencySystem>,
-    shared: OnceCell<Arc<CrawlerShared>>,
+    concurrency: Rc<ConcurrencySystem>,
+    shared: OnceCell<Rc<CrawlerShared>>,
 }
 
 /// A crawler that runs a handler for every request of its queue, with retries, sessions and
@@ -156,7 +157,7 @@ struct Inner<P: Middleware<BasicContext>> {
 ///
 /// [`HttpCrawler`]: https://docs.rs/crawlee-http
 pub struct BasicCrawler<P: Middleware<BasicContext> = Identity> {
-    inner: Arc<Inner<P>>,
+    inner: Rc<Inner<P>>,
 }
 
 impl<P: Middleware<BasicContext>> Clone for BasicCrawler<P> {
@@ -176,14 +177,14 @@ impl BasicCrawler<Identity> {
 #[must_use]
 pub struct BasicCrawlerBuilder<P: Middleware<BasicContext>> {
     pipeline: P,
-    handler: Option<Arc<dyn RequestHandler<P::Out>>>,
-    error_handler: Option<Arc<dyn ErrorHandler>>,
-    failed_request_handler: Option<Arc<dyn ErrorHandler>>,
+    handler: Option<Rc<dyn RequestHandler<P::Out>>>,
+    error_handler: Option<Rc<dyn ErrorHandler>>,
+    failed_request_handler: Option<Rc<dyn ErrorHandler>>,
     options: CrawlerOptions,
     services: Option<Services>,
-    request_manager: Option<Arc<dyn RequestManager>>,
-    http_client: Option<Arc<dyn HttpClient>>,
-    proxies: Option<Arc<dyn ProxySource>>,
+    request_manager: Option<Rc<dyn RequestManager>>,
+    http_client: Option<Rc<dyn HttpClient>>,
+    proxies: Option<Rc<dyn ProxySource>>,
 }
 
 impl<P> BasicCrawlerBuilder<P>
@@ -207,7 +208,7 @@ where
 
     /// The handler run for every request. A [`Router`](crate::Router) is a handler too.
     pub fn request_handler(mut self, handler: impl RequestHandler<P::Out>) -> Self {
-        self.handler = Some(Arc::new(handler));
+        self.handler = Some(Rc::new(handler));
         self
     }
 
@@ -218,13 +219,13 @@ where
 
     /// Called before each retry of a failed request.
     pub fn error_handler(mut self, handler: impl ErrorHandler) -> Self {
-        self.error_handler = Some(Arc::new(handler));
+        self.error_handler = Some(Rc::new(handler));
         self
     }
 
     /// Called once a request failed for the last time.
     pub fn failed_request_handler(mut self, handler: impl ErrorHandler) -> Self {
-        self.failed_request_handler = Some(Arc::new(handler));
+        self.failed_request_handler = Some(Rc::new(handler));
         self
     }
 
@@ -335,39 +336,41 @@ where
     }
 
     /// Where requests come from. Defaults to the default request queue of the services.
-    pub fn request_manager(mut self, manager: Arc<dyn RequestManager>) -> Self {
+    pub fn request_manager(mut self, manager: Rc<dyn RequestManager>) -> Self {
         self.request_manager = Some(manager);
         self
     }
 
-    pub fn http_client(mut self, client: Arc<dyn HttpClient>) -> Self {
+    pub fn http_client(mut self, client: Rc<dyn HttpClient>) -> Self {
         self.http_client = Some(client);
         self
     }
 
     /// Proxies for new sessions, e.g. a [`ProxyConfiguration`](crate::ProxyConfiguration).
-    pub fn proxy_configuration(mut self, proxies: Arc<dyn ProxySource>) -> Self {
+    pub fn proxy_configuration(mut self, proxies: Rc<dyn ProxySource>) -> Self {
         self.proxies = Some(proxies);
         self
     }
 
     pub fn build(self) -> Result<BasicCrawler<P>, BuildError> {
         let handler = self.handler.ok_or(BuildError::MissingRequestHandler)?;
-        let concurrency = Arc::new(ConcurrencySystem::new(self.options.concurrency.clone())?);
-        static INSTANCE_COUNT: AtomicU64 = AtomicU64::new(0);
-        let instance_index = INSTANCE_COUNT.fetch_add(1, Ordering::Relaxed);
+        let concurrency = Rc::new(ConcurrencySystem::new(self.options.concurrency.clone())?);
+        thread_local! {
+            static INSTANCE_COUNT: Cell<u64> = const { Cell::new(0) };
+        }
+        let instance_index = INSTANCE_COUNT.with(|count| count.fetch_add(1));
         let has_explicit_id = self.options.id.is_some();
         let id = self.options.id.clone().unwrap_or_else(|| instance_index.to_string());
 
         let services = self.services.unwrap_or_else(|| Services::global().clone());
-        let session_pool = Arc::new(SessionPool::new(self.options.session_pool.clone(), self.proxies));
-        let statistics = Arc::new(Statistics::with_id(id.clone()));
+        let session_pool = Rc::new(SessionPool::new(self.options.session_pool.clone(), self.proxies));
+        let statistics = Rc::new(Statistics::with_id(id.clone()));
         let statistics_state =
             RecoverableState::new(&services, statistics.persist_state_key(), statistics.clone(), true);
         let session_pool_state =
             RecoverableState::new(&services, session_pool.persist_state_key(), session_pool.clone(), true);
         Ok(BasicCrawler {
-            inner: Arc::new(Inner {
+            inner: Rc::new(Inner {
                 pipeline: self.pipeline,
                 handler,
                 error_handler: self.error_handler,
@@ -394,16 +397,16 @@ where
     P: Middleware<BasicContext>,
     P::Out: CrawlingContext,
 {
-    async fn shared(&self) -> anyhow::Result<&Arc<CrawlerShared>> {
+    async fn shared(&self) -> anyhow::Result<&Rc<CrawlerShared>> {
         let inner = &self.inner;
         inner
             .shared
             .get_or_try_init(|| async {
                 // Before anything is opened, so the storages this crawler uses start empty.
                 inner.services.purge_on_start().await?;
-                let mut request_manager: Arc<dyn RequestManager> = match &inner.request_manager {
+                let mut request_manager: Rc<dyn RequestManager> = match &inner.request_manager {
                     Some(manager) => manager.clone(),
-                    None => Arc::new(inner.services.open_request_queue(&StorageIdentifier::Default).await?),
+                    None => Rc::new(inner.services.open_request_queue(&StorageIdentifier::Default).await?),
                 };
                 let delay = inner.options.same_domain_delay;
                 if !delay.is_zero() {
@@ -420,13 +423,13 @@ where
                             ..ThrottlingOptions::default()
                         };
                         request_manager =
-                            Arc::new(ThrottlingRequestManager::new(options, &inner.services, request_manager));
+                            Rc::new(ThrottlingRequestManager::new(options, &inner.services, request_manager));
                     }
                 }
                 let dataset = inner.services.open_dataset(&StorageIdentifier::Default).await?;
                 let key_value_store = inner.services.open_key_value_store(&StorageIdentifier::Default).await?;
                 request_manager.set_expected_request_processing_time(inner.options.request_handler_timeout * 2).await?;
-                Ok::<_, anyhow::Error>(Arc::new(CrawlerShared {
+                Ok::<_, anyhow::Error>(Rc::new(CrawlerShared {
                     services: inner.services.clone(),
                     request_manager,
                     dataset,
@@ -443,7 +446,7 @@ where
                     },
                     paused: Default::default(),
                     resumed: Notify::new(),
-                    in_flight: AtomicUsize::new(0),
+                    in_flight: Cell::new(0),
                     drained: Notify::new(),
                     robots: inner.options.respect_robots_txt.clone().map(RobotsCache::new),
                     warned: Default::default(),
@@ -479,12 +482,9 @@ where
     }
 
     /// State shared by the crawl and saved with it; see [`BasicContext::use_state`].
-    pub async fn use_state<T>(
-        &self,
-        default: impl Fn() -> T + Send + Sync + 'static,
-    ) -> anyhow::Result<Arc<SerdeState<T>>>
+    pub async fn use_state<T>(&self, default: impl Fn() -> T + 'static) -> anyhow::Result<Rc<SerdeState<T>>>
     where
-        T: Serialize + DeserializeOwned + Send + Sync + 'static,
+        T: Serialize + DeserializeOwned + 'static,
     {
         let shared = self.shared().await?;
         Ok(self.inner.services.auto_saved_value(&shared.state_key, default).await?)
@@ -513,7 +513,7 @@ where
     /// [`run`](Self::run) keeps going once [`resume`](Self::resume) is called.
     pub async fn pause(&self, timeout: Duration) -> anyhow::Result<()> {
         let shared = self.shared().await?;
-        shared.paused.store(true, Ordering::Release);
+        shared.paused.set(true);
         tokio::time::timeout(timeout, shared.wait_until_drained())
             .await
             .map_err(|_| anyhow::anyhow!("pausing the crawler timed out: running tasks did not finish in time"))
@@ -521,7 +521,7 @@ where
 
     pub async fn resume(&self) -> anyhow::Result<()> {
         let shared = self.shared().await?;
-        shared.paused.store(false, Ordering::Release);
+        shared.paused.set(false);
         shared.resumed.notify_waiters();
         Ok(())
     }
@@ -544,7 +544,7 @@ where
     fn spawn_status_logger(&self) -> tokio::task::JoinHandle<()> {
         let crawler = self.clone();
         let interval = self.inner.options.status_message_interval;
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             let mut previous_failed = crawler.inner.statistics.requests_failed();
             let mut ticker = tokio::time::interval(interval.max(Duration::from_millis(1)));
             ticker.tick().await;
@@ -578,7 +578,7 @@ where
         Ok(self.shared().await?.key_value_store.clone())
     }
 
-    pub async fn request_manager(&self) -> anyhow::Result<Arc<dyn RequestManager>> {
+    pub async fn request_manager(&self) -> anyhow::Result<Rc<dyn RequestManager>> {
         Ok(self.shared().await?.request_manager.clone())
     }
 
@@ -709,7 +709,7 @@ where
         }
     }
 
-    async fn task_loop(&self, shared: &Arc<CrawlerShared>) -> anyhow::Result<()> {
+    async fn task_loop(&self, shared: &Rc<CrawlerShared>) -> anyhow::Result<()> {
         let options = &self.inner.options;
         let concurrency = &self.inner.concurrency;
         let mut tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();
@@ -740,11 +740,11 @@ where
                 }
             }
 
-            if shared.paused.load(Ordering::Acquire) {
+            if shared.paused.get() {
                 let resumed = shared.resumed.notified();
                 tokio::pin!(resumed);
                 resumed.as_mut().enable();
-                if shared.paused.load(Ordering::Acquire) {
+                if shared.paused.get() {
                     tokio::select! {
                         () = resumed => {}
                         Some(joined) = tasks.join_next(), if !tasks.is_empty() => Self::check_task(joined, &mut tasks)?,
@@ -771,7 +771,7 @@ where
                     let slot = ConcurrencySlot(concurrency.clone());
                     let in_flight = InFlight::new(shared.clone());
                     let span = tracing::info_span!("request", url = %request.url);
-                    tasks.spawn(
+                    tasks.spawn_local(
                         async move {
                             let _slot = slot;
                             let _in_flight = in_flight;
@@ -796,7 +796,7 @@ where
     }
 
     /// The concurrency system this crawler scales with.
-    pub fn concurrency_system(&self) -> &Arc<ConcurrencySystem> {
+    pub fn concurrency_system(&self) -> &Rc<ConcurrencySystem> {
         &self.inner.concurrency
     }
 
@@ -818,7 +818,7 @@ where
         }
     }
 
-    fn session_for(&self, request: &Request) -> Arc<Session> {
+    fn session_for(&self, request: &Request) -> Rc<Session> {
         if !self.inner.options.use_session_pool {
             return self.inner.session_pool.detached_session();
         }
@@ -829,7 +829,7 @@ where
     }
 
     /// Processes one request. Returns `Err` only for errors that must stop the crawl.
-    async fn process_request(&self, shared: Arc<CrawlerShared>, mut request: Request) -> anyhow::Result<()> {
+    async fn process_request(&self, shared: Rc<CrawlerShared>, mut request: Request) -> anyhow::Result<()> {
         if !shared.is_allowed_by_robots(&request.url).await {
             tracing::warn!(
                 "Skipping request {} ({}) because it is disallowed based on robots.txt",
@@ -902,8 +902,8 @@ where
     /// The retry logic of `requestFunctionErrorHandler` in Crawlee for JS.
     async fn handle_request_error(
         &self,
-        shared: &Arc<CrawlerShared>,
-        session: &Arc<Session>,
+        shared: &Rc<CrawlerShared>,
+        session: &Rc<Session>,
         mut request: Request,
         error: anyhow::Error,
         kind: ErrorKind,
@@ -925,7 +925,7 @@ where
             return Err(error);
         }
 
-        let error = Arc::new(error);
+        let error = Rc::new(error);
 
         if self.can_be_retried(&request, kind) {
             shared.statistics.record_retry(&message);
@@ -974,11 +974,11 @@ where
     /// succeeds. Returns the (possibly modified) request.
     async fn call_error_handler(
         &self,
-        handler: &Arc<dyn ErrorHandler>,
-        shared: &Arc<CrawlerShared>,
-        session: &Arc<Session>,
+        handler: &Rc<dyn ErrorHandler>,
+        shared: &Rc<CrawlerShared>,
+        session: &Rc<Session>,
         request: Request,
-        error: Arc<anyhow::Error>,
+        error: Rc<anyhow::Error>,
     ) -> Request {
         let scope = RequestScope::new(shared.clone(), Some(session.clone()));
         let snapshot = request.clone();
@@ -1008,7 +1008,7 @@ fn panic_error(panic: Box<dyn std::any::Any + Send>) -> anyhow::Error {
 
 /// A running task as counted by the concurrency system; the end is registered on drop, so a
 /// panicking or aborted task frees its slot too.
-struct ConcurrencySlot(Arc<ConcurrencySystem>);
+struct ConcurrencySlot(Rc<ConcurrencySystem>);
 
 impl Drop for ConcurrencySlot {
     fn drop(&mut self) {

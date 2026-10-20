@@ -39,7 +39,7 @@ fn process_usage() -> (f64, f64) {
     (cpu, peak_kib / 1024.0)
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "local")]
 async fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let base = args.next().unwrap_or_else(|| "http://127.0.0.1:3000".to_owned());
