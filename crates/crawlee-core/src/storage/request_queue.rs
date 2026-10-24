@@ -1,6 +1,6 @@
 //! [`RequestQueue`] and the [`RequestManager`] trait crawlers consume requests through.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -17,6 +17,7 @@ use super::batched_adds::{
     drain_request_batches_inline,
 };
 use crate::errors::{StorageError, StorageResult};
+use crate::events::{EventKind, EventManager};
 use crate::recoverable_state::BoxError;
 use crate::request::{Request, RequestError, unique_key_to_request_id};
 use crate::services::CacheLink;
@@ -230,6 +231,8 @@ pub struct RequestQueue {
     counters: Arc<RequestQueueCounters>,
     url_list_fetcher: Arc<Mutex<Option<Arc<dyn UrlListFetcher>>>>,
     in_progress_batches: InProgressBatches,
+    /// Set on the `Migrating` event: nothing is fetched any more (`#queuePausedForMigration`).
+    paused_for_migration: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for RequestQueue {
@@ -255,7 +258,21 @@ impl RequestQueue {
             counters: Arc::default(),
             url_list_fetcher: Arc::default(),
             in_progress_batches: InProgressBatches::default(),
+            paused_for_migration: Arc::default(),
         }
+    }
+
+    /// Stops fetching requests once `events` emits [`Event::Migrating`](crate::Event::Migrating),
+    /// as the queues of Crawlee for JS do: the run is about to move to another host, where the
+    /// requests are fetched again. Queues opened through [`Services`](crate::Services) listen to
+    /// its events.
+    pub fn with_events(self, events: &EventManager) -> Self {
+        let paused = self.paused_for_migration.clone();
+        events.on(EventKind::Migrating, move |_| {
+            paused.store(true, Ordering::Release);
+            async {}
+        });
+        self
     }
 
     pub(crate) fn with_cache_link(mut self, link: CacheLink) -> Self {
@@ -449,6 +466,9 @@ impl RequestManager for RequestQueue {
     }
 
     async fn fetch_next_request(&self) -> StorageResult<Option<Request>> {
+        if self.paused_for_migration.load(Ordering::Acquire) {
+            return Ok(None);
+        }
         self.counters.head_item_read.fetch_add(1, Ordering::Relaxed);
         self.backend.fetch_next_request().await
     }
@@ -783,6 +803,19 @@ mod tests {
         // As if freshly opened: the batches of before do not keep it unfinished.
         queue.purge().await.unwrap();
         assert!(queue.is_finished().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_migration_pauses_fetching() {
+        let services = crate::Services::in_memory();
+        let queue = services.open_request_queue(&StorageIdentifier::Default).await.unwrap();
+        queue.add_request("https://example.com/a", false).await.unwrap();
+
+        services.events.emit(crate::Event::Migrating);
+        services.events.wait_for_all_listeners_to_complete().await;
+        assert!(queue.fetch_next_request().await.unwrap().is_none());
+        assert_eq!(queue.stats().head_item_read_count, 0);
+        assert!(!queue.is_finished().await.unwrap());
     }
 
     #[tokio::test]

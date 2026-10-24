@@ -520,7 +520,7 @@ async fn a_crawl_resumes_with_its_statistics_and_state() {
 }
 
 #[tokio::test]
-async fn migrating_pauses_the_crawl_and_status_messages_are_emitted() {
+async fn aborting_pauses_the_crawl_and_status_messages_are_emitted() {
     use crawlee_core::{Event, EventKind};
 
     let services = services();
@@ -556,7 +556,8 @@ async fn migrating_pauses_the_crawl_and_status_messages_are_emitted() {
     while started.load(Ordering::SeqCst) == 0 {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    services.events.emit(Event::Migrating);
+    // `Migrating` pauses the crawl too, but also the request queue, for good: the run moves.
+    services.events.emit(Event::Aborting);
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(started.load(Ordering::SeqCst), 1, "no request starts while paused");
     assert!(!run.is_finished());
