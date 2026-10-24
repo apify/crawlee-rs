@@ -560,6 +560,20 @@ impl RequestManager for ThrottlingRequestManager {
         self.0.inner_manager.set_expected_request_processing_time(duration).await
     }
 
+    /// The earliest moment a held-back domain with a queue may be fetched from again.
+    fn ready_at(&self) -> Option<std::time::Instant> {
+        let state = self.0.state.lock();
+        let now = now_millis();
+        let until = state
+            .states
+            .iter()
+            .filter(|(domain, _)| state.queues.contains_key(*domain))
+            .map(|(_, domain_state)| domain_state.throttled_until())
+            .filter(|until| *until > now)
+            .min()?;
+        Some(std::time::Instant::now() + Duration::from_millis(u64::try_from(until - now).unwrap_or(0)))
+    }
+
     fn record_pacing_signal(&self, signal: &PacingSignal) -> bool {
         match signal {
             PacingSignal::MinIntervalEverywhere { interval, scope } => {

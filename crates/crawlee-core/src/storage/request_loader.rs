@@ -131,6 +131,10 @@ impl RequestManager for RequestManagerTandem {
     fn record_pacing_signal(&self, signal: &PacingSignal) -> bool {
         self.manager.record_pacing_signal(signal)
     }
+
+    fn ready_at(&self) -> Option<std::time::Instant> {
+        self.manager.ready_at()
+    }
 }
 
 #[cfg(test)]

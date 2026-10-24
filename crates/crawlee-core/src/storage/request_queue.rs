@@ -58,6 +58,12 @@ pub trait RequestManager: Send + Sync {
     async fn set_expected_request_processing_time(&self, _duration: Duration) -> StorageResult<()> {
         Ok(())
     }
+    /// When a manager that has nothing to fetch now (see [`is_empty`](Self::is_empty)) will have
+    /// a request ready, if it knows: for example when a held-back domain may be fetched again. The
+    /// crawler wakes up then instead of waiting for its next check (`readyAt` of `checkReadiness`).
+    fn ready_at(&self) -> Option<std::time::Instant> {
+        None
+    }
     /// Offers a pacing signal (a 429, a crawl delay). Returns `true` when the manager paces the
     /// requests it covers; a plain queue does not, and returns `false`.
     fn record_pacing_signal(&self, _signal: &super::request_loader::PacingSignal) -> bool {

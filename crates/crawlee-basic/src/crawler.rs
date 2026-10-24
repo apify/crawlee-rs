@@ -30,10 +30,7 @@ use crate::session::{Session, SessionPool, SessionPoolOptions};
 use crate::statistics::{FinalStatistics, Statistics};
 use crate::throttling::{ThrottleBy, ThrottledDomains, ThrottlingOptions, ThrottlingRequestManager};
 
-/// How long the task loop waits for new requests before checking the queue again.
-const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(100);
-/// How often the task loop asks the concurrency system again when it had no capacity
-/// (`maybeRunIntervalSecs`).
+/// How often the task loop checks whether a task can start (`maybeRunIntervalSecs`).
 const MAYBE_RUN_INTERVAL: Duration = Duration::from_millis(500);
 /// Releases the proxy of a session nothing will use again, once the attempt (with its error
 /// handlers) is over, however it ends.
@@ -694,7 +691,8 @@ where
             })
         });
 
-        let mut result = self.task_loop(&shared).await;
+        let run = RunState::default();
+        let mut result = self.task_loop(&shared, &run).await;
         inner.statistics.finish();
         inner.concurrency.stop();
         for id in pause_listeners {
@@ -747,90 +745,140 @@ where
         }
     }
 
-    async fn task_loop(&self, shared: &Arc<CrawlerShared>) -> anyhow::Result<()> {
-        let options = &self.inner.options;
+    /// The task loop (`AutoscaledPool` of Crawlee for JS): while there is capacity and a request
+    /// is ready, a task is started, and the task fetches the request itself, so that fetches
+    /// overlap. Readiness is checked again as soon as a task starts or ends, when requests are
+    /// added, when the request manager said a request would be ready, and every 500 ms
+    /// (`maybeRunIntervalSecs`). Once no task runs and none is ready, the crawl ends if the
+    /// request manager is finished.
+    async fn task_loop(&self, shared: &Arc<CrawlerShared>, run: &RunState) -> anyhow::Result<()> {
         let concurrency = &self.inner.concurrency;
         let mut tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();
-        let mut limit_logged = false;
+        let mut wake_at: Option<tokio::time::Instant> = None;
 
         loop {
             while let Some(joined) = tasks.try_join_next() {
                 Self::check_task(joined, &mut tasks)?;
             }
 
-            if let Some(max) = options.max_requests_per_crawl {
-                let in_flight = tasks.len() as u64;
-                if self.inner.statistics.requests_finished() + in_flight >= max {
-                    if !limit_logged {
-                        tracing::info!(
-                            max,
-                            "Crawler reached the maxRequestsPerCrawl limit; waiting for running requests."
-                        );
-                        limit_logged = true;
-                    }
-                    match tasks.join_next().await {
-                        Some(joined) => {
-                            Self::check_task(joined, &mut tasks)?;
-                            continue;
-                        }
-                        None => return Ok(()),
-                    }
-                }
-            }
-
-            if shared.paused.load(Ordering::Acquire) {
-                let resumed = shared.resumed.notified();
-                tokio::pin!(resumed);
-                resumed.as_mut().enable();
-                if shared.paused.load(Ordering::Acquire) {
-                    tokio::select! {
-                        () = resumed => {}
-                        Some(joined) = tasks.join_next(), if !tasks.is_empty() => Self::check_task(joined, &mut tasks)?,
-                    }
-                    continue;
-                }
-            }
-
-            // No capacity: wait for a task to finish, or ask again shortly (the desired
-            // concurrency and the load change over time).
-            if !concurrency.can_start_task() {
-                tokio::select! {
-                    Some(joined) = tasks.join_next(), if !tasks.is_empty() => Self::check_task(joined, &mut tasks)?,
-                    () = tokio::time::sleep(MAYBE_RUN_INTERVAL) => {}
-                }
-                continue;
-            }
-
-            match shared.request_manager.fetch_next_request().await? {
-                Some(request) => {
+            // `maybeRunTask`; a paused crawler starts nothing and does not finish.
+            if !shared.paused.load(Ordering::Acquire) {
+                let ready =
+                    concurrency.can_start_task() && self.is_task_ready(shared, run, tasks.len(), &mut wake_at).await?;
+                if ready && concurrency.try_register_task_start() {
                     let crawler = self.clone();
                     let shared = shared.clone();
-                    concurrency.register_task_start();
                     let slot = ConcurrencySlot(concurrency.clone());
                     let in_flight = InFlight::new(shared.clone());
-                    let span = tracing::info_span!("request", url = %request.url);
-                    tasks.spawn(
-                        async move {
-                            let _slot = slot;
-                            let _in_flight = in_flight;
-                            crawler.process_request(shared, request).await
-                        }
-                        .instrument(span),
-                    );
+                    tasks.spawn(async move {
+                        let _slot = slot;
+                        let _in_flight = in_flight;
+                        crawler.run_task(shared).await
+                    });
+                    // Try the next one right away, to build up concurrency.
+                    continue;
                 }
-                None => {
-                    if tasks.is_empty() && shared.request_manager.is_finished().await? {
-                        return Ok(());
-                    }
-                    let added = shared.requests_added.notified();
-                    tokio::select! {
-                        Some(joined) = tasks.join_next(), if !tasks.is_empty() => Self::check_task(joined, &mut tasks)?,
-                        () = added => {}
-                        () = tokio::time::sleep(IDLE_POLL_INTERVAL) => {}
-                    }
+                // `maybeFinish`
+                if !ready && tasks.is_empty() && self.is_finished(shared, run).await? {
+                    return Ok(());
                 }
             }
+
+            let added = shared.requests_added.notified();
+            let resumed = shared.resumed.notified();
+            let wake = async {
+                match wake_at {
+                    Some(at) => tokio::time::sleep_until(at).await,
+                    None => std::future::pending().await,
+                }
+            };
+            tokio::select! {
+                Some(joined) = tasks.join_next(), if !tasks.is_empty() => Self::check_task(joined, &mut tasks)?,
+                () = added => {}
+                () = resumed => {}
+                () = wake => wake_at = None,
+                () = tokio::time::sleep(MAYBE_RUN_INTERVAL) => {}
+            }
         }
+    }
+
+    /// Whether a task may start: the limits are not reached and the request manager has a
+    /// request (`isTaskReadyFunction`). A manager that will have one later sets `wake_at`.
+    async fn is_task_ready(
+        &self,
+        shared: &CrawlerShared,
+        run: &RunState,
+        in_flight: usize,
+        wake_at: &mut Option<tokio::time::Instant>,
+    ) -> anyhow::Result<bool> {
+        // In-flight requests count too, so that the limit is never exceeded.
+        if let Some(max) = self.inner.options.max_requests_per_crawl
+            && self.inner.statistics.requests_finished() + in_flight as u64 >= max
+        {
+            run.log_once("shuttingDown", || {
+                format!(
+                    "Crawler reached the maxRequestsPerCrawl limit of {max} requests and will shut down soon. \
+                     Requests that are in progress will be allowed to finish."
+                )
+            });
+            return Ok(false);
+        }
+        let manager = &shared.request_manager;
+        if !manager.is_empty().await? {
+            return Ok(true);
+        }
+        if let Some(at) = manager.ready_at() {
+            let at = tokio::time::Instant::from_std(at);
+            // A single wake-up, which only an earlier one replaces (`scheduleWake`).
+            if wake_at.is_none_or(|current| at < current) {
+                *wake_at = Some(at);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether the crawl is over, asked once nothing runs and nothing is ready
+    /// (`isFinishedFunction`).
+    async fn is_finished(&self, shared: &CrawlerShared, _run: &RunState) -> anyhow::Result<bool> {
+        if let Some(max) = self.inner.options.max_requests_per_crawl
+            && self.inner.statistics.requests_finished() >= max
+        {
+            tracing::info!(
+                "Earlier, the crawler reached the maxRequestsPerCrawl limit of {max} requests and all requests that \
+                 were in progress at that time have now finished. In total, the crawler processed {} requests and \
+                 will shut down.",
+                self.inner.statistics.requests_finished()
+            );
+            return Ok(true);
+        }
+        let finished = shared.request_manager.is_finished().await?;
+        if finished {
+            tracing::info!("All requests from the queue have been processed, the crawler will shut down.");
+        }
+        Ok(finished)
+    }
+
+    /// One task: fetches a request and processes it (`runTaskFunction`).
+    async fn run_task(&self, shared: Arc<CrawlerShared>) -> anyhow::Result<()> {
+        let internal_timeout = self.internal_timeout();
+        let manager = shared.request_manager.clone();
+        let fetched = timeout_and_retry(
+            internal_timeout,
+            &format!("Fetching next request timed out after {} seconds.", internal_timeout.as_secs_f64()),
+            || async { Ok(manager.fetch_next_request().await?) },
+        )
+        .await?;
+        let Some(mut request) = fetched else { return Ok(()) };
+        // An old one must not be carried over to a retry.
+        request.loaded_url = None;
+        let span = tracing::info_span!("request", url = %request.url);
+        self.process_request(shared, request).instrument(span).await
+    }
+
+    /// The timeout of the crawler's own operations: storage calls, error handling, and the
+    /// request as a whole (`internalTimeoutMillis`): twice the handler timeout, at least 5 min.
+    fn internal_timeout(&self) -> Duration {
+        (self.inner.options.request_handler_timeout * 2).max(Duration::from_secs(300))
     }
 
     /// The concurrency system this crawler scales with.
@@ -1045,6 +1093,47 @@ where
             Err(panic) => tracing::error!("Error handler panicked: {:#}", panic_error(panic)),
         }
         scope.take_returned().unwrap_or(snapshot)
+    }
+}
+
+/// Runs `operation` with `timeout`, and up to 3 more times when it fails or times out
+/// (`timeoutAndRetry`).
+async fn timeout_and_retry<T, F, Fut>(timeout: Duration, timeout_message: &str, mut operation: F) -> anyhow::Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<T>>,
+{
+    const MAX_RETRIES: u32 = 3;
+    let mut retried = 1;
+    loop {
+        let result = match tokio::time::timeout(timeout, operation()).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!("{timeout_message}")),
+        };
+        match result {
+            Ok(value) => return Ok(value),
+            Err(err) if retried <= MAX_RETRIES => {
+                // Retried on any error, not just a timeout.
+                tracing::warn!("{err:#} (retrying {retried}/{MAX_RETRIES})");
+                retried += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// What one `run()` keeps: messages logged once per run.
+#[derive(Default)]
+struct RunState {
+    logged: parking_lot::Mutex<std::collections::HashSet<&'static str>>,
+}
+
+impl RunState {
+    /// Logs `message` the first time this run asks for it under `key` (`logOnce`).
+    fn log_once(&self, key: &'static str, message: impl FnOnce() -> String) {
+        if self.logged.lock().insert(key) {
+            tracing::info!("{}", message());
+        }
     }
 }
 

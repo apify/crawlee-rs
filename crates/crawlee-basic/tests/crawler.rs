@@ -901,3 +901,87 @@ async fn context_add_requests_skips_what_is_too_deep_disallowed_or_filtered_out(
     assert!(skipped.contains(&("https://a.dev/private/1".to_owned(), RobotsTxt)), "{skipped:?}");
     assert!(skipped.contains(&("https://a.dev/level/2".to_owned(), Depth)), "{skipped:?}");
 }
+
+/// A request queue that answers fetches after a delay, like a remote one.
+struct SlowFetches(crawlee_core::RequestQueue);
+
+#[async_trait::async_trait]
+impl crawlee_core::RequestManager for SlowFetches {
+    async fn add_requests(
+        &self,
+        requests: Vec<Request>,
+        forefront: bool,
+    ) -> crawlee_core::StorageResult<crawlee_core::storage::backend::BatchAddRequestsResult> {
+        self.0.add_requests(requests, forefront).await
+    }
+    async fn fetch_next_request(&self) -> crawlee_core::StorageResult<Option<Request>> {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        self.0.fetch_next_request().await
+    }
+    async fn mark_request_as_handled(
+        &self,
+        request: &mut Request,
+    ) -> crawlee_core::StorageResult<Option<crawlee_core::storage::backend::QueueOperationInfo>> {
+        self.0.mark_request_as_handled(request).await
+    }
+    async fn reclaim_request(
+        &self,
+        request: &Request,
+        forefront: bool,
+    ) -> crawlee_core::StorageResult<Option<crawlee_core::storage::backend::QueueOperationInfo>> {
+        self.0.reclaim_request(request, forefront).await
+    }
+    async fn is_empty(&self) -> crawlee_core::StorageResult<bool> {
+        self.0.is_empty().await
+    }
+    async fn is_finished(&self) -> crawlee_core::StorageResult<bool> {
+        self.0.is_finished().await
+    }
+    async fn handled_count(&self) -> crawlee_core::StorageResult<u64> {
+        self.0.handled_count().await
+    }
+}
+
+#[tokio::test]
+async fn requests_are_fetched_in_parallel_by_the_tasks() {
+    let services = services();
+    let queue = services.open_request_queue(&crawlee_core::StorageIdentifier::Default).await.unwrap();
+    let crawler = BasicCrawler::builder()
+        .services(services)
+        .request_manager(Arc::new(SlowFetches(queue)))
+        .fixed_concurrency(10)
+        .request_handler(|_ctx: BasicContext| async move { Ok(()) })
+        .build()
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let urls: Vec<String> = (0..30).map(|i| format!("https://a.dev/{i}")).collect();
+    let stats = crawler.run(urls).await.unwrap();
+    assert_eq!(stats.requests_succeeded, 30);
+    // One fetch after another would take 30 × 50 ms.
+    assert!(started.elapsed() < Duration::from_millis(1000), "{:?}", started.elapsed());
+}
+
+#[tokio::test]
+async fn a_paced_crawl_wakes_up_when_its_domain_is_ready() {
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let log = starts.clone();
+    let crawler = BasicCrawler::builder()
+        .services(services())
+        .same_domain_delay(Duration::from_millis(700))
+        .request_handler(move |_ctx: BasicContext| {
+            let log = log.clone();
+            async move {
+                log.lock().push(std::time::Instant::now());
+                Ok(())
+            }
+        })
+        .build()
+        .unwrap();
+
+    crawler.run(["https://a.dev/1", "https://a.dev/2"]).await.unwrap();
+    let starts = starts.lock().clone();
+    let gap = starts[1] - starts[0];
+    // Polling every 500 ms would start the second one about 1 s after the first.
+    assert!(gap >= Duration::from_millis(690) && gap < Duration::from_millis(900), "{gap:?}");
+}
