@@ -445,7 +445,10 @@ where
                     resumed: Notify::new(),
                     in_flight: AtomicUsize::new(0),
                     drained: Notify::new(),
-                    robots: inner.options.respect_robots_txt.clone().map(RobotsCache::new),
+                    robots: inner.options.respect_robots_txt.clone().map(|user_agent| {
+                        RobotsCache::new(user_agent)
+                            .with_sessions(inner.session_pool.clone(), inner.options.use_session_pool)
+                    }),
                     warned: Default::default(),
                 }))
             })
