@@ -1469,3 +1469,34 @@ async fn without_a_session_pool_shared_proxies_are_not_released() {
     crawler.run(["https://a.dev/1", "https://a.dev/2", "https://a.dev/3"]).await.unwrap();
     assert!(client.released.lock().is_empty(), "released: {:?}", client.released.lock());
 }
+
+#[tokio::test]
+async fn the_internal_timeout_comes_from_the_configuration() {
+    let configuration =
+        Configuration { internal_timeout: Some(Duration::from_millis(200)), ..Configuration::default() };
+    let services = Services::with_configuration(configuration, Arc::new(crawlee_core::MemoryStorageBackend::new()));
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let counter = attempts.clone();
+    let crawler = BasicCrawler::builder()
+        .services(services)
+        .request_handler(move |_ctx: BasicContext| {
+            let counter = counter.clone();
+            async move {
+                match counter.fetch_add(1, Ordering::SeqCst) {
+                    0 => anyhow::bail!("boom"),
+                    _ => Ok(()),
+                }
+            }
+        })
+        // Outlasts the internal timeout of 200 ms, but not the default one (at least 5 min).
+        .error_handler(|_ctx: BasicContext, _error: Arc<anyhow::Error>| async move {
+            tokio::time::sleep(Duration::from_secs(600)).await;
+            Ok(())
+        })
+        .build()
+        .unwrap();
+
+    let stats = tokio::time::timeout(Duration::from_secs(10), crawler.run(["https://a.dev/"])).await.unwrap().unwrap();
+    assert_eq!(stats.requests_succeeded, 1);
+    assert_eq!(attempts.load(Ordering::SeqCst), 2);
+}

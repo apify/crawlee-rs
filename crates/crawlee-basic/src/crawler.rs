@@ -1264,9 +1264,15 @@ where
     }
 
     /// The timeout of the crawler's own operations: storage calls, error handling, and the
-    /// request as a whole (`internalTimeoutMillis`): twice the handler timeout, at least 5 min.
+    /// request as a whole (`internalTimeoutMillis`): the configured
+    /// [`internal_timeout`](crawlee_core::Configuration::internal_timeout), or twice the handler
+    /// timeout, at least 5 min.
     fn internal_timeout(&self) -> Duration {
-        (self.inner.options.request_handler_timeout * 2).max(Duration::from_secs(300))
+        self.inner
+            .services
+            .configuration
+            .internal_timeout
+            .unwrap_or_else(|| (self.inner.options.request_handler_timeout * 2).max(Duration::from_secs(300)))
     }
 
     /// The concurrency system of the run in progress, or of the last run; `None` before the
