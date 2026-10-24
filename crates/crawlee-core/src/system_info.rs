@@ -288,6 +288,11 @@ impl SystemInfoSampler {
 
     fn memory(&mut self) -> (Option<u64>, Option<u64>) {
         let used = self.process_tree_memory();
+        (self.total_memory(), used)
+    }
+
+    /// Memory available to the process: the Lambda or container limit, or the machine's memory.
+    pub fn total_memory(&mut self) -> Option<u64> {
         self.system.refresh_memory();
         let host_total = self.system.total_memory();
 
@@ -296,11 +301,11 @@ impl SystemInfoSampler {
                 .ok()
                 .and_then(|mb| mb.parse::<u64>().ok())
                 .map(|mb| mb * 1_000_000);
-            return (total, used);
+            return total;
         }
         if self.containerized {
             match cgroup_version().map(cgroup_memory) {
-                Some(Ok((limit, _))) => return (Some(limit.unwrap_or(host_total)), used),
+                Some(Ok((limit, _))) => return Some(limit.unwrap_or(host_total)),
                 Some(Err(err)) => self.warn_once(
                     "memory-cgroup",
                     &format!(
@@ -316,7 +321,7 @@ impl SystemInfoSampler {
                 ),
             }
         }
-        (Some(host_total), used)
+        Some(host_total)
     }
 }
 
