@@ -5,7 +5,6 @@
 //! Here they are explicit: crawlers take a `Services` value (cheap to clone) or fall back to the
 //! process-wide default.
 
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, Weak};
 
@@ -17,7 +16,7 @@ use serde::de::DeserializeOwned;
 use crate::configuration::Configuration;
 use crate::errors::{StorageError, StorageResult};
 use crate::events::EventManager;
-use crate::recoverable_state::{RecoverableState, SerdeState};
+use crate::recoverable_state::SerdeState;
 use crate::storage::backend::{StorageBackend, StorageIdentifier, StorageKind};
 use crate::storage::dataset::Dataset;
 use crate::storage::key_value_store::KeyValueStore;
@@ -29,8 +28,6 @@ pub struct Services {
     pub configuration: Arc<Configuration>,
     pub storage: Arc<dyn StorageBackend>,
     pub events: EventManager,
-    /// Values of [`auto_saved_value`](Self::auto_saved_value), by key.
-    auto_saved: Arc<tokio::sync::Mutex<HashMap<String, Arc<dyn Any + Send + Sync>>>>,
     /// Set once the run-scoped storages were purged, so that they are purged once per backend
     /// even when several crawlers run one after another.
     purged: Arc<tokio::sync::OnceCell<()>>,
@@ -67,7 +64,6 @@ impl Services {
             configuration: Arc::new(configuration),
             storage,
             events,
-            auto_saved: Arc::default(),
             purged: Arc::default(),
             storages: Arc::default(),
         }
@@ -122,8 +118,7 @@ impl Services {
     }
 
     /// A value saved in the default key-value store under `key` on every `PersistState` event,
-    /// like `KeyValueStore.getAutoSavedValue()` in JS. The first call loads the saved record
-    /// (or starts from `default`); later calls with the same key return the same value.
+    /// like `useState()` in JS: [`KeyValueStore::get_auto_saved_value`] of the default store.
     pub async fn auto_saved_value<T>(
         &self,
         key: &str,
@@ -132,17 +127,7 @@ impl Services {
     where
         T: Serialize + DeserializeOwned + Send + Sync + 'static,
     {
-        let mut values = self.auto_saved.lock().await;
-        if let Some(value) = values.get(key) {
-            return value.clone().downcast::<SerdeState<T>>().map_err(|_| {
-                StorageError::InvalidArgument(format!("the value saved under '{key}' is used with another type"))
-            });
-        }
-        let state = Arc::new(SerdeState::new(default));
-        // Never torn down: the final `PersistState` of `EventManager::close` saves it.
-        RecoverableState::new(self, key, state.clone(), true).initialize().await?;
-        values.insert(key.to_owned(), state.clone());
-        Ok(state)
+        self.open_key_value_store(&StorageIdentifier::Default).await?.get_auto_saved_value(key, default).await
     }
 
     /// Opens a dataset, returning the instance already open for the same id, name or alias
@@ -205,7 +190,7 @@ impl Services {
             StorageKind::KeyValueStore => {
                 let backend = self.storage.create_key_value_store_backend(identifier).await?;
                 let info = backend.get_metadata().await?;
-                let store = KeyValueStore::from_backend(backend).with_cache_link(link);
+                let store = KeyValueStore::from_backend(backend).with_cache_link(link).with_events(self.events.clone());
                 (CachedStorage::KeyValueStore(store), (info.id, info.name))
             }
             StorageKind::RequestQueue => {

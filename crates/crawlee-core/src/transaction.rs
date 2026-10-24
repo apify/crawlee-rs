@@ -16,7 +16,7 @@ use serde::de::DeserializeOwned;
 use crate::errors::StorageResult;
 use crate::storage::backend::{DatasetItem, KeyValueStoreRecord};
 use crate::storage::dataset::{Dataset, serialize_items};
-use crate::storage::key_value_store::{CONTENT_TYPE_JSON, KeyValueStore, serialize_json, validate_key};
+use crate::storage::key_value_store::{CONTENT_TYPE_JSON, KeyValueStore, read_typed, serialize_json, validate_key};
 
 /// A key-value write recorded in a transaction. `value: None` is a deletion.
 #[derive(Clone, Debug)]
@@ -106,7 +106,7 @@ impl StorageTransaction {
             .find(|write| write.key == key && write.store.same_storage(store))
             .map(|write| write.value.clone());
         match pending {
-            Some(Some((bytes, _))) => Ok(Some(serde_json::from_slice(&bytes)?)),
+            Some(Some((bytes, content_type))) => Ok(Some(read_typed(key, &bytes, Some(&content_type))?)),
             Some(None) => Ok(None),
             None => store.get_value(key).await,
         }
@@ -169,6 +169,8 @@ impl StorageTransaction {
             for (key, value) in writes {
                 match value {
                     Some((value, content_type)) => {
+                        // As the replay through `setValue` in JS does.
+                        store.update_auto_saved(&key, || serde_json::from_slice(&value).ok());
                         store.write_record(KeyValueStoreRecord { key, value, content_type: Some(content_type) }).await?
                     }
                     None => store.delete_record(&key).await?,
@@ -217,6 +219,8 @@ mod tests {
         tx.push_data(&dataset, &json!({ "attempt": 2 })).unwrap();
         tx.set_value(&store, "STATE", &json!({ "n": 1 })).unwrap();
         assert_eq!(tx.get_value::<serde_json::Value>(&store, "STATE").await.unwrap(), Some(json!({ "n": 1 })));
+        tx.set_bytes(&store, "NOTE", Bytes::from_static(b"hi"), "text/plain").unwrap();
+        assert_eq!(tx.get_value::<String>(&store, "NOTE").await.unwrap().as_deref(), Some("hi"));
         assert!(store.get_record("STATE").await.unwrap().is_none());
 
         let committed = Arc::new(AtomicBool::new(false));
