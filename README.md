@@ -75,7 +75,7 @@ duplicates). Concurrency is pinned (min = max) in both, and storage is in memory
 |---|---|---|
 | `crawlee` | `crawlee` | Re-exports everything below |
 | `crawlee-utils` | `@crawlee/utils`, `@apify/utilities` | `normalize_url`, enqueue strategies, public-suffix domains, glob/regex URL filters, streaming link extraction (`lol_html`), HTML attribute entity decoding, charset prescan, robots.txt and sitemap parsing, `Retry-After` |
-| `crawlee-core` | `@crawlee/core`, `@crawlee/types`, `@crawlee/fs-storage` | `Request` (with the JS wire format), `Dataset`, `KeyValueStore`, `RequestQueue`, the 4-trait `StorageBackend` contract, the file-system and in-memory backends, request-scoped `StorageTransaction`, `Configuration` (`CRAWLEE_*` variables, `crawlee.json`), `RequestLoader` / `RequestManagerTandem`, `EventManager`, `RecoverableState`, system info (cgroup-aware), `Services` |
+| `crawlee-core` | `@crawlee/core`, `@crawlee/types`, `@crawlee/fs-storage` | `Request` (with the JS wire format), `Dataset`, `KeyValueStore`, `RequestQueue`, `RequestList`, the 4-trait `StorageBackend` contract, the file-system and in-memory backends, request-scoped `StorageTransaction`, `Configuration` (`CRAWLEE_*` variables, `crawlee.json`), `RequestLoader` / `RequestManagerTandem`, `EventManager`, `RecoverableState`, system info (cgroup-aware), `Services` |
 | `crawlee-http-client` | `@crawlee/http-client` | The `HttpClient` / `Transport` traits, the shared redirect and cookie logic, a reqwest transport |
 | `crawlee-basic` | `@crawlee/basic` | `BasicCrawler`: task loop, retries and error classification, sessions and proxies, router, statistics, `enqueue_urls` filtering, the typed context pipeline, autoscaling (`ConcurrencySystem`, `SystemStatus`, load signals), robots.txt, `Sitemap` / `SitemapRequestLoader`, `ThrottlingRequestManager` |
 | `crawlee-http` | `@crawlee/http`, `@crawlee/cheerio` | `HttpCrawler` (typed JSON via serde), `HtmlCrawler` (lazy DOM, streaming `enqueue_links`), body decoding |
@@ -100,8 +100,19 @@ storage/
 - **Restarts.** A request queue keeps its handled requests across runs. With
   `CRAWLEE_PURGE_ON_START=false`, a crawl resumes where it stopped.
 - **Settings:** `CRAWLEE_STORAGE_DIR`, `CRAWLEE_PURGE_ON_START`, `CRAWLEE_PERSIST_STORAGE`
-  (`false` keeps everything in memory), or the same keys in `crawlee.json`.
+  (`false` keeps everything in memory), `CRAWLEE_INTERNAL_TIMEOUT`, or the same keys in
+  `crawlee.json`.
 - **In code:** `Services::from_configuration(...)`, or `Services::in_memory()` for tests.
+- **One instance per storage.** `Services::open_dataset` (and the other `open_*`) returns the
+  instance already open for the same id, name or alias, as `StorageInstanceManager` does in JS.
+  `Dataset::open(backend, id)` and the like open a new handle without that cache.
+- **Remote URL lists.** `RequestQueue::add_requests_from_url(RequestsFromUrl::new(url), ..)` is the
+  `{ requestsFromUrl }` source of JS. It downloads with the queue's `UrlListFetcher`; crawlers set
+  one on the default queue that uses their HTTP client.
+- **Request lists.** `RequestList::open(&services, Some("name"), sources)` is a static list of
+  URLs, requests and remote lists. `.request_list(Arc::new(list))` makes a crawler read it before
+  its queue. With a name (or `persist_state_key` / `persist_requests_key`), its position and its
+  requests are saved, so a resumed crawl continues where it stopped.
 
 ## Events and saved state
 
@@ -110,8 +121,9 @@ storage/
 - `SystemInfo` every second: CPU and memory, read from cgroups in a container;
 - `StatusMessage`.
 
-`Migrating` and `Aborting` pause the crawl and save the statistics; the Apify SDK will emit
-them. On `PersistState`, crawlers save their state to the default key-value store, under the
+`Migrating` and `Aborting` pause the crawl and save the statistics, and `Migrating` stops the
+request queues from handing out requests; the Apify SDK will emit them, and `Exit` with its exit
+options. On `PersistState`, crawlers save their state to the default key-value store, under the
 keys and in the record formats of Crawlee for JS:
 
 | Key | What |
@@ -134,6 +146,9 @@ keys and in the record formats of Crawlee for JS:
   - robots.txt `Crawl-delay` is honoured as a minimum interval between requests to the domain.
   - `.same_domain_delay(d)` sets such an interval for every site, and adds a throttling manager
     when the crawler has none.
+  - A domain that answers 429 to every request for longer than `max_domain_stall` (15 min) ends
+    the crawl with a `PersistentRateLimitError` once nothing else can be crawled, unless the
+    crawler keeps alive. Its requests stay queued.
 - **Sitemaps.** `Sitemap::load` fetches sitemaps, nested and gzipped ones included, and returns
   their pages.
   - `SitemapRequestLoader` crawls them in the background. Put it in front of a request queue with
@@ -203,15 +218,10 @@ to `conformance/golden`. `crates/crawlee/tests/golden.rs` replays all of them ag
 
 These are planned in this order, following `docs/plan.md`:
 
-1. **Remaining request sources and options:**
-   - `RequestList`;
-   - `extend_context`, `extend_timeout`, `skip_navigation` in `HttpCrawler`;
-   - the `stalled` readiness state of throttling;
-   - CSV export.
-2. **Side-by-side crawl comparison** (level 3 of the conformance plan): the same crawl run by
+1. **Side-by-side crawl comparison** (level 3 of the conformance plan): the same crawl run by
    both implementations against the fixture server, comparing their outputs. Today the two are
    compared function by function (golden files) and by benchmark.
-3. **Later:** an Apify SDK crate on top of the Rust `apify-client`; browser and adaptive crawlers.
+2. **Later:** an Apify SDK crate on top of the Rust `apify-client`; browser and adaptive crawlers.
 
 ## Development
 

@@ -3,6 +3,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 
@@ -14,6 +15,17 @@ pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 /// [`Router`](crate::Router).
 pub trait RequestHandler<C>: Send + Sync + 'static {
     fn handle(&self, ctx: C) -> BoxFuture<anyhow::Result<()>>;
+
+    /// The timeout of requests with this label, when the handler overrides the crawler's
+    /// `request_handler_timeout` (a [`Router`](crate::Router) route can).
+    fn timeout_for(&self, _label: Option<&str>) -> Option<std::time::Duration> {
+        None
+    }
+
+    /// The longest timeout [`timeout_for`](Self::timeout_for) returns for any label.
+    fn max_timeout(&self) -> Option<std::time::Duration> {
+        None
+    }
 }
 
 impl<C, F, Fut> RequestHandler<C> for F
@@ -53,6 +65,13 @@ where
 pub trait Middleware<In: Send + 'static>: Send + Sync + 'static {
     type Out: Send + 'static;
     async fn run(&self, input: In) -> anyhow::Result<Self::Out>;
+
+    /// The longest this step may take to navigate (`getNavigationTimeoutMillis`). The crawler adds
+    /// it to the handler timeout, so the request timeout does not cut the navigation short. Zero
+    /// for steps that do not navigate.
+    fn navigation_timeout(&self) -> Duration {
+        Duration::ZERO
+    }
 }
 
 /// The empty pipeline.
@@ -82,6 +101,10 @@ where
     async fn run(&self, input: In) -> anyhow::Result<B::Out> {
         let intermediate = self.0.run(input).await?;
         self.1.run(intermediate).await
+    }
+
+    fn navigation_timeout(&self) -> Duration {
+        self.0.navigation_timeout() + self.1.navigation_timeout()
     }
 }
 

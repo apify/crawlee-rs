@@ -29,6 +29,10 @@ pub struct Configuration {
     pub max_used_cpu_ratio: f64,
     /// `CRAWLEE_CONTAINERIZED`: whether to read limits from cgroups (auto-detected when unset).
     pub containerized: Option<bool>,
+    /// `CRAWLEE_INTERNAL_TIMEOUT` (milliseconds): the timeout of a crawler's own operations
+    /// (`internalTimeoutMillis`). When unset, crawlers use twice their request handler timeout,
+    /// but at least 5 minutes.
+    pub internal_timeout: Option<Duration>,
 }
 
 impl Default for Configuration {
@@ -43,6 +47,7 @@ impl Default for Configuration {
             memory_mbytes: None,
             max_used_cpu_ratio: 0.95,
             containerized: None,
+            internal_timeout: None,
         }
     }
 }
@@ -60,6 +65,7 @@ struct FileConfiguration {
     memory_mbytes: Option<u64>,
     max_used_cpu_ratio: Option<f64>,
     containerized: Option<bool>,
+    internal_timeout_millis: Option<u64>,
 }
 
 /// `'0'` and `'false'` (any case) are false; any other non-empty value is true, as in JS.
@@ -103,6 +109,9 @@ impl Configuration {
                 config.max_used_cpu_ratio = v;
             }
             config.containerized = file.containerized.or(config.containerized);
+            if let Some(v) = file.internal_timeout_millis {
+                config.internal_timeout = Some(Duration::from_millis(v));
+            }
         }
 
         // Empty environment variables count as unset.
@@ -129,6 +138,9 @@ impl Configuration {
         if let Some(v) = var("CRAWLEE_CONTAINERIZED") {
             config.containerized = Some(parse_bool(&v));
         }
+        if let Some(v) = var("CRAWLEE_INTERNAL_TIMEOUT").and_then(|v| v.trim().parse().ok()) {
+            config.internal_timeout = Some(Duration::from_millis(v));
+        }
         config
     }
 }
@@ -152,5 +164,16 @@ mod tests {
         assert!(!config.purge_on_start, "from crawlee.json");
         assert_eq!(config.memory_mbytes, Some(512), "empty env var is ignored");
         assert_eq!(config.available_memory_ratio, 0.25);
+        assert_eq!(config.internal_timeout, None);
+    }
+
+    #[test]
+    fn internal_timeout() {
+        let file = r#"{ "internalTimeoutMillis": 1500 }"#;
+        let config = Configuration::from_sources(|_| None, Some(file.to_owned()));
+        assert_eq!(config.internal_timeout, Some(Duration::from_millis(1500)));
+        let env = |name: &str| (name == "CRAWLEE_INTERNAL_TIMEOUT").then(|| "2500".to_owned());
+        let config = Configuration::from_sources(env, Some(file.to_owned()));
+        assert_eq!(config.internal_timeout, Some(Duration::from_millis(2500)));
     }
 }

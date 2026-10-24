@@ -9,18 +9,20 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::Notify;
 
-use crawlee_core::storage::backend::BatchAddRequestsResult;
+use crawlee_core::storage::batched_adds::AddRequestsBatchedResult;
 use crawlee_core::{
     Dataset, KeyValueStore, PacingScope, PacingSignal, Request, RequestManager, SerdeState, Services,
     StorageTransaction,
 };
 use crawlee_http_client::{HttpClient, HttpClientError, HttpRequest, HttpResponse, SendOptions};
 
-use crate::errors::RequestSkipped;
+use crate::enqueue::{CrawlerAddRequestsOptions, EnqueueError, SkipReason, SkippedRequestCallback};
+use crate::errors::SkipRequestError;
 use crate::proxy::ProxyInfo;
 use crate::robots::RobotsCache;
 use crate::session::Session;
 use crate::statistics::Statistics;
+use crate::timeout::{TimeoutExtensions, TimeoutWindow};
 
 /// Everything request tasks of one crawler share.
 pub struct CrawlerShared {
@@ -31,6 +33,10 @@ pub struct CrawlerShared {
     pub http_client: Arc<dyn HttpClient>,
     pub statistics: Arc<Statistics>,
     pub max_crawl_depth: Option<u32>,
+    /// Caps what is added too (`maxRequestsPerCrawl`).
+    pub max_requests_per_crawl: Option<u64>,
+    /// `onSkippedRequest`.
+    pub(crate) on_skipped_request: Option<SkippedRequestCallback>,
     /// Timeout for `send_request` from handlers.
     pub send_request_timeout: Duration,
     /// Woken when requests are added, so an idle crawler picks them up immediately.
@@ -48,7 +54,7 @@ pub struct CrawlerShared {
     pub(crate) drained: Notify,
     /// robots.txt files, when the crawler respects them.
     pub(crate) robots: Option<RobotsCache>,
-    /// Domains already warned about (unpaced 429s and crawl delays).
+    /// Domains already warned about (unpaced 429s and crawl delays), and messages logged once.
     pub(crate) warned: Mutex<std::collections::HashSet<String>>,
 }
 
@@ -60,6 +66,12 @@ impl CrawlerShared {
     fn warn_once(&self, key: String, message: impl FnOnce() -> String) {
         if self.warned.lock().insert(key) {
             tracing::warn!("{}", message());
+        }
+    }
+
+    pub(crate) fn info_once(&self, key: &str, message: impl FnOnce() -> String) {
+        if self.warned.lock().insert(format!("info:{key}")) {
+            tracing::info!("{}", message());
         }
     }
 
@@ -145,11 +157,19 @@ pub struct RequestScope {
     pub(crate) transaction: StorageTransaction,
     /// The context hands its request back here when it is dropped.
     returned: Mutex<Option<Request>>,
+    /// Extensions of the request's timeouts (`extend_timeout`).
+    pub(crate) timeouts: Arc<TimeoutExtensions>,
 }
 
 impl RequestScope {
     pub(crate) fn new(shared: Arc<CrawlerShared>, session: Option<Arc<Session>>) -> Arc<Self> {
-        Arc::new(RequestScope { shared, session, transaction: StorageTransaction::new(), returned: Mutex::new(None) })
+        Arc::new(RequestScope {
+            shared,
+            session,
+            transaction: StorageTransaction::new(),
+            returned: Mutex::new(None),
+            timeouts: Arc::default(),
+        })
     }
 
     pub(crate) fn take_returned(&self) -> Option<Request> {
@@ -207,11 +227,36 @@ impl BasicContext {
             request.id.as_deref().unwrap_or_default(),
             message.map(|message| format!(": {message}")).unwrap_or_default()
         );
-        RequestSkipped { reason: message.unwrap_or("skipped by the request handler").to_owned() }.into()
+        SkipRequestError { message: message.map(str::to_owned) }.into()
     }
 
     pub fn request_mut(&mut self) -> &mut Request {
         self.request.as_mut().expect(PRESENT)
+    }
+
+    /// Gives the request `by` more time to finish (`context.extendTimeout`), for when how long it
+    /// needs is only apparent once it runs. Prefer `request_handler_timeout`, or a per-route
+    /// timeout, when the time needed is known up front.
+    ///
+    /// The timeout of the running phase (the request handler, or the navigation when called from a
+    /// navigation hook) and the request timeout are pushed back together. A request manager that
+    /// locks requests is asked to extend the lock by the same amount, in the background.
+    pub fn extend_timeout(&self, by: Duration) {
+        self.scope.timeouts.extend(by);
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else { return };
+        let (manager, request) = (self.scope.shared.request_manager.clone(), self.request().clone());
+        runtime.spawn(async move {
+            // Extension failure must not fail the request that asked for more time.
+            if let Err(error) = manager.extend_request_processing_time(&request, by).await {
+                tracing::debug!(url = %request.url, %error, "Extending the request processing time failed");
+            }
+        });
+    }
+
+    /// A timeout of `timeout` from now that [`extend_timeout`](Self::extend_timeout) pushes back,
+    /// for the phases of crawlers built on this context (such as the navigation).
+    pub fn timeout_window(&self, timeout: Duration) -> TimeoutWindow {
+        self.scope.timeouts.window(timeout)
     }
 
     pub fn session(&self) -> Option<&Arc<Session>> {
@@ -253,14 +298,6 @@ impl BasicContext {
         &self.scope.transaction
     }
 
-    pub(crate) fn scope_shared(&self) -> &Arc<CrawlerShared> {
-        &self.scope.shared
-    }
-
-    pub(crate) fn max_crawl_depth(&self) -> Option<u32> {
-        self.scope.shared.max_crawl_depth
-    }
-
     /// Appends one object (or each object of an array) to the default dataset once the handler
     /// succeeds. The data is serialized immediately.
     pub fn push_data<T: Serialize + ?Sized>(&self, data: &T) -> anyhow::Result<()> {
@@ -291,32 +328,45 @@ impl BasicContext {
     }
 
     /// Adds requests to the crawler's queue right away (not transactionally, as in Crawlee for
-    /// JS). Requests without an explicit depth are one level deeper than the current request.
-    pub async fn add_requests<I, R>(&self, requests: I) -> anyhow::Result<BatchAddRequestsResult>
+    /// JS), as [`BasicCrawler::add_requests`](crate::BasicCrawler::add_requests) does: in batches,
+    /// within the `max_requests_per_crawl` budget, skipping what is too deep or disallowed by
+    /// robots.txt. Requests without an explicit depth are one level deeper than the current one.
+    pub async fn add_requests<I, R>(&self, requests: I) -> anyhow::Result<AddRequestsBatchedResult>
     where
         I: IntoIterator<Item = R>,
         R: Into<Request>,
     {
+        self.add_requests_with_options(requests, CrawlerAddRequestsOptions::default()).await
+    }
+
+    /// [`add_requests`](Self::add_requests) with filters and batching options.
+    pub async fn add_requests_with_options<I, R>(
+        &self,
+        requests: I,
+        options: CrawlerAddRequestsOptions,
+    ) -> anyhow::Result<AddRequestsBatchedResult>
+    where
+        I: IntoIterator<Item = R>,
+        R: Into<Request>,
+    {
+        let (result, _) = self.add_requests_filtered(requests.into_iter().map(Into::into), &options).await?;
+        Ok(result)
+    }
+
+    /// Adds `requests` one level deeper than the current request, unless they have a depth.
+    pub(crate) async fn add_requests_filtered(
+        &self,
+        requests: impl Iterator<Item = Request>,
+        options: &CrawlerAddRequestsOptions,
+    ) -> Result<(AddRequestsBatchedResult, Vec<(Request, SkipReason)>), EnqueueError> {
         let depth = self.request().crawl_depth() + 1;
-        let requests: Vec<Request> = requests
-            .into_iter()
-            .map(Into::into)
+        let requests = requests
             .map(|mut request| {
                 request.crawlee.crawl_depth.get_or_insert(depth);
                 request
             })
             .collect();
-        if requests.is_empty() {
-            return Ok(BatchAddRequestsResult::default());
-        }
-        let result = self.scope.shared.request_manager.add_requests(requests, false).await?;
-        self.notify_requests_added();
-        Ok(result)
-    }
-
-    /// Wakes the task loop if it is waiting for requests.
-    pub(crate) fn notify_requests_added(&self) {
-        self.scope.shared.requests_added.notify_one();
+        self.scope.shared.add_requests_filtered(requests, options).await
     }
 
     /// State shared by every request of the crawl and saved with it, like `useState()` in JS.
@@ -345,12 +395,14 @@ impl BasicContext {
         self.scope.shared.record_domain_rate_limit(url, wait)
     }
 
-    /// Sends an HTTP request with this request's session (cookies and proxy).
+    /// Sends an HTTP request with this request's session (cookies, proxy and fingerprint).
     pub async fn send_request(&self, request: HttpRequest) -> Result<HttpResponse, HttpClientError> {
         let options = SendOptions {
             proxy_url: self.proxy_info().map(|proxy| proxy.url.clone()),
             cookie_jar: self.session().map(|session| session.cookie_jar().clone()),
             timeout: Some(self.scope.shared.send_request_timeout),
+            ignore_tls_errors: self.proxy_info().is_some_and(|proxy| proxy.ignore_tls_errors),
+            fingerprint: self.session().and_then(|session| session.fingerprint_handle().cloned()),
             ..Default::default()
         };
         self.scope.shared.http_client.send_request(request, &options).await

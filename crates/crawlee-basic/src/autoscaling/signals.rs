@@ -227,15 +227,22 @@ impl LoadSignal for MemoryLoadSignal {
                 ratio * 100.0
             );
         }
+        // Measured here in case `SystemInfo` comes without the total memory (memory_load_signal.ts).
+        let local_total = match fixed_max_bytes {
+            Some(_) => None,
+            None => crawlee_core::system_info::SystemInfoSampler::new(configuration.containerized, 1.0).total_memory(),
+        };
         let max_used_ratio = self.options.max_used_ratio;
         let store = self.store.clone();
         let last_warning: Mutex<Option<DateTime<Utc>>> = Mutex::new(None);
         self.subscription.subscribe(&services.events, move |info| {
-            let (Some(used), Some(total)) = (info.mem_current_bytes, info.mem_total_bytes) else {
+            let Some(max_bytes) = fixed_max_bytes
+                .or_else(|| info.mem_total_bytes.or(local_total).map(|total| ratio * total as f64))
+            else {
                 return;
             };
-            let max_bytes = fixed_max_bytes.unwrap_or(ratio * total as f64);
-            let used = used as f64;
+            // Without the used memory, JS compares `undefined`: never overloaded, but still recorded.
+            let used = info.mem_current_bytes.map_or(f64::NAN, |used| used as f64);
             store.lock().push(LoadSnapshot { created_at: info.created_at, is_overloaded: used / max_bytes > max_used_ratio });
 
             let critical = max_bytes * max_used_ratio + max_bytes * (1.0 - max_used_ratio) * RESERVE_MEMORY_RATIO;
@@ -492,5 +499,32 @@ mod tests {
         assert_eq!(info.actual_ratio, 0.25);
         assert!(info.is_overloaded);
         assert!(!evaluate_sample(&sample, 0.3).is_overloaded);
+    }
+
+    /// Like JS, a `SystemInfo` without the total memory (as some platforms send it) is measured
+    /// against the memory this machine reports, instead of being dropped.
+    #[tokio::test]
+    async fn memory_without_a_total_falls_back_to_the_local_total() {
+        let services = Services::in_memory();
+        let signal = MemoryLoadSignal::new(MemoryLoadSignalOptions::default());
+        signal.start(&services, Duration::from_secs(60));
+        let info = |millis: i64, used: Option<u64>| {
+            Event::SystemInfo(SystemInfo {
+                created_at: DateTime::from_timestamp_millis(1_000_000 + millis).unwrap(),
+                cpu_current_usage: 0.0,
+                is_cpu_overloaded: false,
+                mem_total_bytes: None,
+                mem_current_bytes: used,
+            })
+        };
+        services.events.emit(info(0, Some(1 << 20)));
+        services.events.emit(info(1000, Some(u64::MAX / 4)));
+        // Without the used memory, JS compares `undefined` (never overloaded) and still records it.
+        services.events.emit(info(2000, None));
+        services.events.wait_for_all_listeners_to_complete().await;
+        signal.stop();
+
+        let overloaded: Vec<bool> = signal.sample(None).iter().map(|snapshot| snapshot.is_overloaded).collect();
+        assert_eq!(overloaded, [false, true, false]);
     }
 }

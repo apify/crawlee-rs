@@ -18,6 +18,57 @@ pub struct RequestSkipped {
     pub reason: String,
 }
 
+/// Returned by [`BasicContext::skip_request`](crate::BasicContext::skip_request): the request is
+/// settled as skipped rather than failed (`ContextPipelineInterruptedError('manual')`).
+#[derive(Debug, thiserror::Error)]
+#[error("{}", .message.as_deref().unwrap_or("Request was skipped"))]
+pub struct SkipRequestError {
+    pub message: Option<String>,
+}
+
+/// A request is pinned to a session (`session_id`) that the session pool does not have, or that is
+/// no longer usable.
+#[derive(Debug, thiserror::Error)]
+#[error("The current SessionPool instance couldn't find a valid session for the following id: {session_id}.")]
+pub struct MissingSessionError {
+    pub session_id: String,
+}
+
+/// A member of the context that needs the response was used on a request with `skip_navigation`
+/// (`NavigationSkippedError`, a `NonRetryableError` in JS): the request fails without retries.
+///
+/// Fallible members return it. Infallible ones (such as the status of an HTTP response) panic
+/// with its message instead, as the getters of Crawlee for JS throw; the crawler turns that panic
+/// back into this error.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("The `{member}` method is not available - `skip_navigation` was used")]
+pub struct NavigationSkippedError {
+    pub member: String,
+}
+
+impl NavigationSkippedError {
+    pub fn new(member: impl Into<String>) -> Self {
+        NavigationSkippedError { member: member.into() }
+    }
+
+    /// The error whose message a panic carries, if it is one.
+    pub(crate) fn from_message(message: &str) -> Option<Self> {
+        let member =
+            message.strip_prefix("The `")?.strip_suffix("` method is not available - `skip_navigation` was used")?;
+        Some(Self::new(member))
+    }
+}
+
+/// A domain kept rate-limiting every request for longer than the request manager's
+/// `max_domain_stall`, and nothing else can be crawled: the crawl gives up rather than wait
+/// forever (`PersistentRateLimitError`, a `CriticalError` in JS). The domain's requests stay
+/// queued, so a later run can pick them up.
+#[derive(Debug, thiserror::Error)]
+#[error("Giving up: {reason}")]
+pub struct PersistentRateLimitError {
+    pub reason: String,
+}
+
 /// The request handler did not finish in time.
 #[derive(Debug, thiserror::Error)]
 #[error("requestHandler timed out after {secs} seconds.")]
@@ -51,19 +102,20 @@ impl ErrorKind {
             if cause.is::<SessionError>() {
                 return ErrorKind::Session;
             }
-            if cause.is::<NonRetryableError>() {
+            if cause.is::<NonRetryableError>() || cause.is::<NavigationSkippedError>() {
                 return ErrorKind::NonRetryable;
             }
             if cause.is::<RetryRequestError>() {
                 return ErrorKind::RetryRequest;
             }
-            if cause.is::<CriticalError>() || cause.is::<MissingRouteError>() {
+            if cause.is::<CriticalError>() || cause.is::<MissingRouteError>() || cause.is::<PersistentRateLimitError>()
+            {
                 return ErrorKind::Critical;
             }
             if cause.is::<RequestThrottledError>() {
                 return ErrorKind::Throttled;
             }
-            if cause.is::<RequestSkipped>() {
+            if cause.is::<RequestSkipped>() || cause.is::<SkipRequestError>() {
                 return ErrorKind::Skipped;
             }
         }
@@ -95,5 +147,13 @@ mod tests {
         assert_eq!(ErrorKind::of(&anyhow::anyhow!("plain")), ErrorKind::Other);
         assert_eq!(ErrorKind::of(&MissingRouteError { label: "X".into() }.into()), ErrorKind::Critical);
         assert_eq!(error_message(&wrapped), "while fetching: blocked");
+    }
+
+    #[test]
+    fn a_skipped_navigation_is_not_retried() {
+        let error = NavigationSkippedError::new("status");
+        assert_eq!(ErrorKind::of(&error.clone().into()), ErrorKind::NonRetryable);
+        assert_eq!(NavigationSkippedError::from_message(&error.to_string()), Some(error));
+        assert_eq!(NavigationSkippedError::from_message("The `status` method"), None);
     }
 }

@@ -122,7 +122,8 @@ async fn robots_txt_is_respected() {
 
     assert_eq!(site.hits("/private/secret"), 0, "a disallowed link is not enqueued");
     assert_eq!(site.hits("/private/direct"), 0, "a disallowed start URL is skipped");
-    assert_eq!(stats.requests_skipped, 1);
+    // Skipped when added, as `crawler.addRequests()` does, so it is never fetched from the queue.
+    assert_eq!(stats.requests_skipped, 0);
     assert_eq!(site.hits("/page/public"), 1);
     assert_eq!(site.hits("/robots.txt"), 1, "fetched once per origin");
 }

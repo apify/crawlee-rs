@@ -9,18 +9,24 @@ use std::sync::Arc;
 
 use crawlee::http_client::{HttpClient, RedirectingClient};
 use crawlee::{HtmlContext, HtmlCrawler};
-use crawlee_impit::{Browser, ImpitTransport};
+use crawlee_impit::ImpitTransport;
 
-let client: Arc<dyn HttpClient> = Arc::new(RedirectingClient::new(ImpitTransport::new(Browser::Chrome)));
+let client: Arc<dyn HttpClient> = Arc::new(RedirectingClient::new(ImpitTransport::new()));
 let crawler = HtmlCrawler::builder()
     .http_client(client)
     .request_handler(|ctx: HtmlContext| async move { Ok(()) })
     .build()?;
 ```
 
+Each session impersonates the browser of its fingerprint (Chrome or Firefox, in a version picked
+once per session; Edge and Safari fingerprints get Chrome), as `ImpitHttpClient` does in Crawlee
+for JS. `ImpitTransport::with_browser(Browser::Firefox)` impersonates one browser for every
+request instead.
+
 `ImpitTransport` only does single request/response exchanges. `RedirectingClient` handles
-redirects, cookies, sessions and timeouts, as it does for the default reqwest transport. One impit
-client is kept per proxy URL, so connections are reused.
+redirects, cookies, sessions and timeouts, as it does for the default reqwest transport. The
+impit clients of the 10 most recently used combinations of proxy, TLS mode and browser are kept,
+so connections are reused.
 
 ## Why it is not part of the main workspace
 

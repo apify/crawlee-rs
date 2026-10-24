@@ -12,6 +12,10 @@
 //!   It is the minimum time between two requests to the domain.
 //! - **Saved domains.** With `domains: All`, the domains discovered so far are saved under
 //!   `CRAWLEE_THROTTLED_DOMAINS`, so a resumed crawl finds their queues.
+//! - **Stalling.** A domain that answered 429 to every request for longer than
+//!   `max_domain_stall` (15 min), and still does, makes the manager report itself
+//!   [stalled](RequestSourceStatus::Stalled) once nothing else can be fetched. The crawler then
+//!   gives up with a `PersistentRateLimitError`, leaving the domain's requests queued.
 //!
 //! The crawler offers 429s and crawl delays as [`PacingSignal`]s. A request whose domain answered
 //! 429 is put back, at the front of its queue, without spending a retry.
@@ -26,10 +30,13 @@ use parking_lot::Mutex;
 use tokio::sync::OnceCell;
 use url::Url;
 
-use crawlee_core::storage::backend::{BatchAddRequestsResult, QueueOperationInfo};
+use crawlee_core::storage::backend::{BatchAddRequestsResult, ProcessedRequest, QueueOperationInfo};
+use crawlee_core::storage::batched_adds::{
+    AddRequestsBatchedOptions, AddRequestsBatchedResult, InProgressBatches, drain_request_batches,
+};
 use crawlee_core::{
-    KeyValueStore, PacingScope, PacingSignal, Request, RequestManager, RequestQueue, Services, StorageError,
-    StorageIdentifier, StorageResult,
+    KeyValueStore, PacingScope, PacingSignal, Request, RequestManager, RequestQueue, RequestSourceStatus, Services,
+    StorageError, StorageIdentifier, StorageResult,
 };
 use crawlee_utils::registrable_domain;
 
@@ -67,6 +74,9 @@ pub struct ThrottlingOptions {
     /// are refused.
     pub max_throttled_domains: usize,
     pub persist_state_key: String,
+    /// How long a domain may rate-limit every request before the manager reports itself stalled
+    /// (`maxDomainStallSecs`). 15 min by default.
+    pub max_domain_stall: Duration,
 }
 
 impl Default for ThrottlingOptions {
@@ -79,6 +89,7 @@ impl Default for ThrottlingOptions {
             min_crawl_delay: Duration::ZERO,
             max_throttled_domains: 100,
             persist_state_key: STATE_KEY.to_owned(),
+            max_domain_stall: Duration::from_secs(900),
         }
     }
 }
@@ -95,6 +106,10 @@ struct DomainState {
     backoff_decays_at: i64,
     consecutive_429_count: u32,
     declared_crawl_delay: Option<i64>,
+    /// When the current unbroken run of 429s began, or 0 when the domain is not rate-limiting.
+    rate_limited_since: i64,
+    /// When the domain last answered 429, or 0 if it never did.
+    last_rate_limited_at: i64,
 }
 
 impl DomainState {
@@ -116,13 +131,18 @@ struct Inner {
 }
 
 /// Paces requests per domain; see the [module documentation](self).
-pub struct ThrottlingRequestManager {
+pub struct ThrottlingRequestManager(Arc<Shared>);
+
+/// The state of a [`ThrottlingRequestManager`], shared with its background batches.
+struct Shared {
     options: ThrottlingOptions,
     services: Services,
     inner_manager: Arc<dyn RequestManager>,
     state: Mutex<Inner>,
     ready: OnceCell<Option<KeyValueStore>>,
     expected_processing_time: Mutex<Option<Duration>>,
+    /// Batches still being added in the background, which keep the manager unfinished.
+    in_progress_batches: InProgressBatches,
 }
 
 impl ThrottlingRequestManager {
@@ -144,20 +164,23 @@ impl ThrottlingRequestManager {
                 state.states.insert(key, DomainState::default());
             }
         }
-        ThrottlingRequestManager {
+        ThrottlingRequestManager(Arc::new(Shared {
             options,
             services: services.clone(),
             inner_manager: inner,
             state: Mutex::new(state),
             ready: OnceCell::new(),
             expected_processing_time: Mutex::new(None),
-        }
+            in_progress_batches: InProgressBatches::default(),
+        }))
     }
 
     pub fn inner(&self) -> &Arc<dyn RequestManager> {
-        &self.inner_manager
+        &self.0.inner_manager
     }
+}
 
+impl Shared {
     fn throttles_every_domain(&self) -> bool {
         self.options.domains == ThrottledDomains::All
     }
@@ -259,6 +282,11 @@ impl ThrottlingRequestManager {
         let mut state = self.state.lock();
         let Some(domain_state) = state.states.get_mut(&domain) else { return false };
         let now = now_millis();
+        // Before the burst suppression: a suppressed 429 is still the domain turning us away.
+        domain_state.last_rate_limited_at = now;
+        if domain_state.rate_limited_since == 0 {
+            domain_state.rate_limited_since = now;
+        }
         if now < domain_state.backoff_until {
             return true;
         }
@@ -290,6 +318,14 @@ impl ThrottlingRequestManager {
             delay as f64 / 1000.0
         );
         true
+    }
+
+    /// A request of the domain of `url` got through, which ends its run of 429s.
+    fn record_progress(&self, url: &str) {
+        let Some(domain) = self.domain_of(url) else { return };
+        if let Some(domain_state) = self.state.lock().states.get_mut(&domain) {
+            domain_state.rate_limited_since = 0;
+        }
     }
 
     fn check_scope(&self, scope: Option<PacingScope>) -> bool {
@@ -336,6 +372,41 @@ impl ThrottlingRequestManager {
         Ok(None)
     }
 
+    /// Adds one batch, routed by domain: each target adds its slice as one batch. Requests of
+    /// domains over `max_throttled_domains` are refused after the others are added.
+    async fn add_batch(&self, chunk: Vec<Request>, forefront: bool) -> StorageResult<Vec<ProcessedRequest>> {
+        let mut groups: Vec<(Arc<dyn RequestManager>, Vec<Request>)> = Vec::new();
+        let mut overflowing = None;
+        for request in chunk {
+            let Some(manager) = self.select(&request.url).await? else {
+                overflowing.get_or_insert_with(|| self.domain_of(&request.url).unwrap_or_default());
+                continue;
+            };
+            match groups
+                .iter_mut()
+                .find(|(existing, _)| std::ptr::addr_eq(Arc::as_ptr(existing), Arc::as_ptr(&manager)))
+            {
+                Some((_, slice)) => slice.push(request),
+                None => groups.push((manager, vec![request])),
+            }
+        }
+        let results = futures::future::try_join_all(groups.into_iter().map(|(manager, slice)| async move {
+            let options = AddRequestsBatchedOptions {
+                forefront,
+                // The slice is one batch already, and is needed added before the next one.
+                batch_size: slice.len(),
+                wait_for_all_requests_to_be_added: true,
+                ..AddRequestsBatchedOptions::default()
+            };
+            manager.add_requests_batched(slice, options).await
+        }))
+        .await?;
+        if let Some(domain) = overflowing {
+            return Err(self.domain_limit_error(&domain));
+        }
+        Ok(results.into_iter().flat_map(|result| result.added_requests).collect())
+    }
+
     fn fetchable_domains(&self) -> Vec<(String, Arc<RequestQueue>)> {
         let state = self.state.lock();
         let now = now_millis();
@@ -379,12 +450,12 @@ fn encode_uri_component(text: &str) -> String {
 #[async_trait]
 impl RequestManager for ThrottlingRequestManager {
     async fn add_requests(&self, requests: Vec<Request>, forefront: bool) -> StorageResult<BatchAddRequestsResult> {
-        self.ensure_ready().await?;
+        self.0.ensure_ready().await?;
         let mut groups: Vec<(Arc<dyn RequestManager>, Vec<Request>)> = Vec::new();
         let mut overflowing = None;
         for request in requests {
-            let Some(manager) = self.select(&request.url).await? else {
-                overflowing.get_or_insert_with(|| self.domain_of(&request.url).unwrap_or_default());
+            let Some(manager) = self.0.select(&request.url).await? else {
+                overflowing.get_or_insert_with(|| self.0.domain_of(&request.url).unwrap_or_default());
                 continue;
             };
             match groups
@@ -402,17 +473,33 @@ impl RequestManager for ThrottlingRequestManager {
             result.unprocessed_requests.extend(added.unprocessed_requests);
         }
         match overflowing {
-            Some(domain) => Err(self.domain_limit_error(&domain)),
+            Some(domain) => Err(self.0.domain_limit_error(&domain)),
             None => Ok(result),
         }
     }
 
+    /// Adds the requests in batches, each routed by domain (`addRequestsBatched`).
+    async fn add_requests_batched(
+        &self,
+        requests: Vec<Request>,
+        options: AddRequestsBatchedOptions,
+    ) -> StorageResult<AddRequestsBatchedResult> {
+        self.0.ensure_ready().await?;
+        let shared = self.0.clone();
+        let forefront = options.forefront;
+        drain_request_batches(requests, &options, &self.0.in_progress_batches, move |chunk, _| {
+            let shared = shared.clone();
+            async move { shared.add_batch(chunk, forefront).await }
+        })
+        .await
+    }
+
     async fn fetch_next_request(&self) -> StorageResult<Option<Request>> {
-        self.ensure_ready().await?;
-        for (domain, queue) in self.fetchable_domains() {
+        self.0.ensure_ready().await?;
+        for (domain, queue) in self.0.fetchable_domains() {
             // Taken before fetching, so that concurrent fetches respect the delay too.
             let before = {
-                let mut state = self.state.lock();
+                let mut state = self.0.state.lock();
                 let min = state.min_crawl_delay;
                 let Some(domain_state) = state.states.get_mut(&domain) else { continue };
                 let before = domain_state.crawl_delay_until;
@@ -425,85 +512,200 @@ impl RequestManager for ThrottlingRequestManager {
             if let Some(request) = queue.fetch_next_request().await? {
                 return Ok(Some(request));
             }
-            if let Some(domain_state) = self.state.lock().states.get_mut(&domain) {
+            if let Some(domain_state) = self.0.state.lock().states.get_mut(&domain) {
                 domain_state.crawl_delay_until = before;
             }
         }
-        let request = self.fetch_from_inner().await?;
+        let request = self.0.fetch_from_inner().await?;
         if let Some(request) = &request {
             let key = request.id.clone().unwrap_or_else(|| request.unique_key.clone());
-            self.state.lock().in_flight_from_inner.insert(key);
+            self.0.state.lock().in_flight_from_inner.insert(key);
         }
         Ok(request)
     }
 
     async fn mark_request_as_handled(&self, request: &mut Request) -> StorageResult<Option<QueueOperationInfo>> {
-        let manager = self.holding(request).await?;
+        let manager = self.0.holding(request).await?;
+        // Succeeded or out of retries, the domain answered either way.
+        self.0.record_progress(&request.url);
         manager.mark_request_as_handled(request).await
     }
 
     async fn reclaim_request(&self, request: &Request, forefront: bool) -> StorageResult<Option<QueueOperationInfo>> {
-        let manager = self.holding(request).await?;
+        let manager = self.0.holding(request).await?;
         manager.reclaim_request(request, forefront).await
     }
 
-    /// Nothing can be fetched right now: held-back domains count as empty.
+    /// Extends the lock where the request is held, without consuming the marker that routes
+    /// `mark_request_as_handled` and `reclaim_request` later.
+    async fn extend_request_processing_time(&self, request: &Request, by: Duration) -> StorageResult<bool> {
+        let key = request.id.clone().unwrap_or_else(|| request.unique_key.clone());
+        let manager = if self.0.state.lock().in_flight_from_inner.contains(&key) {
+            self.0.inner_manager.clone()
+        } else {
+            self.0.select(&request.url).await?.ok_or_else(|| self.0.domain_limit_error(&request.url))?
+        };
+        manager.extend_request_processing_time(request, by).await
+    }
+
+    /// Nothing can be fetched right now: held-back and stalled domains count as empty.
     async fn is_empty(&self) -> StorageResult<bool> {
-        self.ensure_ready().await?;
-        for (_, queue) in self.fetchable_domains() {
-            if !queue.is_empty().await? {
-                return Ok(false);
+        Ok(self.check_readiness().await? != RequestSourceStatus::Ready)
+    }
+
+    /// Ready when the inner manager or a domain that is not held back has a request; otherwise
+    /// stalled when a domain rate-limited every request for longer than `max_domain_stall`, and
+    /// still does; otherwise waiting until the earliest held-back domain may be fetched again.
+    async fn check_readiness(&self) -> StorageResult<RequestSourceStatus> {
+        self.0.ensure_ready().await?;
+        let now = now_millis();
+        let max_stall = self.0.options.max_domain_stall.as_millis() as i64;
+        let mut dispatchable = Vec::new();
+        let mut stall_candidates = Vec::new();
+        let mut ready_at: Option<i64> = None;
+        {
+            let state = self.0.state.lock();
+            for (domain, domain_state) in &state.states {
+                // A crawl delay can give a domain a clock before it has a queue.
+                let Some(queue) = state.queues.get(domain) else { continue };
+                if domain_state.rate_limited_since != 0
+                    && now - domain_state.last_rate_limited_at <= max_stall
+                    && now - domain_state.rate_limited_since > max_stall
+                {
+                    // Not dispatchable even when its backoff lapsed: that is what it does between 429s.
+                    stall_candidates.push((domain.clone(), domain_state.rate_limited_since, queue.clone()));
+                    continue;
+                }
+                let until = domain_state.throttled_until();
+                if now >= until {
+                    dispatchable.push(queue.clone());
+                } else if ready_at.is_none_or(|ready_at| until < ready_at) {
+                    ready_at = Some(until);
+                }
             }
         }
-        self.inner_manager.is_empty().await
+
+        let mut probed = self.0.inner_manager.check_readiness().await?;
+        for queue in dispatchable {
+            probed = probed.join(queue.check_readiness().await?);
+        }
+        // Anything dispatchable outranks a stalled or held-back domain.
+        if probed == RequestSourceStatus::Ready {
+            return Ok(probed);
+        }
+
+        let mut stalled = Vec::new();
+        for (domain, since, queue) in stall_candidates {
+            if queue.check_readiness().await? == RequestSourceStatus::Ready {
+                stalled.push(format!("\"{domain}\" ({}s)", (now - since) / 1000));
+            }
+        }
+        if !stalled.is_empty() {
+            return Ok(RequestSourceStatus::Stalled {
+                reason: format!(
+                    "{} rate-limited every request for longer than max_domain_stall ({}s). Waiting longer will not \
+                     help - lower the crawler's concurrency, or drop these domains. Their requests are still queued, \
+                     so re-running with `purge_on_start` disabled will resume them if the rate limit lifts.",
+                    stalled.join(", "),
+                    max_stall / 1000
+                ),
+            });
+        }
+
+        if let Some(until) = ready_at {
+            let wait = Duration::from_millis(u64::try_from(until - now).unwrap_or(0));
+            let waiting = RequestSourceStatus::Waiting { ready_at: Some(std::time::Instant::now() + wait) };
+            return Ok(probed.join(waiting));
+        }
+        // Batches still being added in the background are work no queue shows yet.
+        if self.0.in_progress_batches.any() && probed == RequestSourceStatus::Finished {
+            return Ok(RequestSourceStatus::Waiting { ready_at: None });
+        }
+        Ok(probed)
     }
 
     async fn is_finished(&self) -> StorageResult<bool> {
-        self.ensure_ready().await?;
-        for queue in self.all_queues() {
+        self.0.ensure_ready().await?;
+        // Batches still being added in the background are work no queue shows yet.
+        if self.0.in_progress_batches.any() {
+            return Ok(false);
+        }
+        for queue in self.0.all_queues() {
             if !queue.is_finished().await? {
                 return Ok(false);
             }
         }
-        self.inner_manager.is_finished().await
+        self.0.inner_manager.is_finished().await
     }
 
     async fn handled_count(&self) -> StorageResult<u64> {
-        self.ensure_ready().await?;
-        let mut total = self.inner_manager.handled_count().await?;
-        for queue in self.all_queues() {
+        self.0.ensure_ready().await?;
+        let mut total = self.0.inner_manager.handled_count().await?;
+        for queue in self.0.all_queues() {
             total += queue.handled_count().await?;
         }
-        Ok(total.saturating_sub(self.state.lock().migrated_from_inner))
+        Ok(total.saturating_sub(self.0.state.lock().migrated_from_inner))
+    }
+
+    async fn total_count(&self) -> StorageResult<u64> {
+        self.0.ensure_ready().await?;
+        let mut total = self.0.inner_manager.total_count().await?;
+        for queue in self.0.all_queues() {
+            total += queue.total_count().await?;
+        }
+        Ok(total.saturating_sub(self.0.state.lock().migrated_from_inner))
+    }
+
+    async fn pending_count(&self) -> StorageResult<u64> {
+        self.0.ensure_ready().await?;
+        let mut total = self.0.inner_manager.pending_count().await?;
+        for queue in self.0.all_queues() {
+            total += queue.pending_count().await?;
+        }
+        Ok(total)
     }
 
     async fn set_expected_request_processing_time(&self, duration: Duration) -> StorageResult<()> {
-        *self.expected_processing_time.lock() = Some(duration);
-        for queue in self.all_queues() {
+        *self.0.expected_processing_time.lock() = Some(duration);
+        for queue in self.0.all_queues() {
             queue.set_expected_request_processing_time(duration).await?;
         }
-        self.inner_manager.set_expected_request_processing_time(duration).await
+        self.0.inner_manager.set_expected_request_processing_time(duration).await
+    }
+
+    /// The earliest moment a held-back domain with a queue may be fetched from again.
+    fn ready_at(&self) -> Option<std::time::Instant> {
+        let state = self.0.state.lock();
+        let now = now_millis();
+        let until = state
+            .states
+            .iter()
+            .filter(|(domain, _)| state.queues.contains_key(*domain))
+            .map(|(_, domain_state)| domain_state.throttled_until())
+            .filter(|until| *until > now)
+            .min()?;
+        Some(std::time::Instant::now() + Duration::from_millis(u64::try_from(until - now).unwrap_or(0)))
     }
 
     fn record_pacing_signal(&self, signal: &PacingSignal) -> bool {
         match signal {
             PacingSignal::MinIntervalEverywhere { interval, scope } => {
-                if !self.throttles_every_domain() || !self.check_scope(*scope) {
+                if !self.0.throttles_every_domain() || !self.0.check_scope(*scope) {
                     return false;
                 }
-                let mut state = self.state.lock();
+                let mut state = self.0.state.lock();
                 state.min_crawl_delay = state.min_crawl_delay.max(interval.as_millis() as i64);
                 true
             }
-            PacingSignal::RateLimited { url, wait } => self.record_rate_limit(url, *wait),
+            PacingSignal::RateLimited { url, wait } => self.0.record_rate_limit(url, *wait),
             PacingSignal::MinInterval { url, interval, scope } => {
-                if !self.check_scope(*scope) {
+                if !self.0.check_scope(*scope) {
                     return false;
                 }
-                let Some(domain) = self.domain_of(url).filter(|domain| self.is_throttled_domain(domain)) else {
+                let Some(domain) = self.0.domain_of(url).filter(|domain| self.0.is_throttled_domain(domain)) else {
                     return false;
                 };
-                let mut state = self.state.lock();
+                let mut state = self.0.state.lock();
                 let domain_state = state.states.entry(domain).or_default();
                 domain_state.declared_crawl_delay.get_or_insert(interval.as_millis() as i64);
                 true
@@ -515,6 +717,7 @@ impl RequestManager for ThrottlingRequestManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crawlee_core::RequestSourceStatus;
 
     #[test]
     fn domain_keys() {
@@ -548,19 +751,19 @@ mod tests {
         assert!(manager.is_empty().await.unwrap());
         assert!(!manager.is_finished().await.unwrap());
 
-        let until = manager.state.lock().states["a.test"].backoff_until;
+        let until = manager.0.state.lock().states["a.test"].backoff_until;
         assert!((until - now_millis() - 2000).abs() < 200, "base delay 2 s");
         // While backing off, further 429s do not extend it.
         assert!(manager.record_pacing_signal(&PacingSignal::RateLimited { url: first.url.clone(), wait: None }));
-        assert_eq!(manager.state.lock().states["a.test"].consecutive_429_count, 1);
+        assert_eq!(manager.0.state.lock().states["a.test"].consecutive_429_count, 1);
         // The next one after the backoff doubles it.
-        manager.state.lock().states.get_mut("a.test").unwrap().backoff_until = 0;
+        manager.0.state.lock().states.get_mut("a.test").unwrap().backoff_until = 0;
         manager.record_pacing_signal(&PacingSignal::RateLimited { url: first.url.clone(), wait: None });
-        let state = manager.state.lock().states["a.test"].clone();
+        let state = manager.0.state.lock().states["a.test"].clone();
         assert_eq!(state.consecutive_429_count, 2);
         assert!((state.backoff_until - now_millis() - 4000).abs() < 200);
 
-        manager.state.lock().states.get_mut("a.test").unwrap().backoff_until = 0;
+        manager.0.state.lock().states.get_mut("a.test").unwrap().backoff_until = 0;
         first = manager.fetch_next_request().await.unwrap().unwrap();
         assert_eq!(first.url, "https://a.test/1", "reclaimed to the front");
     }
@@ -577,13 +780,13 @@ mod tests {
         assert!(manager.fetch_next_request().await.unwrap().is_some());
         assert!(manager.fetch_next_request().await.unwrap().is_none(), "crawl delay between the two");
 
-        let state = manager.state.lock().states["a.test"].clone();
+        let state = manager.0.state.lock().states["a.test"].clone();
         assert!((state.crawl_delay_until - now_millis() - 5000).abs() < 200);
         manager.record_pacing_signal(&PacingSignal::RateLimited {
             url: "https://a.test/1".into(),
             wait: Some(Duration::from_secs(30)),
         });
-        let state = manager.state.lock().states["a.test"].clone();
+        let state = manager.0.state.lock().states["a.test"].clone();
         assert!((state.backoff_until - now_millis() - 10_000).abs() < 200, "capped at max_delay");
     }
 
@@ -607,7 +810,90 @@ mod tests {
         assert!(limited.add_requests(vec!["https://b.test/1".into()], false).await.is_err());
     }
 
+    #[tokio::test]
+    async fn batches_are_routed_by_domain_and_keep_the_manager_unfinished() {
+        let manager = manager(ThrottlingOptions::default()).await;
+        let options = AddRequestsBatchedOptions {
+            batch_size: 1,
+            wait_between_batches: Duration::from_millis(200),
+            ..Default::default()
+        };
+        let result = manager
+            .add_requests_batched(vec!["https://a.test/1".into(), "https://b.test/1".into()], options)
+            .await
+            .unwrap();
+        assert_eq!(result.added_requests.len(), 1);
+        let mut first = manager.fetch_next_request().await.unwrap().unwrap();
+        assert_eq!(first.url, "https://a.test/1");
+        manager.mark_request_as_handled(&mut first).await.unwrap();
+        assert!(!manager.is_finished().await.unwrap(), "a batch is still being added");
+
+        assert_eq!(result.wait_for_all_requests_to_be_added.unwrap().await.unwrap().unwrap().len(), 1);
+        let mut second = manager.fetch_next_request().await.unwrap().unwrap();
+        assert_eq!(second.url, "https://b.test/1");
+        manager.mark_request_as_handled(&mut second).await.unwrap();
+        assert!(manager.is_finished().await.unwrap());
+        assert!(manager.0.state.lock().queues.contains_key("b.test"), "routed to the domain's queue");
+
+        let options = AddRequestsBatchedOptions { max_new_requests: Some(1), ..Default::default() };
+        let result = manager
+            .add_requests_batched(
+                vec!["https://a.test/1".into(), "https://a.test/2".into(), "https://c.test/1".into()],
+                options,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.added_requests.iter().filter(|added| !added.was_already_present).count(), 1);
+        assert_eq!(result.requests_over_limit.len(), 1);
+    }
+
     async fn manager_with_limit() -> ThrottlingRequestManager {
         manager(ThrottlingOptions { max_throttled_domains: 1, ..Default::default() }).await
+    }
+
+    #[tokio::test]
+    async fn a_domain_that_rate_limits_for_too_long_stalls() {
+        let manager = manager(ThrottlingOptions {
+            domains: ThrottledDomains::List(vec!["a.test".into(), "b.test".into()]),
+            max_domain_stall: Duration::from_secs(10),
+            ..Default::default()
+        })
+        .await;
+        manager.add_requests(vec!["https://a.test/1".into(), "https://a.test/2".into()], false).await.unwrap();
+        let first = manager.fetch_next_request().await.unwrap().unwrap();
+        assert!(manager.record_pacing_signal(&PacingSignal::RateLimited { url: first.url.clone(), wait: None }));
+        manager.reclaim_request(&first, true).await.unwrap();
+        assert!(matches!(manager.check_readiness().await.unwrap(), RequestSourceStatus::Waiting { ready_at: Some(_) }));
+
+        // Rate-limited without a break for longer than the window, and still at it: stalled, even
+        // though its backoff is over.
+        {
+            let mut state = manager.0.state.lock();
+            let domain = state.states.get_mut("a.test").unwrap();
+            domain.rate_limited_since = now_millis() - 11_000;
+            domain.backoff_until = 0;
+        }
+        let RequestSourceStatus::Stalled { reason } = manager.check_readiness().await.unwrap() else {
+            panic!("not stalled");
+        };
+        assert!(reason.starts_with("\"a.test\" (11s) rate-limited every request for longer than"), "{reason}");
+        assert!(manager.is_empty().await.unwrap());
+
+        // Another domain with something to fetch masks it.
+        manager.add_requests(vec!["https://b.test/1".into()], false).await.unwrap();
+        assert_eq!(manager.check_readiness().await.unwrap(), RequestSourceStatus::Ready);
+        let mut other = manager.fetch_next_request().await.unwrap().unwrap();
+        manager.mark_request_as_handled(&mut other).await.unwrap();
+
+        // A domain quiet for longer than the window is merely being waited out.
+        manager.0.state.lock().states.get_mut("a.test").unwrap().last_rate_limited_at = now_millis() - 10_500;
+        assert_eq!(manager.check_readiness().await.unwrap(), RequestSourceStatus::Ready);
+
+        // A request that gets through ends the run of 429s.
+        manager.0.state.lock().states.get_mut("a.test").unwrap().last_rate_limited_at = now_millis();
+        let mut request = manager.fetch_next_request().await.unwrap().unwrap();
+        manager.mark_request_as_handled(&mut request).await.unwrap();
+        assert_eq!(manager.0.state.lock().states["a.test"].rate_limited_since, 0);
+        assert_eq!(manager.check_readiness().await.unwrap(), RequestSourceStatus::Ready);
     }
 }

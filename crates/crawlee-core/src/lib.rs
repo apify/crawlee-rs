@@ -13,23 +13,26 @@ pub mod transaction;
 
 pub use crate::configuration::Configuration;
 pub use crate::errors::{
-    CriticalError, NonRetryableError, RequestThrottledError, RetryRequestError, SessionError, StorageError,
-    StorageResult,
+    CriticalError, NonRetryableError, RequestThrottledError, RetryRequestError, SessionError, StateValidationError,
+    StorageError, StorageResult,
 };
-pub use crate::events::{Event, EventKind, EventManager, StatusLevel, StatusMessage};
+pub use crate::events::{Event, EventKind, EventManager, ExitOptions, StatusLevel, StatusMessage};
 pub use crate::recoverable_state::{PersistedState, RecoverableState, SerdeState};
 pub use crate::request::{Request, RequestBuilder};
 pub use crate::services::Services;
 pub use crate::storage::backend::{StorageBackend, StorageIdentifier};
-pub use crate::storage::dataset::Dataset;
+pub use crate::storage::dataset::{Dataset, DatasetExportOptions, DatasetStats};
 #[cfg(feature = "fs-storage")]
 pub use crate::storage::file_system::FileSystemStorageBackend;
-pub use crate::storage::key_value_store::KeyValueStore;
+pub use crate::storage::key_value_store::{KeyValueStore, KeyValueStoreStats, RecordValue};
 pub use crate::storage::memory::MemoryStorageBackend;
+pub use crate::storage::request_list::{RequestList, RequestListOptions, RequestListSource, RequestListState};
 pub use crate::storage::request_loader::{
-    LoaderStatus, PacingScope, PacingSignal, RequestLoader, RequestManagerTandem,
+    LoaderStatus, PacingScope, PacingSignal, RequestLoader, RequestManagerTandem, RequestSourceStatus,
 };
-pub use crate::storage::request_queue::{RequestManager, RequestQueue};
+pub use crate::storage::request_queue::{
+    RequestManager, RequestQueue, RequestQueueStats, RequestsFromUrl, UrlListFetcher,
+};
 pub use crate::system_info::SystemInfo;
 pub use crate::transaction::StorageTransaction;
 

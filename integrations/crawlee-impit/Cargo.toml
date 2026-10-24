@@ -20,7 +20,9 @@ crawlee-http-client = { path = "../../crates/crawlee-http-client", default-featu
 http = "1"
 impit = { git = "https://github.com/apify/impit.git", rev = "f4e05a053ff1fd6f2f4daa43482d9105fd952130" }
 parking_lot = "0.12"
+rand = "0.9"
 reqwest = { version = "0.13", default-features = false }
+tracing = "0.1"
 url = "2"
 
 [dev-dependencies]

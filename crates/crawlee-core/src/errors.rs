@@ -74,6 +74,18 @@ pub enum StorageError {
     Serialization(#[from] serde_json::Error),
     #[error("storage backend error: {0}")]
     Backend(#[source] Box<dyn std::error::Error + Send + Sync>),
+    #[error(transparent)]
+    StateValidation(#[from] StateValidationError),
+}
+
+/// A state saved by a [`RecoverableState`](crate::RecoverableState) could not be restored
+/// (`StateValidationError` in Crawlee for JS).
+#[derive(Debug, thiserror::Error)]
+#[error("State persisted under key '{persist_state_key}' failed validation: {source}")]
+pub struct StateValidationError {
+    pub persist_state_key: String,
+    #[source]
+    pub source: Box<dyn std::error::Error + Send + Sync>,
 }
 
 pub type StorageResult<T> = Result<T, StorageError>;

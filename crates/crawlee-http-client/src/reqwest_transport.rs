@@ -2,20 +2,23 @@
 //!
 //! One `reqwest::Client` is kept per (proxy, TLS verification) combination, so connections,
 //! TLS sessions and HTTP/2 streams are reused across requests instead of being set up per call.
-//! Clients share one TLS configuration, and the clients of proxies no longer used are dropped:
-//! without a session pool, every request has a proxy URL of its own.
+//! Clients share one TLS configuration per verification mode, and the clients of proxies no longer
+//! used are dropped: without a session pool, every request can have a proxy URL of its own.
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use http::HeaderValue;
 use http::header::{ACCEPT, ACCEPT_LANGUAGE, USER_AGENT};
 use parking_lot::Mutex;
 
-use crate::{HttpClientError, HttpRequest, HttpResponse, Transport, TransportOptions};
+use crate::{
+    BodyStream, HttpClientError, HttpRequest, HttpResponse, ResponseBody, StreamingResponse, Transport,
+    TransportOptions,
+};
 
 /// User agent sent when the request does not set one.
 pub const DEFAULT_USER_AGENT: &str =
@@ -28,28 +31,93 @@ struct CachedClient {
     last_used: Instant,
 }
 
-/// The TLS configuration of every client, built once. reqwest builds one per client, and with it
-/// a certificate verifier that loads the system's root certificates again.
+fn crypto_provider() -> Arc<rustls::crypto::CryptoProvider> {
+    // As reqwest: a crypto provider installed by the application, else aws-lc-rs.
+    rustls::crypto::CryptoProvider::get_default()
+        .cloned()
+        .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()))
+}
+
+fn build_tls_config(
+    provider: Arc<rustls::crypto::CryptoProvider>,
+    verifier: Arc<dyn rustls::client::danger::ServerCertVerifier>,
+) -> Result<rustls::ClientConfig, String> {
+    let mut config = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|err| err.to_string())?
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Ok(config)
+}
+
+fn cached_config(
+    cell: &'static OnceLock<Result<rustls::ClientConfig, String>>,
+    init: impl FnOnce() -> Result<rustls::ClientConfig, String>,
+) -> Result<&'static rustls::ClientConfig, HttpClientError> {
+    cell.get_or_init(init).as_ref().map_err(|err| HttpClientError::Other(format!("TLS configuration: {err}")))
+}
+
+/// The TLS configuration of every client that verifies certificates, built once. reqwest builds
+/// one per client, and with it a certificate verifier that loads the system's root certificates
+/// again.
 fn tls_config() -> Result<&'static rustls::ClientConfig, HttpClientError> {
     static CONFIG: OnceLock<Result<rustls::ClientConfig, String>> = OnceLock::new();
-    CONFIG
-        .get_or_init(|| {
-            // As reqwest: a crypto provider installed by the application, else aws-lc-rs.
-            let provider = rustls::crypto::CryptoProvider::get_default()
-                .cloned()
-                .unwrap_or_else(|| Arc::new(rustls::crypto::aws_lc_rs::default_provider()));
-            let verifier = rustls_platform_verifier::Verifier::new(provider.clone()).map_err(|err| err.to_string())?;
-            let mut config = rustls::ClientConfig::builder_with_provider(provider)
-                .with_safe_default_protocol_versions()
-                .map_err(|err| err.to_string())?
-                .dangerous()
-                .with_custom_certificate_verifier(Arc::new(verifier))
-                .with_no_client_auth();
-            config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-            Ok(config)
-        })
-        .as_ref()
-        .map_err(|err| HttpClientError::Other(format!("TLS configuration: {err}")))
+    cached_config(&CONFIG, || {
+        let provider = crypto_provider();
+        let verifier = rustls_platform_verifier::Verifier::new(provider.clone()).map_err(|err| err.to_string())?;
+        build_tls_config(provider, Arc::new(verifier))
+    })
+}
+
+/// The TLS configuration of every client that ignores certificate errors (the crawler's default),
+/// built once too.
+fn insecure_tls_config() -> Result<&'static rustls::ClientConfig, HttpClientError> {
+    static CONFIG: OnceLock<Result<rustls::ClientConfig, String>> = OnceLock::new();
+    cached_config(&CONFIG, || {
+        let provider = crypto_provider();
+        build_tls_config(provider.clone(), Arc::new(AcceptAnyCertificate(provider)))
+    })
+}
+
+/// Accepts every certificate; signatures are still checked, as reqwest's own verifier does.
+#[derive(Debug)]
+struct AcceptAnyCertificate(Arc<rustls::crypto::CryptoProvider>);
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyCertificate {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
 }
 
 /// `reqwest`-based transport with transparent gzip, brotli and deflate decompression.
@@ -100,11 +168,8 @@ impl ReqwestTransport {
             .connect_timeout(self.connect_timeout)
             .pool_idle_timeout(self.pool_idle_timeout)
             .tcp_nodelay(true);
-        builder = if options.ignore_tls_errors {
-            builder.tls_danger_accept_invalid_certs(true)
-        } else {
-            builder.tls_backend_preconfigured(tls_config()?.clone())
-        };
+        let tls = if options.ignore_tls_errors { insecure_tls_config()? } else { tls_config()? };
+        builder = builder.tls_backend_preconfigured(tls.clone());
         // Without an explicit proxy, the system proxy settings (`HTTPS_PROXY`, `NO_PROXY`, ...)
         // apply, as with curl.
         if let Some(proxy) = &options.proxy_url {
@@ -152,6 +217,16 @@ impl Transport for ReqwestTransport {
     }
 
     async fn fetch(&self, request: HttpRequest, options: &TransportOptions) -> Result<HttpResponse, HttpClientError> {
+        let mut response = self.fetch_streaming(request, options).await?;
+        response.body.set_max_size(options.max_body_size);
+        response.into_response().await
+    }
+
+    async fn fetch_streaming(
+        &self,
+        request: HttpRequest,
+        options: &TransportOptions,
+    ) -> Result<StreamingResponse, HttpClientError> {
         let client = self.client(options)?;
         let via_proxy = options.proxy_url.is_some();
 
@@ -172,25 +247,22 @@ impl Transport for ReqwestTransport {
         let status = response.status();
         let headers = std::mem::take(response.headers_mut());
         let url = response.url().clone();
+        let exact_len = response.content_length();
+        let body = ResponseBody::from_stream(ReqwestBody { response, via_proxy }, exact_len);
+        Ok(StreamingResponse { status, headers, url, body, redirects: Vec::new() })
+    }
+}
 
-        let body = match options.max_body_size {
-            None => response.bytes().await.map_err(|err| map_error(err, via_proxy))?,
-            Some(limit) => {
-                if response.content_length().is_some_and(|len| len as usize > limit) {
-                    return Err(HttpClientError::BodyTooLarge { limit });
-                }
-                let mut buffer = BytesMut::new();
-                while let Some(chunk) = response.chunk().await.map_err(|err| map_error(err, via_proxy))? {
-                    if buffer.len() + chunk.len() > limit {
-                        return Err(HttpClientError::BodyTooLarge { limit });
-                    }
-                    buffer.extend_from_slice(&chunk);
-                }
-                Bytes::from(buffer)
-            }
-        };
+/// The body of a reqwest response, read chunk by chunk. Dropping it aborts the download.
+struct ReqwestBody {
+    response: reqwest::Response,
+    via_proxy: bool,
+}
 
-        Ok(HttpResponse { status, headers, url, body, redirects: Vec::new() })
+#[async_trait]
+impl BodyStream for ReqwestBody {
+    async fn next_chunk(&mut self) -> Result<Option<Bytes>, HttpClientError> {
+        self.response.chunk().await.map_err(|err| map_error(err, self.via_proxy))
     }
 }
 
@@ -201,6 +273,7 @@ mod tests {
     use axum::Router;
     use axum::response::{IntoResponse, Redirect};
     use axum::routing::get;
+    use futures::StreamExt as _;
     use url::Url;
 
     async fn serve() -> Url {
@@ -213,7 +286,16 @@ mod tests {
                     ([("set-cookie", "visited=yes")], format!("ua={ua}")).into_response()
                 }),
             )
-            .route("/big", get(|| async { "x".repeat(10_000) }));
+            .route("/big", get(|| async { "x".repeat(10_000) }))
+            .route(
+                "/slow",
+                get(|| async {
+                    // The headers and a first chunk now, the rest never.
+                    let chunks = futures::stream::iter([Ok::<_, std::io::Error>(Bytes::from_static(b"first"))])
+                        .chain(futures::stream::pending());
+                    axum::body::Body::from_stream(chunks)
+                }),
+            );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -263,6 +345,31 @@ mod tests {
         let first = tls_config().unwrap() as *const rustls::ClientConfig;
         assert_eq!(first, tls_config().unwrap() as *const _);
         assert_eq!(tls_config().unwrap().alpn_protocols, [b"h2".to_vec(), b"http/1.1".to_vec()]);
+
+        // Ignoring TLS errors (the crawler's default) costs no configuration per client either.
+        let insecure = insecure_tls_config().unwrap() as *const rustls::ClientConfig;
+        assert_eq!(insecure, insecure_tls_config().unwrap() as *const _);
+        assert_ne!(insecure, first);
+        assert_eq!(insecure_tls_config().unwrap().alpn_protocols, [b"h2".to_vec(), b"http/1.1".to_vec()]);
+    }
+
+    /// The response is handed over once the headers arrived: the body is read on demand, within
+    /// the request's timeout.
+    #[tokio::test]
+    async fn streaming_returns_before_the_body_is_read() {
+        let base = serve().await;
+        let client = RedirectingClient::new(ReqwestTransport::new());
+        let timeout = Duration::from_millis(300);
+        let mut response = client
+            .send_request_streaming(
+                HttpRequest::get(base.join("/slow").unwrap()),
+                &SendOptions { timeout: Some(timeout), ..Default::default() },
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body.chunk().await.unwrap().unwrap(), "first");
+        assert!(matches!(response.body.chunk().await, Err(HttpClientError::Timeout(t)) if t == timeout));
     }
 
     #[tokio::test]
