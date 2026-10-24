@@ -1348,8 +1348,10 @@ where
         let snapshot = request.clone();
 
         // The phases have timeouts of their own, but what is between them has not: the internal
-        // timeout is the catch-all (`withRequestTimeout`).
-        let request_timeout = internal_timeout.max(self.handler_timeout(request.label()));
+        // timeout is the catch-all (`withRequestTimeout`), long enough for the navigation and the
+        // handler together.
+        let phases = self.inner.pipeline.navigation_timeout() + self.handler_timeout(request.label());
+        let request_timeout = internal_timeout.max(phases);
         let request_id = request.id.clone().unwrap_or_default();
         let attempt = async {
             self.run_pipeline_and_handler(BasicContext::new(request, scope.clone())).await?;

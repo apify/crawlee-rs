@@ -3,6 +3,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 
@@ -64,6 +65,13 @@ where
 pub trait Middleware<In: Send + 'static>: Send + Sync + 'static {
     type Out: Send + 'static;
     async fn run(&self, input: In) -> anyhow::Result<Self::Out>;
+
+    /// The longest this step may take to navigate (`getNavigationTimeoutMillis`). The crawler adds
+    /// it to the handler timeout, so the request timeout does not cut the navigation short. Zero
+    /// for steps that do not navigate.
+    fn navigation_timeout(&self) -> Duration {
+        Duration::ZERO
+    }
 }
 
 /// The empty pipeline.
@@ -93,6 +101,10 @@ where
     async fn run(&self, input: In) -> anyhow::Result<B::Out> {
         let intermediate = self.0.run(input).await?;
         self.1.run(intermediate).await
+    }
+
+    fn navigation_timeout(&self) -> Duration {
+        self.0.navigation_timeout() + self.1.navigation_timeout()
     }
 }
 

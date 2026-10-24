@@ -662,6 +662,11 @@ impl Default for HttpPipeline {
 impl Middleware<BasicContext> for HttpPipeline {
     type Out = HttpContext;
 
+    /// The navigation window: the hooks, the request and reading the body.
+    fn navigation_timeout(&self) -> Duration {
+        self.options.navigation_timeout
+    }
+
     async fn run(&self, mut ctx: BasicContext) -> anyhow::Result<HttpContext> {
         // One navigation window covers the pre-navigation hooks, the request, the post-navigation
         // hooks and reading the body.

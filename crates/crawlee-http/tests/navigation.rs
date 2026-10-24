@@ -387,3 +387,14 @@ async fn hooks_share_the_navigation_window() {
     assert!(errors.is_empty(), "{errors:?}");
     assert_eq!(titles.len(), 1);
 }
+
+/// The crawler sizes its request timeout with the navigation timeout of the pipeline.
+#[test]
+fn the_pipelines_report_their_navigation_timeout() {
+    use crawlee_basic::{Middleware, Then};
+    let options = HttpCrawlerOptions { navigation_timeout: Duration::from_secs(45), ..Default::default() };
+    let http = crawlee_http::HttpPipeline::new(options);
+    assert_eq!(Middleware::<BasicContext>::navigation_timeout(&http), Duration::from_secs(45));
+    let html = Then(http, crawlee_http::HtmlLayer);
+    assert_eq!(Middleware::<BasicContext>::navigation_timeout(&html), Duration::from_secs(45));
+}
