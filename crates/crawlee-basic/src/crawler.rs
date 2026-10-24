@@ -10,7 +10,7 @@ use tokio::sync::{Notify, OnceCell};
 use tokio::task::JoinSet;
 use tracing::Instrument as _;
 
-use crawlee_core::storage::batched_adds::{AddRequestsBatchedOptions, AddRequestsBatchedResult};
+use crawlee_core::storage::batched_adds::AddRequestsBatchedResult;
 use crawlee_core::{
     Dataset, Event, EventKind, KeyValueStore, PacingScope, PacingSignal, RecoverableState, Request, RequestManager,
     SerdeState, Services, StatusLevel, StatusMessage, StorageIdentifier,
@@ -21,6 +21,7 @@ use serde::de::DeserializeOwned;
 
 use crate::autoscaling::{ConcurrencyError, ConcurrencyOptions, ConcurrencySystem};
 use crate::context::{BasicContext, CrawlerShared, CrawlingContext, InFlight, RequestScope};
+use crate::enqueue::{CrawlerAddRequestsOptions, SkipReason, SkippedRequestCallback, skipped_request_callback};
 use crate::errors::{ErrorKind, HandlerPanic, RequestHandlerTimeout, error_message};
 use crate::handler::{ErrorHandler, Identity, Middleware, RequestHandler};
 use crate::proxy::ProxySource;
@@ -120,6 +121,7 @@ struct Inner<P: Middleware<BasicContext>> {
     handler: Arc<dyn RequestHandler<P::Out>>,
     error_handler: Option<Arc<dyn ErrorHandler>>,
     failed_request_handler: Option<Arc<dyn ErrorHandler>>,
+    on_skipped_request: Option<SkippedRequestCallback>,
     options: CrawlerOptions,
     /// The explicit id, or the instantiation index.
     id: String,
@@ -179,6 +181,7 @@ pub struct BasicCrawlerBuilder<P: Middleware<BasicContext>> {
     handler: Option<Arc<dyn RequestHandler<P::Out>>>,
     error_handler: Option<Arc<dyn ErrorHandler>>,
     failed_request_handler: Option<Arc<dyn ErrorHandler>>,
+    on_skipped_request: Option<SkippedRequestCallback>,
     options: CrawlerOptions,
     services: Option<Services>,
     request_manager: Option<Arc<dyn RequestManager>>,
@@ -197,6 +200,7 @@ where
             handler: None,
             error_handler: None,
             failed_request_handler: None,
+            on_skipped_request: None,
             options: CrawlerOptions::default(),
             services: None,
             request_manager: None,
@@ -225,6 +229,18 @@ where
     /// Called once a request failed for the last time.
     pub fn failed_request_handler(mut self, handler: impl ErrorHandler) -> Self {
         self.failed_request_handler = Some(Arc::new(handler));
+        self
+    }
+
+    /// Called with each request that is not added or not crawled, and why: too deep, disallowed
+    /// by robots.txt, filtered out, over a limit, or redirected out of its enqueue strategy
+    /// (`onSkippedRequest`).
+    pub fn on_skipped_request<F, Fut>(mut self, callback: F) -> Self
+    where
+        F: Fn(Request, SkipReason) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.on_skipped_request = Some(skipped_request_callback(callback));
         self
     }
 
@@ -372,6 +388,7 @@ where
                 handler,
                 error_handler: self.error_handler,
                 failed_request_handler: self.failed_request_handler,
+                on_skipped_request: self.on_skipped_request,
                 options: self.options,
                 id,
                 has_explicit_id,
@@ -434,6 +451,8 @@ where
                     http_client: inner.http_client.clone(),
                     statistics: inner.statistics.clone(),
                     max_crawl_depth: inner.options.max_crawl_depth,
+                    max_requests_per_crawl: inner.options.max_requests_per_crawl,
+                    on_skipped_request: inner.on_skipped_request.clone(),
                     send_request_timeout: inner.options.send_request_timeout,
                     requests_added: Notify::new(),
                     state_key: if inner.has_explicit_id {
@@ -455,20 +474,23 @@ where
     /// Adds requests to the crawler's queue in batches, as `crawler.addRequests()` in Crawlee for
     /// JS: the first 1000 before returning, the rest in the background, 1000 at a time with a pause
     /// of 1 s after each. The crawler is not finished while they are being added.
+    ///
+    /// Requests deeper than `max_crawl_depth` or disallowed by robots.txt are skipped, and no more
+    /// are added than `max_requests_per_crawl` leaves room for (then every batch is awaited).
     pub async fn add_requests<I, R>(&self, requests: I) -> anyhow::Result<AddRequestsBatchedResult>
     where
         I: IntoIterator<Item = R>,
         R: Into<Request>,
     {
-        self.add_requests_with_options(requests, AddRequestsBatchedOptions::default()).await
+        self.add_requests_with_options(requests, CrawlerAddRequestsOptions::default()).await
     }
 
-    /// [`add_requests`](Self::add_requests) with other batching options, or at the front of the
-    /// queue.
+    /// [`add_requests`](Self::add_requests) with filters (`include`, `exclude`, `strategy`,
+    /// `transform`, `limit`), labels and batching options.
     pub async fn add_requests_with_options<I, R>(
         &self,
         requests: I,
-        options: AddRequestsBatchedOptions,
+        options: impl Into<CrawlerAddRequestsOptions>,
     ) -> anyhow::Result<AddRequestsBatchedResult>
     where
         I: IntoIterator<Item = R>,
@@ -476,8 +498,7 @@ where
     {
         let shared = self.shared().await?;
         let requests: Vec<Request> = requests.into_iter().map(Into::into).collect();
-        let result = shared.request_manager.add_requests_batched(requests, options).await?;
-        shared.requests_added.notify_one();
+        let (result, _) = shared.add_requests_filtered(requests, &options.into()).await?;
         Ok(result)
     }
 
@@ -855,6 +876,7 @@ where
             request.no_retry = true;
             shared.request_manager.mark_request_as_handled(&mut request).await?;
             shared.statistics.record_skipped();
+            shared.handle_skipped_request(request, SkipReason::RobotsTxt).await;
             return Ok(());
         }
         let started = Instant::now();
@@ -866,7 +888,7 @@ where
         // Fallback in case the handler leaks its context into a task that outlives it.
         let snapshot = request.clone();
 
-        let result = self.run_pipeline_and_handler(BasicContext::new(request, scope.clone())).await;
+        let (result, handler_ran) = self.run_pipeline_and_handler(BasicContext::new(request, scope.clone())).await;
         let mut request = scope.take_returned().unwrap_or(snapshot);
 
         let result = match result {
@@ -890,6 +912,10 @@ where
                     tracing::debug!("Skipping request: {err:#}");
                     shared.request_manager.mark_request_as_handled(&mut request).await?;
                     shared.statistics.record_skipped();
+                    // Skipped by the context pipeline: redirected out of its enqueue strategy.
+                    if !handler_ran {
+                        shared.handle_skipped_request(request, SkipReason::Redirect).await;
+                    }
                     return Ok(());
                 }
                 self.handle_request_error(&shared, &session, request, err, kind, started).await?;
@@ -901,18 +927,26 @@ where
         }
     }
 
-    async fn run_pipeline_and_handler(&self, ctx: BasicContext) -> anyhow::Result<()> {
+    /// Runs the context pipeline, then the request handler. Also returns whether the handler ran.
+    async fn run_pipeline_and_handler(&self, ctx: BasicContext) -> (anyhow::Result<()>, bool) {
         let ctx = match AssertUnwindSafe(self.inner.pipeline.run(ctx)).catch_unwind().await {
-            Ok(result) => result?,
-            Err(panic) => return Err(panic_error(panic)),
+            Ok(Ok(ctx)) => ctx,
+            Ok(Err(err)) => return (Err(err), false),
+            Err(panic) => return (Err(panic_error(panic)), false),
         };
 
         let timeout = self.inner.options.request_handler_timeout;
-        match tokio::time::timeout(timeout, AssertUnwindSafe(self.inner.handler.handle(ctx)).catch_unwind()).await {
+        let result = match tokio::time::timeout(
+            timeout,
+            AssertUnwindSafe(self.inner.handler.handle(ctx)).catch_unwind(),
+        )
+        .await
+        {
             Ok(Ok(result)) => result,
             Ok(Err(panic)) => Err(panic_error(panic)),
             Err(_) => Err(RequestHandlerTimeout { secs: timeout.as_secs_f64() }.into()),
-        }
+        };
+        (result, true)
     }
 
     /// The retry logic of `requestFunctionErrorHandler` in Crawlee for JS.

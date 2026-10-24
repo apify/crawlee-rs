@@ -9,14 +9,14 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::Notify;
 
-use crawlee_core::storage::backend::BatchAddRequestsResult;
-use crawlee_core::storage::batched_adds::AddRequestsBatchedOptions;
+use crawlee_core::storage::batched_adds::AddRequestsBatchedResult;
 use crawlee_core::{
     Dataset, KeyValueStore, PacingScope, PacingSignal, Request, RequestManager, SerdeState, Services,
     StorageTransaction,
 };
 use crawlee_http_client::{HttpClient, HttpClientError, HttpRequest, HttpResponse, SendOptions};
 
+use crate::enqueue::{CrawlerAddRequestsOptions, EnqueueError, SkipReason, SkippedRequestCallback};
 use crate::errors::RequestSkipped;
 use crate::proxy::ProxyInfo;
 use crate::robots::RobotsCache;
@@ -32,6 +32,10 @@ pub struct CrawlerShared {
     pub http_client: Arc<dyn HttpClient>,
     pub statistics: Arc<Statistics>,
     pub max_crawl_depth: Option<u32>,
+    /// Caps what is added too (`maxRequestsPerCrawl`).
+    pub max_requests_per_crawl: Option<u64>,
+    /// `onSkippedRequest`.
+    pub(crate) on_skipped_request: Option<SkippedRequestCallback>,
     /// Timeout for `send_request` from handlers.
     pub send_request_timeout: Duration,
     /// Woken when requests are added, so an idle crawler picks them up immediately.
@@ -49,7 +53,7 @@ pub struct CrawlerShared {
     pub(crate) drained: Notify,
     /// robots.txt files, when the crawler respects them.
     pub(crate) robots: Option<RobotsCache>,
-    /// Domains already warned about (unpaced 429s and crawl delays).
+    /// Domains already warned about (unpaced 429s and crawl delays), and messages logged once.
     pub(crate) warned: Mutex<std::collections::HashSet<String>>,
 }
 
@@ -61,6 +65,12 @@ impl CrawlerShared {
     fn warn_once(&self, key: String, message: impl FnOnce() -> String) {
         if self.warned.lock().insert(key) {
             tracing::warn!("{}", message());
+        }
+    }
+
+    pub(crate) fn info_once(&self, key: &str, message: impl FnOnce() -> String) {
+        if self.warned.lock().insert(format!("info:{key}")) {
+            tracing::info!("{}", message());
         }
     }
 
@@ -254,14 +264,6 @@ impl BasicContext {
         &self.scope.transaction
     }
 
-    pub(crate) fn scope_shared(&self) -> &Arc<CrawlerShared> {
-        &self.scope.shared
-    }
-
-    pub(crate) fn max_crawl_depth(&self) -> Option<u32> {
-        self.scope.shared.max_crawl_depth
-    }
-
     /// Appends one object (or each object of an array) to the default dataset once the handler
     /// succeeds. The data is serialized immediately.
     pub fn push_data<T: Serialize + ?Sized>(&self, data: &T) -> anyhow::Result<()> {
@@ -292,39 +294,45 @@ impl BasicContext {
     }
 
     /// Adds requests to the crawler's queue right away (not transactionally, as in Crawlee for
-    /// JS). Requests without an explicit depth are one level deeper than the current request.
-    pub async fn add_requests<I, R>(&self, requests: I) -> anyhow::Result<BatchAddRequestsResult>
+    /// JS), as [`BasicCrawler::add_requests`](crate::BasicCrawler::add_requests) does: in batches,
+    /// within the `max_requests_per_crawl` budget, skipping what is too deep or disallowed by
+    /// robots.txt. Requests without an explicit depth are one level deeper than the current one.
+    pub async fn add_requests<I, R>(&self, requests: I) -> anyhow::Result<AddRequestsBatchedResult>
     where
         I: IntoIterator<Item = R>,
         R: Into<Request>,
     {
+        self.add_requests_with_options(requests, CrawlerAddRequestsOptions::default()).await
+    }
+
+    /// [`add_requests`](Self::add_requests) with filters and batching options.
+    pub async fn add_requests_with_options<I, R>(
+        &self,
+        requests: I,
+        options: CrawlerAddRequestsOptions,
+    ) -> anyhow::Result<AddRequestsBatchedResult>
+    where
+        I: IntoIterator<Item = R>,
+        R: Into<Request>,
+    {
+        let (result, _) = self.add_requests_filtered(requests.into_iter().map(Into::into), &options).await?;
+        Ok(result)
+    }
+
+    /// Adds `requests` one level deeper than the current request, unless they have a depth.
+    pub(crate) async fn add_requests_filtered(
+        &self,
+        requests: impl Iterator<Item = Request>,
+        options: &CrawlerAddRequestsOptions,
+    ) -> Result<(AddRequestsBatchedResult, Vec<(Request, SkipReason)>), EnqueueError> {
         let depth = self.request().crawl_depth() + 1;
-        let requests: Vec<Request> = requests
-            .into_iter()
-            .map(Into::into)
+        let requests = requests
             .map(|mut request| {
                 request.crawlee.crawl_depth.get_or_insert(depth);
                 request
             })
             .collect();
-        if requests.is_empty() {
-            return Ok(BatchAddRequestsResult::default());
-        }
-        // In batches, as `crawler.addRequests()`: only more than 1000 requests are added partly in
-        // the background, and the result has the first 1000.
-        let result = self
-            .scope
-            .shared
-            .request_manager
-            .add_requests_batched(requests, AddRequestsBatchedOptions::default())
-            .await?;
-        self.notify_requests_added();
-        Ok(BatchAddRequestsResult { processed_requests: result.added_requests, ..Default::default() })
-    }
-
-    /// Wakes the task loop if it is waiting for requests.
-    pub(crate) fn notify_requests_added(&self) {
-        self.scope.shared.requests_added.notify_one();
+        self.scope.shared.add_requests_filtered(requests, options).await
     }
 
     /// State shared by every request of the crawl and saved with it, like `useState()` in JS.

@@ -337,12 +337,12 @@ async fn skipped_requests_do_not_count_towards_max_requests_per_crawl() {
             if ctx.request().url.ends_with("/skip") {
                 return Err(ctx.skip_request(None));
             }
+            ctx.add_requests(["https://a.dev/2", "https://a.dev/3"]).await?;
             Ok(())
         })
         .build()
         .unwrap();
-    let stats =
-        crawler.run(["https://a.dev/skip", "https://a.dev/1", "https://a.dev/2", "https://a.dev/3"]).await.unwrap();
+    let stats = crawler.run(["https://a.dev/skip", "https://a.dev/1"]).await.unwrap();
     assert_eq!((stats.requests_succeeded, stats.requests_skipped), (2, 1));
 }
 
@@ -769,4 +769,135 @@ async fn without_a_session_pool_the_proxy_of_an_attempt_is_released_after_it() {
             assert_eq!(released, used, "each proxy released once");
         }
     }
+}
+
+type Skipped = Arc<Mutex<Vec<(String, crawlee_basic::SkipReason)>>>;
+
+fn skip_log() -> (Skipped, impl Fn(Request, crawlee_basic::SkipReason) -> std::future::Ready<()> + Send + Sync + 'static)
+{
+    let skipped: Skipped = Arc::default();
+    let log = skipped.clone();
+    (skipped, move |request: Request, reason| {
+        log.lock().push((request.url, reason));
+        std::future::ready(())
+    })
+}
+
+#[tokio::test]
+async fn max_requests_per_crawl_caps_what_is_enqueued() {
+    let (skipped, on_skipped) = skip_log();
+    let crawler = BasicCrawler::builder()
+        .services(services())
+        .max_requests_per_crawl(3)
+        .on_skipped_request(on_skipped)
+        .request_handler(|ctx: BasicContext| async move {
+            if ctx.request().crawl_depth() == 0 {
+                ctx.add_requests((0..10).map(|i| format!("https://a.dev/{i}"))).await?;
+            }
+            Ok(())
+        })
+        .build()
+        .unwrap();
+
+    let stats = crawler.run(["https://a.dev/"]).await.unwrap();
+    assert_eq!(stats.requests_succeeded, 3);
+    // 3 less the start request, which was pending: 2 were added, and the rest skipped.
+    let manager = crawler.request_manager().await.unwrap();
+    assert_eq!(manager.pending_count().await.unwrap(), 0);
+    assert_eq!(manager.handled_count().await.unwrap(), 3);
+    let skipped = skipped.lock().clone();
+    assert_eq!(skipped.len(), 8);
+    assert!(skipped.iter().all(|(_, reason)| *reason == crawlee_basic::SkipReason::Limit));
+}
+
+#[tokio::test]
+async fn the_enqueue_limit_counts_only_new_requests() {
+    let added = Arc::new(Mutex::new(Vec::new()));
+    let log = added.clone();
+    let crawler = BasicCrawler::builder()
+        .services(services())
+        .request_handler(move |ctx: BasicContext| {
+            let log = log.clone();
+            async move {
+                if ctx.request().crawl_depth() > 0 {
+                    return Ok(());
+                }
+                ctx.add_requests(["https://a.dev/a", "https://a.dev/b"]).await?;
+                let urls =
+                    ["a", "b", "c", "d", "e"].map(|path| url::Url::parse(&format!("https://a.dev/{path}")).unwrap());
+                let result = ctx.enqueue_urls(urls, &crawlee_basic::EnqueueLinksOptions::new().limit(2)).await?;
+                log.lock().push((result.newly_added(), result.skipped.len()));
+                Ok(())
+            }
+        })
+        .build()
+        .unwrap();
+
+    let stats = crawler.run(["https://a.dev/"]).await.unwrap();
+    assert_eq!(*added.lock(), [(2, 1)], "c and d are added, e is over the limit");
+    assert_eq!(stats.requests_succeeded, 5);
+}
+
+/// Serves a robots.txt that disallows `/private`, and an empty page for everything else.
+struct RobotsClient;
+
+#[async_trait::async_trait]
+impl crawlee_http_client::HttpClient for RobotsClient {
+    async fn send_request(
+        &self,
+        request: crawlee_http_client::HttpRequest,
+        _: &crawlee_http_client::SendOptions,
+    ) -> Result<crawlee_http_client::HttpResponse, crawlee_http_client::HttpClientError> {
+        let body = if request.url.path() == "/robots.txt" { "User-agent: *\nDisallow: /private\n" } else { "" };
+        Ok(crawlee_http_client::HttpResponse {
+            status: http::StatusCode::OK,
+            headers: http::HeaderMap::new(),
+            url: request.url,
+            body: body.into(),
+            redirects: Vec::new(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn context_add_requests_skips_what_is_too_deep_disallowed_or_filtered_out() {
+    let (skipped, on_skipped) = skip_log();
+    let handled = Arc::new(Mutex::new(Vec::new()));
+    let log = handled.clone();
+    let crawler = BasicCrawler::builder()
+        .services(services())
+        .max_crawl_depth(1)
+        .respect_robots_txt(true)
+        .http_client(Arc::new(RobotsClient))
+        .on_skipped_request(on_skipped)
+        .request_handler(move |ctx: BasicContext| {
+            let log = log.clone();
+            async move {
+                log.lock().push(ctx.request().url.clone());
+                let next = format!("https://a.dev/level/{}", ctx.request().crawl_depth() + 1);
+                ctx.add_requests([next, "https://a.dev/private/1".to_owned()]).await?;
+                if ctx.request().crawl_depth() == 0 {
+                    let options = crawlee_basic::CrawlerAddRequestsOptions::new()
+                        .exclude(["https://a.dev/excluded*"])
+                        .label("LABELED");
+                    let result = ctx
+                        .add_requests_with_options(["https://a.dev/excluded", "https://a.dev/kept"], options)
+                        .await?;
+                    assert_eq!(result.added_requests.len(), 1);
+                }
+                Ok(())
+            }
+        })
+        .build()
+        .unwrap();
+
+    crawler.run(["https://a.dev/"]).await.unwrap();
+    let mut handled = handled.lock().clone();
+    handled.sort();
+    assert_eq!(handled, ["https://a.dev/", "https://a.dev/kept", "https://a.dev/level/1"]);
+    let skipped = skipped.lock().clone();
+    use crawlee_basic::SkipReason::{Depth, Filters, RobotsTxt};
+    assert!(skipped.contains(&("https://a.dev/excluded".to_owned(), Filters)), "{skipped:?}");
+    assert!(skipped.contains(&("https://a.dev/private/1".to_owned(), RobotsTxt)), "{skipped:?}");
+    assert!(skipped.contains(&("https://a.dev/level/2".to_owned(), Depth)), "{skipped:?}");
 }

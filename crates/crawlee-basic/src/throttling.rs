@@ -477,6 +477,15 @@ impl RequestManager for ThrottlingRequestManager {
         Ok(total.saturating_sub(self.state.lock().migrated_from_inner))
     }
 
+    async fn pending_count(&self) -> StorageResult<u64> {
+        self.ensure_ready().await?;
+        let mut total = self.inner_manager.pending_count().await?;
+        for queue in self.all_queues() {
+            total += queue.pending_count().await?;
+        }
+        Ok(total)
+    }
+
     async fn set_expected_request_processing_time(&self, duration: Duration) -> StorageResult<()> {
         *self.expected_processing_time.lock() = Some(duration);
         for queue in self.all_queues() {
