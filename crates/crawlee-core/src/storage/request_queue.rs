@@ -68,6 +68,20 @@ pub trait RequestManager: Send + Sync {
     async fn set_expected_request_processing_time(&self, _duration: Duration) -> StorageResult<()> {
         Ok(())
     }
+    /// Whether a request can be fetched now, later, never, or all work is done
+    /// (`checkReadiness`). By default, from [`is_empty`](Self::is_empty),
+    /// [`is_finished`](Self::is_finished) and [`ready_at`](Self::ready_at); a manager that can
+    /// stall reports it here.
+    async fn check_readiness(&self) -> StorageResult<super::request_loader::RequestSourceStatus> {
+        use super::request_loader::RequestSourceStatus;
+        if !self.is_empty().await? {
+            return Ok(RequestSourceStatus::Ready);
+        }
+        if self.is_finished().await? {
+            return Ok(RequestSourceStatus::Finished);
+        }
+        Ok(RequestSourceStatus::Waiting { ready_at: self.ready_at() })
+    }
     /// When a manager that has nothing to fetch now (see [`is_empty`](Self::is_empty)) will have
     /// a request ready, if it knows: for example when a held-back domain may be fetched again. The
     /// crawler wakes up then instead of waiting for its next check (`readyAt` of `checkReadiness`).

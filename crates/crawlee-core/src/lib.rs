@@ -28,7 +28,7 @@ pub use crate::storage::key_value_store::{KeyValueStore, KeyValueStoreStats, Rec
 pub use crate::storage::memory::MemoryStorageBackend;
 pub use crate::storage::request_list::{RequestList, RequestListOptions, RequestListSource, RequestListState};
 pub use crate::storage::request_loader::{
-    LoaderStatus, PacingScope, PacingSignal, RequestLoader, RequestManagerTandem,
+    LoaderStatus, PacingScope, PacingSignal, RequestLoader, RequestManagerTandem, RequestSourceStatus,
 };
 pub use crate::storage::request_queue::{
     RequestManager, RequestQueue, RequestQueueStats, RequestsFromUrl, UrlListFetcher,

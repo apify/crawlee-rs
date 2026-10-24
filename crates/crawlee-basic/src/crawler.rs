@@ -13,8 +13,8 @@ use tracing::Instrument as _;
 use crawlee_core::storage::batched_adds::AddRequestsBatchedResult;
 use crawlee_core::{
     CriticalError, Dataset, Event, EventKind, KeyValueStore, PacingScope, PacingSignal, RecoverableState, Request,
-    RequestLoader, RequestManager, RequestManagerTandem, SerdeState, Services, StatusLevel, StatusMessage,
-    StorageIdentifier,
+    RequestLoader, RequestManager, RequestManagerTandem, RequestSourceStatus, SerdeState, Services, StatusLevel,
+    StatusMessage, StorageIdentifier,
 };
 use crawlee_http_client::HttpClient;
 use serde::Serialize;
@@ -26,8 +26,8 @@ use crate::enqueue::{
     CrawlerAddRequestsOptions, SkipReason, SkippedRequest, SkippedRequestCallback, skipped_request_callback,
 };
 use crate::errors::{
-    ErrorKind, HandlerPanic, MissingSessionError, RequestHandlerTimeout, RequestSkipped, SkipRequestError,
-    error_message,
+    ErrorKind, HandlerPanic, MissingSessionError, PersistentRateLimitError, RequestHandlerTimeout, RequestSkipped,
+    SkipRequestError, error_message,
 };
 use crate::handler::{BoxFuture, ErrorHandler, Identity, Middleware, RequestHandler};
 use crate::proxy::ProxySource;
@@ -1224,18 +1224,18 @@ where
         if let Some(is_task_ready) = &self.inner.task_loop.is_task_ready {
             return is_task_ready().await;
         }
-        let manager = &shared.request_manager;
-        if !manager.is_empty().await? {
-            return Ok(true);
-        }
-        if let Some(at) = manager.ready_at() {
-            let at = tokio::time::Instant::from_std(at);
-            // A single wake-up, which only an earlier one replaces (`scheduleWake`).
-            if wake_at.is_none_or(|current| at < current) {
-                *wake_at = Some(at);
+        match shared.request_manager.check_readiness().await? {
+            RequestSourceStatus::Ready => Ok(true),
+            RequestSourceStatus::Waiting { ready_at: Some(at) } => {
+                let at = tokio::time::Instant::from_std(at);
+                // A single wake-up, which only an earlier one replaces (`scheduleWake`).
+                if wake_at.is_none_or(|current| at < current) {
+                    *wake_at = Some(at);
+                }
+                Ok(false)
             }
+            _ => Ok(false),
         }
-        Ok(false)
     }
 
     /// Whether the crawl is over, asked once nothing runs and nothing is ready
@@ -1256,13 +1256,19 @@ where
             tracing::info!("The crawler has finished all the remaining ongoing requests and will shut down now.");
             return Ok(true);
         }
-        // With `keep_alive`, an empty queue is waited out.
+        // Asked only once nothing runs: where a crawl that cannot progress is told apart from one
+        // that is merely waiting.
+        let state = shared.request_manager.check_readiness().await?;
+        // With `keep_alive`, an empty queue is waited out, and so is a domain that stalls.
         if self.inner.options.keep_alive {
             return Ok(false);
         }
+        if let RequestSourceStatus::Stalled { reason } = state {
+            return Err(PersistentRateLimitError { reason }.into());
+        }
         let finished = match &self.inner.task_loop.is_finished {
             Some(is_finished) => is_finished().await?,
-            None => shared.request_manager.is_finished().await?,
+            None => state == RequestSourceStatus::Finished,
         };
         if finished {
             match self.inner.task_loop.is_finished {

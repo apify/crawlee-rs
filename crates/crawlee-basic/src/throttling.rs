@@ -12,6 +12,10 @@
 //!   It is the minimum time between two requests to the domain.
 //! - **Saved domains.** With `domains: All`, the domains discovered so far are saved under
 //!   `CRAWLEE_THROTTLED_DOMAINS`, so a resumed crawl finds their queues.
+//! - **Stalling.** A domain that answered 429 to every request for longer than
+//!   `max_domain_stall` (15 min), and still does, makes the manager report itself
+//!   [stalled](RequestSourceStatus::Stalled) once nothing else can be fetched. The crawler then
+//!   gives up with a `PersistentRateLimitError`, leaving the domain's requests queued.
 //!
 //! The crawler offers 429s and crawl delays as [`PacingSignal`]s. A request whose domain answered
 //! 429 is put back, at the front of its queue, without spending a retry.
@@ -31,8 +35,8 @@ use crawlee_core::storage::batched_adds::{
     AddRequestsBatchedOptions, AddRequestsBatchedResult, InProgressBatches, drain_request_batches,
 };
 use crawlee_core::{
-    KeyValueStore, PacingScope, PacingSignal, Request, RequestManager, RequestQueue, Services, StorageError,
-    StorageIdentifier, StorageResult,
+    KeyValueStore, PacingScope, PacingSignal, Request, RequestManager, RequestQueue, RequestSourceStatus, Services,
+    StorageError, StorageIdentifier, StorageResult,
 };
 use crawlee_utils::registrable_domain;
 
@@ -70,6 +74,9 @@ pub struct ThrottlingOptions {
     /// are refused.
     pub max_throttled_domains: usize,
     pub persist_state_key: String,
+    /// How long a domain may rate-limit every request before the manager reports itself stalled
+    /// (`maxDomainStallSecs`). 15 min by default.
+    pub max_domain_stall: Duration,
 }
 
 impl Default for ThrottlingOptions {
@@ -82,6 +89,7 @@ impl Default for ThrottlingOptions {
             min_crawl_delay: Duration::ZERO,
             max_throttled_domains: 100,
             persist_state_key: STATE_KEY.to_owned(),
+            max_domain_stall: Duration::from_secs(900),
         }
     }
 }
@@ -98,6 +106,10 @@ struct DomainState {
     backoff_decays_at: i64,
     consecutive_429_count: u32,
     declared_crawl_delay: Option<i64>,
+    /// When the current unbroken run of 429s began, or 0 when the domain is not rate-limiting.
+    rate_limited_since: i64,
+    /// When the domain last answered 429, or 0 if it never did.
+    last_rate_limited_at: i64,
 }
 
 impl DomainState {
@@ -270,6 +282,11 @@ impl Shared {
         let mut state = self.state.lock();
         let Some(domain_state) = state.states.get_mut(&domain) else { return false };
         let now = now_millis();
+        // Before the burst suppression: a suppressed 429 is still the domain turning us away.
+        domain_state.last_rate_limited_at = now;
+        if domain_state.rate_limited_since == 0 {
+            domain_state.rate_limited_since = now;
+        }
         if now < domain_state.backoff_until {
             return true;
         }
@@ -301,6 +318,14 @@ impl Shared {
             delay as f64 / 1000.0
         );
         true
+    }
+
+    /// A request of the domain of `url` got through, which ends its run of 429s.
+    fn record_progress(&self, url: &str) {
+        let Some(domain) = self.domain_of(url) else { return };
+        if let Some(domain_state) = self.state.lock().states.get_mut(&domain) {
+            domain_state.rate_limited_since = 0;
+        }
     }
 
     fn check_scope(&self, scope: Option<PacingScope>) -> bool {
@@ -501,6 +526,8 @@ impl RequestManager for ThrottlingRequestManager {
 
     async fn mark_request_as_handled(&self, request: &mut Request) -> StorageResult<Option<QueueOperationInfo>> {
         let manager = self.0.holding(request).await?;
+        // Succeeded or out of retries, the domain answered either way.
+        self.0.record_progress(&request.url);
         manager.mark_request_as_handled(request).await
     }
 
@@ -509,15 +536,80 @@ impl RequestManager for ThrottlingRequestManager {
         manager.reclaim_request(request, forefront).await
     }
 
-    /// Nothing can be fetched right now: held-back domains count as empty.
+    /// Nothing can be fetched right now: held-back and stalled domains count as empty.
     async fn is_empty(&self) -> StorageResult<bool> {
+        Ok(self.check_readiness().await? != RequestSourceStatus::Ready)
+    }
+
+    /// Ready when the inner manager or a domain that is not held back has a request; otherwise
+    /// stalled when a domain rate-limited every request for longer than `max_domain_stall`, and
+    /// still does; otherwise waiting until the earliest held-back domain may be fetched again.
+    async fn check_readiness(&self) -> StorageResult<RequestSourceStatus> {
         self.0.ensure_ready().await?;
-        for (_, queue) in self.0.fetchable_domains() {
-            if !queue.is_empty().await? {
-                return Ok(false);
+        let now = now_millis();
+        let max_stall = self.0.options.max_domain_stall.as_millis() as i64;
+        let mut dispatchable = Vec::new();
+        let mut stall_candidates = Vec::new();
+        let mut ready_at: Option<i64> = None;
+        {
+            let state = self.0.state.lock();
+            for (domain, domain_state) in &state.states {
+                // A crawl delay can give a domain a clock before it has a queue.
+                let Some(queue) = state.queues.get(domain) else { continue };
+                if domain_state.rate_limited_since != 0
+                    && now - domain_state.last_rate_limited_at <= max_stall
+                    && now - domain_state.rate_limited_since > max_stall
+                {
+                    // Not dispatchable even when its backoff lapsed: that is what it does between 429s.
+                    stall_candidates.push((domain.clone(), domain_state.rate_limited_since, queue.clone()));
+                    continue;
+                }
+                let until = domain_state.throttled_until();
+                if now >= until {
+                    dispatchable.push(queue.clone());
+                } else if ready_at.is_none_or(|ready_at| until < ready_at) {
+                    ready_at = Some(until);
+                }
             }
         }
-        self.0.inner_manager.is_empty().await
+
+        let mut probed = self.0.inner_manager.check_readiness().await?;
+        for queue in dispatchable {
+            probed = probed.join(queue.check_readiness().await?);
+        }
+        // Anything dispatchable outranks a stalled or held-back domain.
+        if probed == RequestSourceStatus::Ready {
+            return Ok(probed);
+        }
+
+        let mut stalled = Vec::new();
+        for (domain, since, queue) in stall_candidates {
+            if queue.check_readiness().await? == RequestSourceStatus::Ready {
+                stalled.push(format!("\"{domain}\" ({}s)", (now - since) / 1000));
+            }
+        }
+        if !stalled.is_empty() {
+            return Ok(RequestSourceStatus::Stalled {
+                reason: format!(
+                    "{} rate-limited every request for longer than max_domain_stall ({}s). Waiting longer will not \
+                     help - lower the crawler's concurrency, or drop these domains. Their requests are still queued, \
+                     so re-running with `purge_on_start` disabled will resume them if the rate limit lifts.",
+                    stalled.join(", "),
+                    max_stall / 1000
+                ),
+            });
+        }
+
+        if let Some(until) = ready_at {
+            let wait = Duration::from_millis(u64::try_from(until - now).unwrap_or(0));
+            let waiting = RequestSourceStatus::Waiting { ready_at: Some(std::time::Instant::now() + wait) };
+            return Ok(probed.join(waiting));
+        }
+        // Batches still being added in the background are work no queue shows yet.
+        if self.0.in_progress_batches.any() && probed == RequestSourceStatus::Finished {
+            return Ok(RequestSourceStatus::Waiting { ready_at: None });
+        }
+        Ok(probed)
     }
 
     async fn is_finished(&self) -> StorageResult<bool> {
@@ -613,6 +705,7 @@ impl RequestManager for ThrottlingRequestManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crawlee_core::RequestSourceStatus;
 
     #[test]
     fn domain_keys() {
@@ -744,5 +837,51 @@ mod tests {
 
     async fn manager_with_limit() -> ThrottlingRequestManager {
         manager(ThrottlingOptions { max_throttled_domains: 1, ..Default::default() }).await
+    }
+
+    #[tokio::test]
+    async fn a_domain_that_rate_limits_for_too_long_stalls() {
+        let manager = manager(ThrottlingOptions {
+            domains: ThrottledDomains::List(vec!["a.test".into(), "b.test".into()]),
+            max_domain_stall: Duration::from_secs(10),
+            ..Default::default()
+        })
+        .await;
+        manager.add_requests(vec!["https://a.test/1".into(), "https://a.test/2".into()], false).await.unwrap();
+        let first = manager.fetch_next_request().await.unwrap().unwrap();
+        assert!(manager.record_pacing_signal(&PacingSignal::RateLimited { url: first.url.clone(), wait: None }));
+        manager.reclaim_request(&first, true).await.unwrap();
+        assert!(matches!(manager.check_readiness().await.unwrap(), RequestSourceStatus::Waiting { ready_at: Some(_) }));
+
+        // Rate-limited without a break for longer than the window, and still at it: stalled, even
+        // though its backoff is over.
+        {
+            let mut state = manager.0.state.lock();
+            let domain = state.states.get_mut("a.test").unwrap();
+            domain.rate_limited_since = now_millis() - 11_000;
+            domain.backoff_until = 0;
+        }
+        let RequestSourceStatus::Stalled { reason } = manager.check_readiness().await.unwrap() else {
+            panic!("not stalled");
+        };
+        assert!(reason.starts_with("\"a.test\" (11s) rate-limited every request for longer than"), "{reason}");
+        assert!(manager.is_empty().await.unwrap());
+
+        // Another domain with something to fetch masks it.
+        manager.add_requests(vec!["https://b.test/1".into()], false).await.unwrap();
+        assert_eq!(manager.check_readiness().await.unwrap(), RequestSourceStatus::Ready);
+        let mut other = manager.fetch_next_request().await.unwrap().unwrap();
+        manager.mark_request_as_handled(&mut other).await.unwrap();
+
+        // A domain quiet for longer than the window is merely being waited out.
+        manager.0.state.lock().states.get_mut("a.test").unwrap().last_rate_limited_at = now_millis() - 10_500;
+        assert_eq!(manager.check_readiness().await.unwrap(), RequestSourceStatus::Ready);
+
+        // A request that gets through ends the run of 429s.
+        manager.0.state.lock().states.get_mut("a.test").unwrap().last_rate_limited_at = now_millis();
+        let mut request = manager.fetch_next_request().await.unwrap().unwrap();
+        manager.mark_request_as_handled(&mut request).await.unwrap();
+        assert_eq!(manager.0.state.lock().states["a.test"].rate_limited_since, 0);
+        assert_eq!(manager.check_readiness().await.unwrap(), RequestSourceStatus::Ready);
     }
 }

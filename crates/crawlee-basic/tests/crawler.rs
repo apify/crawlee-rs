@@ -1503,8 +1503,8 @@ async fn the_internal_timeout_comes_from_the_configuration() {
 
 #[tokio::test]
 async fn crawls_a_request_list_through_the_queue() {
-    use crawlee_core::storage::request_loader::{LoaderStatus, RequestLoader};
     use crawlee_core::RequestList;
+    use crawlee_core::storage::request_loader::{LoaderStatus, RequestLoader};
 
     let services = services();
     let list = RequestList::open(&services, None, ["https://a.dev/1", "https://a.dev/2"]).await.unwrap();
@@ -1544,4 +1544,70 @@ async fn crawls_a_request_list_through_the_queue() {
         .request_handler(|_ctx: BasicContext| async { Ok(()) })
         .build();
     assert!(matches!(built, Err(crawlee_basic::BuildError::RequestListWithRequestManager)));
+}
+
+/// A crawler whose every request to `a.dev` is answered with a 429, through a throttling manager
+/// that gives up on a domain after `max_domain_stall`.
+async fn always_rate_limited(services: &Services, keep_alive: bool, hits: Arc<AtomicUsize>) -> BasicCrawler {
+    use crawlee_basic::{ThrottledDomains, ThrottlingOptions, ThrottlingRequestManager};
+    use crawlee_core::errors::RequestThrottledError;
+    use crawlee_core::{PacingSignal, RequestManager};
+
+    let options = ThrottlingOptions {
+        domains: ThrottledDomains::List(vec!["a.dev".into()]),
+        base_delay: Duration::from_millis(50),
+        max_delay: Duration::from_millis(100),
+        max_domain_stall: Duration::from_millis(500),
+        ..ThrottlingOptions::default()
+    };
+    let queue = services.open_request_queue(&crawlee_core::StorageIdentifier::alias("stall")).await.unwrap();
+    let queue = Arc::new(queue);
+    let manager = Arc::new(ThrottlingRequestManager::new(options, services, queue));
+    let throttler = manager.clone();
+    BasicCrawler::builder()
+        .services(services.clone())
+        .request_manager(manager)
+        .keep_alive(keep_alive)
+        .max_request_retries(0)
+        .request_handler(move |ctx: BasicContext| {
+            let (throttler, hits) = (throttler.clone(), hits.clone());
+            async move {
+                hits.fetch_add(1, Ordering::SeqCst);
+                let url = ctx.request().url.clone();
+                assert!(throttler.record_pacing_signal(&PacingSignal::RateLimited { url, wait: None }));
+                Err(RequestThrottledError::new("429").into())
+            }
+        })
+        .build()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_domain_that_never_stops_rate_limiting_ends_the_crawl() {
+    let services = services();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let crawler = always_rate_limited(&services, false, hits.clone()).await;
+
+    let result = tokio::time::timeout(Duration::from_secs(20), crawler.run(["https://a.dev/always-429"])).await;
+    let err = result.expect("the crawl ends").unwrap_err();
+    assert!(err.is::<crawlee_basic::PersistentRateLimitError>(), "{err:#}");
+    assert!(err.to_string().starts_with("Giving up: \"a.dev\""), "{err}");
+    assert!(hits.load(Ordering::SeqCst) > 1);
+    // Left in its queue, so that a later run can pick it up.
+    let manager = crawler.request_manager().await.unwrap();
+    assert_eq!(manager.pending_count().await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn keep_alive_outlives_a_domain_that_never_stops_rate_limiting() {
+    let services = services();
+    let crawler = always_rate_limited(&services, true, Arc::default()).await;
+    let running = tokio::spawn({
+        let crawler = crawler.clone();
+        async move { crawler.run(["https://a.dev/always-429"]).await }
+    });
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(!running.is_finished(), "still running");
+    crawler.stop(None);
+    running.await.unwrap().unwrap();
 }

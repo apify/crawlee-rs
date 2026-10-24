@@ -2,7 +2,7 @@
 //! a request queue, and the [`PacingSignal`]s a crawler sends its request manager.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
@@ -30,6 +30,55 @@ pub enum PacingSignal {
     MinInterval { url: String, interval: Duration, scope: Option<PacingScope> },
     /// At least `interval` between requests to every site (`same_domain_delay`).
     MinIntervalEverywhere { interval: Duration, scope: Option<PacingScope> },
+}
+
+/// Whether a request source has a request now, will have one later, never will, or is done: the
+/// answer of [`RequestManager::check_readiness`] (`RequestSourceStatus` of `checkReadiness`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RequestSourceStatus {
+    /// The next fetch is expected to hand a request over.
+    Ready,
+    /// Nothing to fetch now, but the source is not done: requests are in progress, are being
+    /// added in the background, or are held back until `ready_at` (when known).
+    Waiting { ready_at: Option<Instant> },
+    /// The source holds requests it cannot make progress on. Only a manager that paces its own
+    /// requests gets there, such as a `ThrottlingRequestManager` whose domain keeps answering 429.
+    Stalled { reason: String },
+    /// Everything was handled.
+    Finished,
+}
+
+impl RequestSourceStatus {
+    /// The status of two sources read as one (`joinRequestSourceStatuses`): `Ready` first, then
+    /// `Stalled`, `Waiting` and `Finished`. Of two waiting sources, the earlier known wake-up
+    /// wins.
+    pub fn join(self, other: RequestSourceStatus) -> RequestSourceStatus {
+        use RequestSourceStatus::*;
+        match (self, other) {
+            (Ready, _) | (_, Ready) => Ready,
+            // A source with work masks a stalled one: the stall only matters once nothing else
+            // can make progress.
+            (stalled @ Stalled { .. }, _) | (_, stalled @ Stalled { .. }) => stalled,
+            (Waiting { ready_at: a }, Waiting { ready_at: b }) => Waiting {
+                ready_at: match (a, b) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                },
+            },
+            (waiting @ Waiting { .. }, Finished) | (Finished, waiting @ Waiting { .. }) => waiting,
+            (Finished, Finished) => Finished,
+        }
+    }
+}
+
+impl From<LoaderStatus> for RequestSourceStatus {
+    fn from(status: LoaderStatus) -> Self {
+        match status {
+            LoaderStatus::Ready => RequestSourceStatus::Ready,
+            LoaderStatus::Waiting => RequestSourceStatus::Waiting { ready_at: None },
+            LoaderStatus::Finished => RequestSourceStatus::Finished,
+        }
+    }
 }
 
 /// Whether a [`RequestLoader`] has a request now, may have one later, or is done.
@@ -128,6 +177,12 @@ impl RequestManager for RequestManagerTandem {
 
     async fn is_finished(&self) -> StorageResult<bool> {
         Ok(self.loader.status().await? == LoaderStatus::Finished && self.manager.is_finished().await?)
+    }
+
+    /// The loader and the manager read as one source.
+    async fn check_readiness(&self) -> StorageResult<RequestSourceStatus> {
+        let loader = RequestSourceStatus::from(self.loader.status().await?);
+        Ok(loader.join(self.manager.check_readiness().await?))
     }
 
     async fn handled_count(&self) -> StorageResult<u64> {
@@ -256,5 +311,22 @@ mod tests {
         assert!(tandem.fetch_next_request().await.unwrap().is_none());
         assert_eq!(loader.handled_count().await.unwrap(), 1);
         assert_eq!(*manager.fetches.lock(), 0);
+    }
+
+    #[test]
+    fn statuses_join_by_precedence() {
+        use RequestSourceStatus::*;
+        let soon = Instant::now();
+        let later = soon + Duration::from_secs(1);
+        let stalled = || Stalled { reason: "x".into() };
+        assert_eq!(stalled().join(Ready), Ready);
+        assert_eq!(Waiting { ready_at: None }.join(stalled()), stalled());
+        assert_eq!(Finished.join(Waiting { ready_at: Some(later) }), Waiting { ready_at: Some(later) });
+        assert_eq!(
+            Waiting { ready_at: Some(later) }.join(Waiting { ready_at: Some(soon) }),
+            Waiting { ready_at: Some(soon) }
+        );
+        assert_eq!(Waiting { ready_at: None }.join(Waiting { ready_at: Some(soon) }), Waiting { ready_at: Some(soon) });
+        assert_eq!(Finished.join(Finished), Finished);
     }
 }
