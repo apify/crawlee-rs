@@ -34,8 +34,8 @@ const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// How often the task loop asks the concurrency system again when it had no capacity
 /// (`maybeRunIntervalSecs`).
 const MAYBE_RUN_INTERVAL: Duration = Duration::from_millis(500);
-/// Releases the proxy of a session nothing will use again, once the attempt (with its error
-/// handlers) is over, however it ends.
+/// Releases the session-specific proxy of a session nothing will use again, once the attempt
+/// (with its error handlers) is over, however it ends.
 struct ReleaseProxy {
     client: Arc<dyn HttpClient>,
     session: Arc<Session>,
@@ -43,7 +43,7 @@ struct ReleaseProxy {
 
 impl Drop for ReleaseProxy {
     fn drop(&mut self) {
-        if let Some(proxy) = self.session.proxy_info() {
+        if let Some(proxy) = self.session.proxy_info().filter(|proxy| proxy.session_specific) {
             self.client.release_proxy(&proxy.url);
         }
     }

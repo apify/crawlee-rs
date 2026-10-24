@@ -104,13 +104,17 @@ fn iso(time: DateTime<Utc>) -> String {
 }
 
 fn proxy_info_json(proxy: &ProxyInfo) -> Value {
-    json!({
+    let mut json = json!({
         "url": proxy.url.as_str(),
         "hostname": proxy.hostname,
         "port": proxy.port,
         "username": proxy.username,
         "password": proxy.password,
-    })
+    });
+    if proxy.ignore_tls_errors {
+        json["ignoreTlsErrors"] = true.into();
+    }
+    json
 }
 
 impl Session {
@@ -162,7 +166,10 @@ impl Session {
             Ok(DateTime::parse_from_rfc3339(text)?.with_timezone(&Utc))
         };
         let id = record["id"].as_str().ok_or("the session has no `id`")?.to_owned();
-        let proxy_info = record["proxyInfo"]["url"].as_str().map(Url::parse).transpose()?.map(ProxyInfo::from_url);
+        let proxy_info = record["proxyInfo"]["url"].as_str().map(Url::parse).transpose()?.map(|url| ProxyInfo {
+            ignore_tls_errors: record["proxyInfo"]["ignoreTlsErrors"].as_bool().unwrap_or(false),
+            ..ProxyInfo::from_url(url)
+        });
         let mut options = options.clone();
         if let Some(value) = record["maxErrorScore"].as_f64() {
             options.max_error_score = value;
@@ -727,6 +734,15 @@ mod tests {
         assert!(session.id().starts_with("custom_session_"));
         assert_eq!(session.user_data()["custom"], true);
         assert!(session.fingerprint().is_some(), "the options carry the default fingerprint");
+    }
+
+    #[test]
+    fn a_mitm_proxy_is_saved_with_the_session() {
+        let proxy = ProxyInfo { ignore_tls_errors: true, ..ProxyInfo::from_url(Url::parse("http://mitm:1").unwrap()) };
+        let record = Session::new("s".into(), Some(proxy), SessionOptions::default()).to_state();
+        assert_eq!(record["proxyInfo"]["ignoreTlsErrors"], true);
+        let restored = Session::from_state(&record, &SessionOptions::default()).unwrap();
+        assert!(restored.proxy_info().unwrap().ignore_tls_errors);
     }
 
     #[test]
