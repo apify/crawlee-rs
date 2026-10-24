@@ -123,25 +123,45 @@ type ClientKey = (Option<String>, bool, Option<Browser>);
 
 type Client = Arc<Impit<reqwest::cookie::Jar>>;
 
-/// The most recently used clients, most recent last.
-#[derive(Default)]
-struct ClientCache(Vec<(ClientKey, Client)>);
+/// The most recently used clients: each with the tick of its last use, so the least recently
+/// used one is evicted when the cache is full.
+struct ClientCache {
+    clients: HashMap<ClientKey, (Client, u64)>,
+    capacity: usize,
+    tick: u64,
+}
+
+impl Default for ClientCache {
+    fn default() -> Self {
+        ClientCache { clients: HashMap::new(), capacity: CLIENT_CACHE_SIZE, tick: 0 }
+    }
+}
 
 impl ClientCache {
     fn get(&mut self, key: &ClientKey) -> Option<Client> {
-        let index = self.0.iter().position(|(k, _)| k == key)?;
-        let entry = self.0.remove(index);
-        let client = entry.1.clone();
-        self.0.push(entry);
-        Some(client)
+        self.tick += 1;
+        let (client, used) = self.clients.get_mut(key)?;
+        *used = self.tick;
+        Some(client.clone())
     }
 
     fn add(&mut self, key: ClientKey, client: Client) {
-        self.0.retain(|(k, _)| *k != key);
-        self.0.push((key, client));
-        if self.0.len() > CLIENT_CACHE_SIZE {
-            self.0.remove(0);
+        self.tick += 1;
+        self.clients.insert(key, (client, self.tick));
+        if self.clients.len() > self.capacity
+            && let Some(oldest) = self.clients.iter().min_by_key(|(_, (_, used))| *used).map(|(key, _)| key.clone())
+        {
+            self.clients.remove(&oldest);
         }
+    }
+
+    fn retain(&mut self, keep: impl Fn(&ClientKey) -> bool) {
+        self.clients.retain(|key, _| keep(key));
+    }
+
+    #[cfg(test)]
+    fn proxies(&self) -> Vec<Option<String>> {
+        self.clients.keys().map(|(proxy, _, _)| proxy.clone()).collect()
     }
 }
 
@@ -176,7 +196,8 @@ impl VersionsByFingerprint {
 /// A [`Transport`] backed by impit (`ImpitHttpClient`).
 ///
 /// Clients are kept for the 10 most recently used combinations of proxy, TLS verification and
-/// browser, so connections are reused.
+/// browser (see [`with_max_cached_clients`](Self::with_max_cached_clients)), so connections are
+/// reused.
 pub struct ImpitTransport {
     browser: Option<Browser>,
     cache_clients: bool,
@@ -210,6 +231,15 @@ impl ImpitTransport {
              crawlers can lead to incompatible session setups."
         );
         ImpitTransport { browser: Some(browser), ..Self::new() }
+    }
+
+    /// How many clients to keep: 10 by default, as in Crawlee for JS. A crawler that gives each
+    /// attempt a proxy session of its own needs about as many as it runs requests at once, or the
+    /// requests of an attempt open new connections when its client was evicted in between.
+    /// [`release_proxy`](Transport::release_proxy) still drops the clients of finished attempts.
+    pub fn with_max_cached_clients(self, max: usize) -> Self {
+        self.clients.lock().capacity = max.max(1);
+        self
     }
 
     /// Whether to keep clients between requests (default `true`). A new client per request cannot
@@ -286,7 +316,7 @@ impl Transport for ImpitTransport {
     /// Drops the clients of a proxy nothing will use again.
     fn release_proxy(&self, proxy_url: &url::Url) {
         let proxy_url = proxy_url.as_str();
-        self.clients.lock().0.retain(|((proxy, _, _), _)| proxy.as_deref() != Some(proxy_url));
+        self.clients.lock().retain(|(proxy, _, _)| proxy.as_deref() != Some(proxy_url));
     }
 
     async fn fetch(&self, request: HttpRequest, options: &TransportOptions) -> Result<HttpResponse, HttpClientError> {
@@ -383,8 +413,7 @@ mod tests {
         }
         assert!(Arc::ptr_eq(&first, &transport.client(&proxy(0)).unwrap()), "reused, and now the most recent");
         transport.client(&proxy(10)).unwrap();
-        let keys: Vec<Option<String>> =
-            transport.clients.lock().0.iter().map(|((proxy, _, _), _)| proxy.clone()).collect();
+        let keys = transport.clients.lock().proxies();
         assert_eq!(keys.len(), 10);
         assert!(!keys.contains(&Some("http://p1.example:8000/".to_owned())), "the least recently used is gone");
         assert!(keys.contains(&Some("http://p0.example:8000/".to_owned())));
@@ -392,6 +421,22 @@ mod tests {
         let uncached = ImpitTransport::new().with_cache_clients(false);
         let a = uncached.client(&proxy(0)).unwrap();
         assert!(!Arc::ptr_eq(&a, &uncached.client(&proxy(0)).unwrap()));
-        assert!(uncached.clients.lock().0.is_empty());
+        assert!(uncached.clients.lock().proxies().is_empty());
+    }
+
+    /// A crawler with a proxy session per attempt and high concurrency keeps more clients, so that
+    /// the requests of an attempt reuse their connection.
+    #[test]
+    fn the_cache_can_keep_more_clients() {
+        let transport = ImpitTransport::new().with_max_cached_clients(50);
+        let first = transport.client(&proxy(0)).unwrap();
+        for n in 1..50 {
+            transport.client(&proxy(n)).unwrap();
+        }
+        assert!(Arc::ptr_eq(&first, &transport.client(&proxy(0)).unwrap()));
+        transport.client(&proxy(50)).unwrap();
+        let keys = transport.clients.lock().proxies();
+        assert_eq!(keys.len(), 50);
+        assert!(!keys.contains(&Some("http://p1.example:8000/".to_owned())), "the least recently used is gone");
     }
 }
