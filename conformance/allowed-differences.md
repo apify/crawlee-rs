@@ -23,7 +23,10 @@ _None._ All 755 checks match.
 | `errorMessages` | `error.stack` | The error with its cause chain (`{error:#}`) | Rust errors have no JS stack traces |
 | Error grouping in statistics | By error code, name, stack path and message placeholders | By first message line with digits masked | Same reason |
 | Event loop load signal | Lateness of a Node timer | Lateness of a tokio timer task | There is no single event loop; a starved tokio runtime is the equivalent |
-| `maxRequestsPerCrawl` | Can overshoot by in-flight requests (5042 of 5000 in the benchmark) | Never exceeded | In-flight requests are counted before fetching |
+| `maxRequestsPerCrawl` | Can overshoot by in-flight requests (5042 of 5000 in the benchmark) | Never exceeded; what is enqueued is capped as in JS | Running tasks are counted before another one starts |
+| Internal timeouts | `internalTimeoutMillis` from `CRAWLEE_INTERNAL_TIMEOUT`, or twice the handler timeout but at least 5 min; the request timeout covers the navigation timeout too | Always twice the handler timeout but at least 5 min; the request timeout is the longer of it and the request's handler timeout | No such setting in `Configuration`, and the pipeline of `BasicCrawler` does not know the navigation timeout of the crawler built on it |
+| SIGINT | `process.once('SIGINT')` during a run; outside one, Node's default | The first Ctrl+C during a run pauses and ends it; a second one, or one when no crawler runs, exits the process with status 130 | tokio's handler replaces the default one for the rest of the process, so the default is emulated |
+| `statusMessageCallback` | Gets the crawler and the statistics state; `previousState` is the state just read | Gets the message and statistics snapshots; `previous_state` is the one of the previous status message | No typed crawler handle in a callback shared by every pipeline; the JS value is always the current state |
 | Transaction capture | Ambient (`AsyncLocalStorage`) | Only writes made through the context | No ambient context in Rust; explicit is clearer |
 | Request queue order numbers | `±Date.now()` | A process-wide counter | Same order, deterministic |
 | Add dedup cache | Stores keys | Stores 64-bit fingerprints of keys (8 MiB per million) | Memory |
