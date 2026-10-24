@@ -58,23 +58,28 @@ const DEDUP_CACHE_SLOTS: usize = 1 << 20;
 
 /// A direct-mapped cache of unique keys this client has already added, so repeated adds of the
 /// same URL (the common case when every page links to the same navigation) skip the backend.
+/// It also remembers whether each request was handled, as the backend last reported it (the
+/// `requestCache` of `RequestQueue` in JS), so that a cached add reports it.
 ///
 /// Slots hold 64-bit fingerprints rather than the keys themselves, which keeps the cache at 8 MiB
-/// for a million entries. A fingerprint collision would make the cache report an unseen request
-/// as present; with 64-bit fingerprints that needs about 2^32 distinct keys to become likely.
+/// for a million entries. The lowest bit of a slot is the handled flag. A fingerprint collision
+/// would make the cache report an unseen request as present; with 63-bit fingerprints that needs
+/// about 2^31 distinct keys to become likely.
 struct DedupCache {
     slots: Option<Box<[u64]>>,
 }
 
 impl DedupCache {
+    const HANDLED: u64 = 1;
+
     fn fingerprint(unique_key: &str) -> u64 {
-        // FNV-1a, 64-bit. Zero marks an empty slot.
+        // FNV-1a, 64-bit, without the flag bit. Zero marks an empty slot.
         let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
         for byte in unique_key.bytes() {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(0x0100_0000_01b3);
         }
-        hash.max(1)
+        (hash & !Self::HANDLED).max(2)
     }
 
     fn slot(fingerprint: u64) -> usize {
@@ -82,15 +87,17 @@ impl DedupCache {
         (fingerprint >> 44) as usize % DEDUP_CACHE_SLOTS
     }
 
-    fn contains(&self, unique_key: &str) -> bool {
+    /// Whether the request was handled, or `None` if it is not cached.
+    fn get(&self, unique_key: &str) -> Option<bool> {
         let fingerprint = Self::fingerprint(unique_key);
-        self.slots.as_ref().is_some_and(|slots| slots[Self::slot(fingerprint)] == fingerprint)
+        let slot = self.slots.as_ref()?[Self::slot(fingerprint)];
+        (slot & !Self::HANDLED == fingerprint).then_some(slot & Self::HANDLED != 0)
     }
 
-    fn insert(&mut self, unique_key: &str) {
+    fn insert(&mut self, unique_key: &str, handled: bool) {
         let fingerprint = Self::fingerprint(unique_key);
         let slots = self.slots.get_or_insert_with(|| vec![0u64; DEDUP_CACHE_SLOTS].into_boxed_slice());
-        slots[Self::slot(fingerprint)] = fingerprint;
+        slots[Self::slot(fingerprint)] = fingerprint | u64::from(handled);
     }
 
     fn clear(&mut self) {
@@ -105,6 +112,8 @@ pub struct RequestQueue {
     backend: Arc<dyn RequestQueueBackend>,
     cache_link: CacheLink,
     added: Arc<Mutex<DedupCache>>,
+    /// The highest expected processing time passed on to the backend.
+    expected_processing_time: Arc<Mutex<Duration>>,
     in_progress_batches: InProgressBatches,
 }
 
@@ -127,6 +136,7 @@ impl RequestQueue {
             backend,
             cache_link: CacheLink::default(),
             added: Arc::new(Mutex::new(DedupCache { slots: None })),
+            expected_processing_time: Arc::default(),
             in_progress_batches: InProgressBatches::default(),
         }
     }
@@ -160,6 +170,19 @@ impl RequestQueue {
         self.backend.get_metadata().await
     }
 
+    /// Removes every request, and forgets what this client cached about them, so the queue behaves
+    /// as if freshly opened.
+    pub async fn purge(&self) -> StorageResult<()> {
+        self.backend.purge().await?;
+        self.added.lock().clear();
+        *self.expected_processing_time.lock() = Duration::ZERO;
+        Ok(())
+    }
+
+    fn cache_request(&self, unique_key: &str, handled: bool) {
+        self.added.lock().insert(unique_key, handled);
+    }
+
     pub async fn drop_storage(self) -> StorageResult<()> {
         self.added.lock().clear();
         self.backend.drop_storage().await?;
@@ -179,13 +202,13 @@ impl RequestManager for RequestQueue {
         {
             let cache = self.added.lock();
             for request in requests {
-                // A forefront add of a known request is not skipped: it may be meant to reorder.
-                if !forefront && cache.contains(&request.unique_key) {
+                // As in JS, a cached request is not added again, not even to the forefront.
+                if let Some(handled) = cache.get(&request.unique_key) {
                     result.processed_requests.push(ProcessedRequest {
                         request_id: unique_key_to_request_id(&request.unique_key),
                         unique_key: request.unique_key,
                         was_already_present: true,
-                        was_already_handled: false,
+                        was_already_handled: handled,
                     });
                 } else if in_batch.insert(request.unique_key.clone()) {
                     to_add.push(request);
@@ -201,7 +224,7 @@ impl RequestManager for RequestQueue {
         {
             let mut cache = self.added.lock();
             for processed in &added.processed_requests {
-                cache.insert(&processed.unique_key);
+                cache.insert(&processed.unique_key, processed.was_already_handled);
             }
         }
         result.processed_requests.extend(added.processed_requests);
@@ -240,14 +263,25 @@ impl RequestManager for RequestQueue {
     }
 
     async fn mark_request_as_handled(&self, request: &mut Request) -> StorageResult<Option<QueueOperationInfo>> {
+        let previous = request.handled_at.clone();
         if request.handled_at.is_none() {
             request.handled_at = Some(crate::now_iso());
         }
-        self.backend.mark_request_as_handled(request).await
+        let info = self.backend.mark_request_as_handled(request).await?;
+        match &info {
+            // The request was not in progress: nothing changed, the request included.
+            None => request.handled_at = previous,
+            Some(info) => self.cache_request(&request.unique_key, info.was_already_handled),
+        }
+        Ok(info)
     }
 
     async fn reclaim_request(&self, request: &Request, forefront: bool) -> StorageResult<Option<QueueOperationInfo>> {
-        self.backend.reclaim_request(request, forefront).await
+        let info = self.backend.reclaim_request(request, forefront).await?;
+        if let Some(info) = &info {
+            self.cache_request(&request.unique_key, info.was_already_handled);
+        }
+        Ok(info)
     }
 
     async fn is_empty(&self) -> StorageResult<bool> {
@@ -266,7 +300,15 @@ impl RequestManager for RequestQueue {
         Ok(self.backend.get_metadata().await?.handled_request_count)
     }
 
+    /// Passed on to the backend only when it raises the highest time so far.
     async fn set_expected_request_processing_time(&self, duration: Duration) -> StorageResult<()> {
+        {
+            let mut expected = self.expected_processing_time.lock();
+            if duration <= *expected {
+                return Ok(());
+            }
+            *expected = duration;
+        }
         self.backend.set_expected_request_processing_time(duration).await
     }
 }
@@ -360,6 +402,14 @@ mod tests {
     struct RecordingBackend {
         inner: Arc<dyn RequestQueueBackend>,
         batches: Mutex<Vec<Vec<String>>>,
+        expected_times: Mutex<Vec<Duration>>,
+    }
+
+    impl RecordingBackend {
+        async fn new(storage: &MemoryStorageBackend) -> Arc<Self> {
+            let inner = storage.create_request_queue_backend(&StorageIdentifier::Default).await.unwrap();
+            Arc::new(RecordingBackend { inner, batches: Mutex::default(), expected_times: Mutex::default() })
+        }
     }
 
     #[async_trait]
@@ -403,13 +453,16 @@ mod tests {
         async fn is_finished(&self) -> StorageResult<bool> {
             self.inner.is_finished().await
         }
+        async fn set_expected_request_processing_time(&self, duration: Duration) -> StorageResult<()> {
+            self.expected_times.lock().push(duration);
+            Ok(())
+        }
     }
 
     #[tokio::test]
     async fn a_batch_reaches_the_backend_without_repeated_unique_keys() {
         let storage = MemoryStorageBackend::new();
-        let inner = storage.create_request_queue_backend(&StorageIdentifier::Default).await.unwrap();
-        let backend = Arc::new(RecordingBackend { inner, batches: Mutex::new(Vec::new()) });
+        let backend = RecordingBackend::new(&storage).await;
         let queue = RequestQueue::from_backend(backend.clone());
 
         for forefront in [false, true] {
@@ -429,12 +482,93 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn a_cached_add_reports_whether_the_request_was_handled() {
+        let storage = MemoryStorageBackend::new();
+        let first = RequestQueue::open(&storage, &StorageIdentifier::Default).await.unwrap();
+        first.add_request("https://example.com/a", false).await.unwrap();
+        let mut request = first.fetch_next_request().await.unwrap().unwrap();
+        first.mark_request_as_handled(&mut request).await.unwrap();
+
+        // A new client learns from the backend that the request was handled, and remembers it.
+        let backend = RecordingBackend::new(&storage).await;
+        let queue = RequestQueue::from_backend(backend.clone());
+        for _ in 0..2 {
+            let added = queue.add_request("https://example.com/a", false).await.unwrap();
+            assert!(added.was_already_present && added.was_already_handled);
+        }
+        assert_eq!(backend.batches.lock().len(), 1, "the second add is served from the cache");
+    }
+
+    #[tokio::test]
+    async fn a_cached_forefront_add_is_served_from_the_cache() {
+        let storage = MemoryStorageBackend::new();
+        let backend = RecordingBackend::new(&storage).await;
+        let queue = RequestQueue::from_backend(backend.clone());
+        queue.add_request("https://example.com/a", false).await.unwrap();
+        let again = queue.add_request("https://example.com/a", true).await.unwrap();
+        assert!(again.was_already_present);
+        assert_eq!(backend.batches.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn marking_and_reclaiming_update_the_cache() {
+        let storage = MemoryStorageBackend::new();
+        let backend = RecordingBackend::new(&storage).await;
+        let queue = RequestQueue::from_backend(backend.clone());
+        queue.add_request("https://example.com/a", false).await.unwrap();
+        let mut request = queue.fetch_next_request().await.unwrap().unwrap();
+        // As in JS, the cache keeps the `was_already_handled` the backend reports: the state
+        // before the request was marked.
+        queue.mark_request_as_handled(&mut request).await.unwrap();
+        assert!(!queue.add_request("https://example.com/a", false).await.unwrap().was_already_handled);
+        queue.mark_request_as_handled(&mut request).await.unwrap();
+        assert!(queue.add_request("https://example.com/a", false).await.unwrap().was_already_handled);
+        assert_eq!(backend.batches.lock().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_request_the_backend_does_not_mark_keeps_no_handled_at() {
+        let storage = MemoryStorageBackend::new();
+        let queue = RequestQueue::open(&storage, &StorageIdentifier::Default).await.unwrap();
+        let mut request = Request::new("https://example.com/unknown");
+        assert!(queue.mark_request_as_handled(&mut request).await.unwrap().is_none());
+        assert!(request.handled_at.is_none());
+    }
+
+    #[tokio::test]
+    async fn the_expected_processing_time_is_only_raised() {
+        let storage = MemoryStorageBackend::new();
+        let backend = RecordingBackend::new(&storage).await;
+        let queue = RequestQueue::from_backend(backend.clone());
+        for secs in [60, 30, 90, 90] {
+            queue.set_expected_request_processing_time(Duration::from_secs(secs)).await.unwrap();
+        }
+        assert_eq!(*backend.expected_times.lock(), [Duration::from_secs(60), Duration::from_secs(90)]);
+
+        queue.purge().await.unwrap();
+        queue.set_expected_request_processing_time(Duration::from_secs(30)).await.unwrap();
+        assert_eq!(backend.expected_times.lock().last(), Some(&Duration::from_secs(30)));
+    }
+
+    #[tokio::test]
+    async fn purge_empties_the_queue_and_its_caches() {
+        let storage = MemoryStorageBackend::new();
+        let queue = RequestQueue::open(&storage, &StorageIdentifier::Default).await.unwrap();
+        queue.add_request("https://example.com/a", false).await.unwrap();
+        queue.purge().await.unwrap();
+        assert!(queue.is_finished().await.unwrap());
+        assert!(!queue.add_request("https://example.com/a", false).await.unwrap().was_already_present);
+    }
+
     #[test]
     fn dedup_cache_fingerprints() {
         let mut cache = DedupCache { slots: None };
-        assert!(!cache.contains("https://a.dev"));
-        cache.insert("https://a.dev");
-        assert!(cache.contains("https://a.dev"));
-        assert!(!cache.contains("https://b.dev"));
+        assert_eq!(cache.get("https://a.dev"), None);
+        cache.insert("https://a.dev", false);
+        assert_eq!(cache.get("https://a.dev"), Some(false));
+        cache.insert("https://a.dev", true);
+        assert_eq!(cache.get("https://a.dev"), Some(true));
+        assert_eq!(cache.get("https://b.dev"), None);
     }
 }

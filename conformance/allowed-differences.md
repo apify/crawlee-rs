@@ -26,7 +26,7 @@ _None._ All 755 checks match.
 | `maxRequestsPerCrawl` | Can overshoot by in-flight requests (5042 of 5000 in the benchmark) | Never exceeded | In-flight requests are counted before fetching |
 | Transaction capture | Ambient (`AsyncLocalStorage`) | Only writes made through the context | No ambient context in Rust; explicit is clearer |
 | Request queue order numbers | `±Date.now()` | A process-wide counter | Same order, deterministic |
-| Add dedup cache | Stores keys | Stores 64-bit fingerprints of keys (8 MiB per million) | Memory |
+| Request queue caches | A 1M-slot dedup cache of keys plus a 2M-entry LRU of requests with their handled state; requests added in background batches skip the LRU, so a later add of one reports `wasAlreadyHandled: false` | One 1M-slot cache of 64-bit key fingerprints with a handled bit (8 MiB), kept for every add | Memory |
 | Default HTTP client | `impit` (browser impersonation) | reqwest (rustls, h2); impit through `integrations/crawlee-impit` | impit needs patched dependencies, which cannot be forced on every user |
 | Throttling | `checkReadiness()` can report a domain as `stalled` after `maxDomainStallSecs` of 429s | Not ported: a domain that rate-limits forever is retried forever | The task loop has no readiness states yet |
 | Error groups in saved statistics | `errors` / `retryErrors` hold the nested `ErrorTracker` tree | A flat `{ group: count }` map | Follows from the error grouping above; JS rebuilds its trackers from scratch on restore anyway |
