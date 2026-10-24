@@ -1,6 +1,6 @@
 //! [`RequestQueue`] and the [`RequestManager`] trait crawlers consume requests through.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -17,6 +17,7 @@ use super::batched_adds::{
     drain_request_batches_inline,
 };
 use crate::errors::{StorageError, StorageResult};
+use crate::events::{EventKind, EventManager};
 use crate::recoverable_state::BoxError;
 use crate::request::{Request, RequestError, unique_key_to_request_id};
 use crate::services::CacheLink;
@@ -71,6 +72,21 @@ pub trait RequestManager: Send + Sync {
     /// handler that asked for more time. `false` when the manager holds no lock.
     async fn extend_request_processing_time(&self, _request: &Request, _by: Duration) -> StorageResult<bool> {
         Ok(false)
+    }
+
+    /// Whether a request can be fetched now, later, never, or all work is done
+    /// (`checkReadiness`). By default, from [`is_empty`](Self::is_empty),
+    /// [`is_finished`](Self::is_finished) and [`ready_at`](Self::ready_at); a manager that can
+    /// stall reports it here.
+    async fn check_readiness(&self) -> StorageResult<super::request_loader::RequestSourceStatus> {
+        use super::request_loader::RequestSourceStatus;
+        if !self.is_empty().await? {
+            return Ok(RequestSourceStatus::Ready);
+        }
+        if self.is_finished().await? {
+            return Ok(RequestSourceStatus::Finished);
+        }
+        Ok(RequestSourceStatus::Waiting { ready_at: self.ready_at() })
     }
     /// When a manager that has nothing to fetch now (see [`is_empty`](Self::is_empty)) will have
     /// a request ready, if it knows: for example when a held-back domain may be fetched again. The
@@ -151,6 +167,44 @@ impl RequestsFromUrl {
     pub fn request(mut self, make: impl Fn(&str) -> Result<Request, RequestError> + Send + Sync + 'static) -> Self {
         self.request = Arc::new(make);
         self
+    }
+
+    /// Downloads the list with `fetcher` (through `proxy_url`, if set), and makes a request of
+    /// every URL in it (`#fetchRequestsFromUrl`). A list without URLs is warned about.
+    pub(crate) async fn fetch_requests(
+        &self,
+        fetcher: Option<&dyn UrlListFetcher>,
+        proxy_url: Option<&str>,
+    ) -> StorageResult<Vec<Request>> {
+        let requests_from_url = &self.requests_from_url;
+        let cannot_fetch = |err: &dyn std::fmt::Display| {
+            StorageError::Backend(format!("Cannot fetch a request list from {requests_from_url}: {err}").into())
+        };
+        let fetcher = fetcher.ok_or_else(|| {
+            cannot_fetch(&"no URL list fetcher was set; set one with RequestQueue::set_url_list_fetcher")
+        })?;
+        // A Google Sheets sharing link is fetched as the CSV export of the sheet.
+        static GOOGLE_SHEETS: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"^(https://docs\.google\.com/spreadsheets/d/[A-Za-z0-9_-]+)/?").unwrap());
+        let url = match GOOGLE_SHEETS.captures(requests_from_url) {
+            Some(sheet) => format!("{}/gviz/tq?tqx=out:csv", &sheet[1]),
+            None => requests_from_url.clone(),
+        };
+        let body = fetcher.fetch(&url, proxy_url).await.map_err(|err| cannot_fetch(&err))?;
+        let urls = extract_urls(&String::from_utf8_lossy(&body), self.regex.as_ref());
+        if urls.is_empty() {
+            tracing::warn!(requests_from_url, regex = ?self.regex, "The fetched list contains no valid URLs.");
+            return Ok(Vec::new());
+        }
+        urls.iter()
+            .map(|url| (self.request)(url))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| StorageError::InvalidArgument(err.to_string()))
+    }
+
+    /// The first five URLs of `requests`, for the log.
+    pub(crate) fn sample(&self, requests: &[Request]) -> Vec<String> {
+        requests.iter().take(5).map(|request| request.url.clone()).collect()
     }
 }
 
@@ -235,6 +289,8 @@ pub struct RequestQueue {
     counters: Arc<RequestQueueCounters>,
     url_list_fetcher: Arc<Mutex<Option<Arc<dyn UrlListFetcher>>>>,
     in_progress_batches: InProgressBatches,
+    /// Set on the `Migrating` event: nothing is fetched any more (`#queuePausedForMigration`).
+    paused_for_migration: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for RequestQueue {
@@ -260,7 +316,21 @@ impl RequestQueue {
             counters: Arc::default(),
             url_list_fetcher: Arc::default(),
             in_progress_batches: InProgressBatches::default(),
+            paused_for_migration: Arc::default(),
         }
+    }
+
+    /// Stops fetching requests once `events` emits [`Event::Migrating`](crate::Event::Migrating),
+    /// as the queues of Crawlee for JS do: the run is about to move to another host, where the
+    /// requests are fetched again. Queues opened through [`Services`](crate::Services) listen to
+    /// its events.
+    pub fn with_events(self, events: &EventManager) -> Self {
+        let paused = self.paused_for_migration.clone();
+        events.on(EventKind::Migrating, move |_| {
+            paused.store(true, Ordering::Release);
+            async {}
+        });
+        self
     }
 
     pub(crate) fn with_cache_link(mut self, link: CacheLink) -> Self {
@@ -297,6 +367,7 @@ impl RequestQueue {
     pub async fn purge(&self) -> StorageResult<()> {
         self.backend.purge().await?;
         self.added.lock().clear();
+        self.in_progress_batches.reset();
         *self.expected_processing_time.lock() = Duration::ZERO;
         Ok(())
     }
@@ -320,42 +391,22 @@ impl RequestQueue {
         source: RequestsFromUrl,
         forefront: bool,
     ) -> StorageResult<Vec<ProcessedRequest>> {
-        let RequestsFromUrl { requests_from_url, regex, request } = source;
         let fetcher = self.url_list_fetcher.lock().clone();
-        let cannot_fetch = |err: &dyn std::fmt::Display| {
-            StorageError::Backend(format!("Cannot fetch a request list from {requests_from_url}: {err}").into())
-        };
-        let fetcher = fetcher.ok_or_else(|| {
-            cannot_fetch(&"no URL list fetcher was set; set one with RequestQueue::set_url_list_fetcher")
-        })?;
-        // A Google Sheets sharing link is fetched as the CSV export of the sheet.
-        static GOOGLE_SHEETS: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"^(https://docs\.google\.com/spreadsheets/d/[A-Za-z0-9_-]+)/?").unwrap());
-        let url = match GOOGLE_SHEETS.captures(&requests_from_url) {
-            Some(sheet) => format!("{}/gviz/tq?tqx=out:csv", &sheet[1]),
-            None => requests_from_url.clone(),
-        };
-        let body = fetcher.fetch(&url, None).await.map_err(|err| cannot_fetch(&err))?;
-        let urls = extract_urls(&String::from_utf8_lossy(&body), regex.as_ref());
-        if urls.is_empty() {
-            tracing::warn!(requests_from_url, regex = ?regex, "The fetched list contains no valid URLs.");
+        let requests = source.fetch_requests(fetcher.as_deref(), None).await?;
+        if requests.is_empty() {
             return Ok(Vec::new());
         }
-        let requests = urls
-            .iter()
-            .map(|url| request(url))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|err| StorageError::InvalidArgument(err.to_string()))?;
         let fetched_count = requests.len();
+        let sample = source.sample(&requests);
         let options = AddRequestsBatchedOptions { forefront, ..Default::default() };
         let added = self.add_requests_batched(requests, options).await?.added_requests;
         tracing::info!(
-            requests_from_url,
-            regex = ?regex,
+            requests_from_url = source.requests_from_url,
+            regex = ?source.regex,
             fetched_count,
             imported_count = added.len(),
             duplicate_count = fetched_count.saturating_sub(added.len()),
-            sample = ?&urls[..urls.len().min(5)],
+            sample = ?sample,
             "Fetched and loaded Requests from a remote resource."
         );
         Ok(added)
@@ -453,6 +504,9 @@ impl RequestManager for RequestQueue {
     }
 
     async fn fetch_next_request(&self) -> StorageResult<Option<Request>> {
+        if self.paused_for_migration.load(Ordering::Acquire) {
+            return Ok(None);
+        }
         self.counters.head_item_read.fetch_add(1, Ordering::Relaxed);
         self.backend.fetch_next_request().await
     }
@@ -770,6 +824,41 @@ mod tests {
         queue.purge().await.unwrap();
         assert!(queue.is_finished().await.unwrap());
         assert!(!queue.add_request("https://example.com/a", false).await.unwrap().was_already_present);
+    }
+
+    #[tokio::test]
+    async fn purge_forgets_the_batches_still_being_added() {
+        let storage = MemoryStorageBackend::new();
+        let queue = RequestQueue::open(&storage, &StorageIdentifier::Default).await.unwrap();
+        let options = AddRequestsBatchedOptions {
+            batch_size: 1,
+            wait_between_batches: Duration::from_secs(60),
+            ..Default::default()
+        };
+        let result = queue.add_requests_batched(urls(3), options).await.unwrap();
+        assert!(result.wait_for_all_requests_to_be_added.is_some());
+        // The second batch is added right away, the third after a minute.
+        while queue.get_info().await.unwrap().total_request_count < 2 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!queue.is_finished().await.unwrap());
+
+        // As if freshly opened: the batches of before do not keep it unfinished.
+        queue.purge().await.unwrap();
+        assert!(queue.is_finished().await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_migration_pauses_fetching() {
+        let services = crate::Services::in_memory();
+        let queue = services.open_request_queue(&StorageIdentifier::Default).await.unwrap();
+        queue.add_request("https://example.com/a", false).await.unwrap();
+
+        services.events.emit(crate::Event::Migrating);
+        services.events.wait_for_all_listeners_to_complete().await;
+        assert!(queue.fetch_next_request().await.unwrap().is_none());
+        assert_eq!(queue.stats().head_item_read_count, 0);
+        assert!(!queue.is_finished().await.unwrap());
     }
 
     #[tokio::test]

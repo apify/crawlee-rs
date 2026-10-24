@@ -196,7 +196,7 @@ impl Services {
             StorageKind::RequestQueue => {
                 let backend = self.storage.create_request_queue_backend(identifier).await?;
                 let info = backend.get_metadata().await?;
-                let queue = RequestQueue::from_backend(backend).with_cache_link(link);
+                let queue = RequestQueue::from_backend(backend).with_cache_link(link).with_events(&self.events);
                 (CachedStorage::RequestQueue(queue), (info.id, info.name))
             }
         };

@@ -59,6 +59,16 @@ impl NavigationSkippedError {
     }
 }
 
+/// A domain kept rate-limiting every request for longer than the request manager's
+/// `max_domain_stall`, and nothing else can be crawled: the crawl gives up rather than wait
+/// forever (`PersistentRateLimitError`, a `CriticalError` in JS). The domain's requests stay
+/// queued, so a later run can pick them up.
+#[derive(Debug, thiserror::Error)]
+#[error("Giving up: {reason}")]
+pub struct PersistentRateLimitError {
+    pub reason: String,
+}
+
 /// The request handler did not finish in time.
 #[derive(Debug, thiserror::Error)]
 #[error("requestHandler timed out after {secs} seconds.")]
@@ -98,7 +108,8 @@ impl ErrorKind {
             if cause.is::<RetryRequestError>() {
                 return ErrorKind::RetryRequest;
             }
-            if cause.is::<CriticalError>() || cause.is::<MissingRouteError>() {
+            if cause.is::<CriticalError>() || cause.is::<MissingRouteError>() || cause.is::<PersistentRateLimitError>()
+            {
                 return ErrorKind::Critical;
             }
             if cause.is::<RequestThrottledError>() {

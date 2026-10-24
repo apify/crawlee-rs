@@ -7,5 +7,6 @@ pub mod dataset;
 pub mod file_system;
 pub mod key_value_store;
 pub mod memory;
+pub mod request_list;
 pub mod request_loader;
 pub mod request_queue;

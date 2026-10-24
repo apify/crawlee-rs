@@ -20,15 +20,16 @@ pub mod timeout;
 pub use crate::autoscaling::{ConcurrencyOptions, ConcurrencySystem, LoadSignal, LoadSignalsOptions};
 pub use crate::context::{BasicContext, CrawlingContext};
 pub use crate::crawler::{
-    BasicCrawler, BasicCrawlerBuilder, BuildError, CrawlerOptions, StatusMessageCallback, StatusMessageInfo,
-    TaskLoopOptions, TaskLoopPredicate,
+    BasicCrawler, BasicCrawlerBuilder, BuildError, CrawlerOptions, HttpUrlListFetcher, StatusMessageCallback,
+    StatusMessageInfo, TaskLoopOptions, TaskLoopPredicate,
 };
 pub use crate::enqueue::{
     CrawlerAddRequestsOptions, EnqueueLinksOptions, EnqueueLinksResult, SkipReason, SkippedRequest,
     SkippedRequestCallback, skipped_request_callback,
 };
 pub use crate::errors::{
-    ErrorKind, MissingRouteError, MissingSessionError, NavigationSkippedError, RequestSkipped, SkipRequestError,
+    ErrorKind, MissingRouteError, MissingSessionError, NavigationSkippedError, PersistentRateLimitError,
+    RequestSkipped, SkipRequestError,
 };
 pub use crate::handler::{ErrorHandler, FnMiddleware, Identity, Middleware, RequestHandler, Then};
 pub use crate::proxy::{ProxyConfiguration, ProxyInfo, ProxySource};

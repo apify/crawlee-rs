@@ -19,6 +19,7 @@ bytes.workspace = true
 chrono.workspace = true
 crawlee-storage = { workspace = true, optional = true }
 crawlee-utils.workspace = true
+flate2.workspace = true
 indexmap.workspace = true
 parking_lot.workspace = true
 rand.workspace = true
