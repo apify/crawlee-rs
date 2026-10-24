@@ -181,8 +181,9 @@ impl Statistics {
         self.skipped.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Records the error of an attempt that will be retried. `requests_retries` counts finished
+    /// requests that needed retries instead (see [`record_success`](Self::record_success)).
     pub fn record_retry(&self, message: &str) {
-        self.retries.fetch_add(1, Ordering::Relaxed);
         *self.detail.lock().retry_errors.entry(error_group(message)).or_default() += 1;
     }
 
@@ -202,6 +203,9 @@ impl Statistics {
     }
 
     fn record_retries(&self, retry_count: u32) {
+        if retry_count > 0 {
+            self.retries.fetch_add(1, Ordering::Relaxed);
+        }
         let mut detail = self.detail.lock();
         let index = retry_count as usize;
         if detail.retry_histogram.len() <= index {
@@ -218,9 +222,9 @@ impl Statistics {
         self.failed.load(Ordering::Relaxed)
     }
 
-    /// Requests finished either way (skipped ones included).
+    /// Requests that succeeded or failed; skipped ones are not counted (`handledRequestsCount`).
     pub fn requests_finished(&self) -> u64 {
-        self.requests_succeeded() + self.requests_failed() + self.skipped.load(Ordering::Relaxed)
+        self.requests_succeeded() + self.requests_failed()
     }
 
     /// Runtime so far: until `finish()`, or until now while running. It spans every run of a

@@ -154,7 +154,8 @@ async fn retries_then_fails_and_rolls_back_writes() {
 
     assert_eq!(attempts.load(Ordering::SeqCst), 3, "1 attempt + 2 retries");
     assert_eq!(stats.requests_failed, 1);
-    assert_eq!(stats.requests_retries, 2);
+    // One finished request that needed retries, however many (`requestsRetries` of JS).
+    assert_eq!(stats.requests_retries, 1);
     assert_eq!(stats.retry_histogram, vec![0, 0, 1]);
 
     let failed = failed.lock().clone().unwrap();
@@ -324,6 +325,25 @@ async fn max_requests_per_crawl_is_respected() {
     let urls: Vec<String> = (0..20).map(|i| format!("https://a.dev/{i}")).collect();
     let stats = crawler.run(urls).await.unwrap();
     assert_eq!(stats.requests_succeeded, 5);
+}
+
+#[tokio::test]
+async fn skipped_requests_do_not_count_towards_max_requests_per_crawl() {
+    let crawler = BasicCrawler::builder()
+        .services(services())
+        .max_concurrency(1)
+        .max_requests_per_crawl(2)
+        .request_handler(|ctx: BasicContext| async move {
+            if ctx.request().url.ends_with("/skip") {
+                return Err(ctx.skip_request(None));
+            }
+            Ok(())
+        })
+        .build()
+        .unwrap();
+    let stats =
+        crawler.run(["https://a.dev/skip", "https://a.dev/1", "https://a.dev/2", "https://a.dev/3"]).await.unwrap();
+    assert_eq!((stats.requests_succeeded, stats.requests_skipped), (2, 1));
 }
 
 #[tokio::test]
