@@ -2,7 +2,6 @@
 
 use std::collections::HashSet;
 use std::ops::{Deref, DerefMut};
-use std::str::FromStr as _;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -133,16 +132,33 @@ pub struct ContentType {
 }
 
 impl ContentType {
-    fn parse(headers: &HeaderMap) -> ContentType {
-        headers
-            .get(http::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| mime::Mime::from_str(value).ok())
-            .map(|mime| ContentType {
-                mime: mime.essence_str().to_ascii_lowercase(),
-                charset: mime.get_param(mime::CHARSET).map(|charset| charset.as_str().to_owned()),
+    /// The content type of a response (`parseContentTypeFromResponse`): from a valid
+    /// `Content-Type` header, else from the extension of the URL's path, else
+    /// `application/octet-stream` (RFC 7231, section 3.1.1.5). As `mime.contentType` does, a type
+    /// guessed from the extension gets the charset `utf-8` when it is text.
+    pub fn from_response(headers: &HeaderMap, url: &Url) -> ContentType {
+        // Repeated headers are read joined by ", ", as the Fetch API joins them.
+        let header = headers
+            .get_all(http::header::CONTENT_TYPE)
+            .iter()
+            .map(|value| value.as_bytes().iter().map(|&byte| byte as char).collect::<String>())
+            .collect::<Vec<_>>()
+            .join(", ");
+        if !header.is_empty() {
+            let parsed = parse_content_type(&header);
+            if is_type_valid(&parsed.mime) {
+                return parsed;
+            }
+        }
+        let extension = extname(url.path()).get(1..).unwrap_or_default().to_ascii_lowercase();
+        let (mime, charset) = crate::mime_types::EXTENSIONS
+            .binary_search_by(|(known, _, _)| (*known).cmp(extension.as_str()))
+            .map(|index| {
+                let (_, mime, charset) = crate::mime_types::EXTENSIONS[index];
+                (mime, charset)
             })
-            .unwrap_or_else(|| ContentType { mime: "application/octet-stream".to_owned(), charset: None })
+            .unwrap_or(("application/octet-stream", Some("utf-8")));
+        ContentType { mime: mime.to_owned(), charset: charset.map(str::to_owned) }
     }
 
     pub fn is_html_or_xml(&self) -> bool {
@@ -155,6 +171,127 @@ impl ContentType {
 
     pub fn is_json(&self) -> bool {
         self.mime == MIME_JSON || self.mime.ends_with("+json")
+    }
+}
+
+fn is_ows(c: char) -> bool {
+    c == ' ' || c == '\t'
+}
+
+fn is_token_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c)
+}
+
+/// A type as RFC 9110 allows it: two tokens around one `/` (`isTypeValid`).
+fn is_type_valid(mime: &str) -> bool {
+    match mime.split_once('/') {
+        Some((kind, subtype)) => {
+            !kind.is_empty() && !subtype.is_empty() && kind.chars().chain(subtype.chars()).all(is_token_char)
+        }
+        None => false,
+    }
+}
+
+/// Parses a `Content-Type` header as the `content-type` package (v3) does: the type
+/// lower-cased, unparsable parameters skipped, the first `charset` kept.
+fn parse_content_type(header: &str) -> ContentType {
+    let (kind, parameters) = match header.split_once(';') {
+        Some((kind, parameters)) => (kind, Some(parameters)),
+        None => (header, None),
+    };
+    let mime = kind.trim_matches(is_ows).to_lowercase();
+    let charset = parameters.and_then(|parameters| {
+        parse_parameters(&parameters.chars().collect::<Vec<_>>()).find(|(key, _)| key == "charset").map(|(_, v)| v)
+    });
+    ContentType { mime, charset }
+}
+
+/// The `key=value` parameters after the type, in order: keys lower-cased, quoted values
+/// unescaped, entries without `=` and unterminated quotes skipped.
+fn parse_parameters(chars: &[char]) -> impl Iterator<Item = (String, String)> + '_ {
+    let len = chars.len();
+    let mut index = 0;
+    std::iter::from_fn(move || {
+        'parameter: while index < len {
+            while index < len && is_ows(chars[index]) {
+                index += 1;
+            }
+            let key_start = index;
+            let mut key_whitespace = None;
+            while index < len {
+                match chars[index] {
+                    ';' => {
+                        index += 1;
+                        continue 'parameter;
+                    }
+                    '=' => {
+                        let key: String = chars[key_start..key_whitespace.unwrap_or(index)].iter().collect();
+                        index += 1;
+                        while index < len && is_ows(chars[index]) {
+                            index += 1;
+                        }
+                        let value = if index < len && chars[index] == '"' {
+                            index += 1;
+                            let mut value = String::new();
+                            loop {
+                                match chars.get(index) {
+                                    None => return None,
+                                    Some('"') => break,
+                                    Some('\\') if index + 1 < len => {
+                                        value.push(chars[index + 1]);
+                                        index += 2;
+                                    }
+                                    Some(&c) => {
+                                        value.push(c);
+                                        index += 1;
+                                    }
+                                }
+                            }
+                            // Whatever follows the closing quote, up to the next `;`, is dropped.
+                            while index < len && chars[index] != ';' {
+                                index += 1;
+                            }
+                            value
+                        } else {
+                            let value_start = index;
+                            let mut value_whitespace = None;
+                            while index < len && chars[index] != ';' {
+                                if is_ows(chars[index]) {
+                                    value_whitespace.get_or_insert(index);
+                                } else {
+                                    value_whitespace = None;
+                                }
+                                index += 1;
+                            }
+                            chars[value_start..value_whitespace.unwrap_or(index)].iter().collect()
+                        };
+                        index += 1;
+                        return Some((key.to_lowercase(), value));
+                    }
+                    c => {
+                        if is_ows(c) {
+                            key_whitespace.get_or_insert(index);
+                        } else {
+                            key_whitespace = None;
+                        }
+                        index += 1;
+                    }
+                }
+            }
+        }
+        None
+    })
+}
+
+/// The extension of the last segment of `path`, dot included, as Node's `path.extname` gives it:
+/// trailing slashes are ignored, and a leading dot (`.htaccess`) is no extension.
+fn extname(path: &str) -> &str {
+    let base = path.trim_end_matches('/');
+    let base = &base[base.rfind('/').map_or(0, |slash| slash + 1)..];
+    match base.rfind('.') {
+        Some(0) | None => "",
+        Some(_) if base == ".." => "",
+        Some(dot) => &base[dot..],
     }
 }
 
@@ -479,7 +616,7 @@ impl Middleware<BasicContext> for HttpPipeline {
         let request_url = ctx.request().url.clone();
 
         // `abortDownloadOfBody`, then the user's hooks: all before the body is read.
-        let content_type = ContentType::parse(&response.headers);
+        let content_type = ContentType::from_response(&response.headers, &response.url);
         self.check_content_type(&request_url, status, &content_type)?;
         for hook in &self.options.post_navigation_hooks {
             hook(&ctx, &response)?;
@@ -576,5 +713,56 @@ impl HttpCrawler {
     pub fn builder_with_options(options: HttpCrawlerOptions) -> BasicCrawlerBuilder<HttpPipeline> {
         BasicCrawlerBuilder::with_pipeline(HttpPipeline::new(options))
             .concurrency_options(ConcurrencyOptions::http_optimized())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn content_type(header: Option<&str>, url: &str) -> (String, Option<String>) {
+        let mut headers = HeaderMap::new();
+        if let Some(header) = header {
+            headers.insert(http::header::CONTENT_TYPE, header.parse().unwrap());
+        }
+        let parsed = ContentType::from_response(&headers, &Url::parse(url).unwrap());
+        (parsed.mime, parsed.charset)
+    }
+
+    fn pair(mime: &str, charset: Option<&str>) -> (String, Option<String>) {
+        (mime.to_owned(), charset.map(str::to_owned))
+    }
+
+    /// Parsed like the `content-type` package (v3): the type lower-cased, unparsable parameters
+    /// skipped, the first charset kept.
+    #[test]
+    fn the_header_is_parsed_leniently() {
+        let url = "https://a.test/page.json";
+        assert_eq!(content_type(Some("TEXT/HTML ; Charset=ISO-8859-2"), url), pair("text/html", Some("ISO-8859-2")));
+        assert_eq!(content_type(Some("text/html; foo"), url), pair("text/html", None));
+        assert_eq!(content_type(Some(r#"text/html;;charset="x""#), url), pair("text/html", Some("x")));
+        assert_eq!(content_type(Some("text/html; charset=a; charset=b"), url), pair("text/html", Some("a")));
+    }
+
+    /// Without a valid `Content-Type`, the type comes from the extension of the URL's path, as
+    /// `mime.contentType(extname(pathname))` gives it (`parseContentTypeFromResponse`).
+    #[test]
+    fn without_a_valid_header_the_extension_decides() {
+        assert_eq!(content_type(None, "https://a.test/a/page.HTML?x=1"), pair("text/html", Some("utf-8")));
+        assert_eq!(content_type(Some("garbage"), "https://a.test/data.json"), pair("application/json", Some("utf-8")));
+        assert_eq!(content_type(None, "https://a.test/feed.xml"), pair("application/xml", None));
+        assert_eq!(content_type(None, "https://a.test/archive.tar.gz"), pair("application/gzip", None));
+        assert_eq!(content_type(None, "https://a.test/dir.html/"), pair("text/html", Some("utf-8")), "as path.extname");
+        let fallback = pair("application/octet-stream", Some("utf-8"));
+        for url in ["https://a.test/", "https://a.test/.html", "https://a.test/x.unknownext", "https://a.test/a."] {
+            assert_eq!(content_type(None, url), fallback, "{url}");
+        }
+    }
+
+    #[test]
+    fn the_extension_table_is_sorted() {
+        let table = crate::mime_types::EXTENSIONS;
+        assert!(table.windows(2).all(|pair| pair[0].0 < pair[1].0));
+        assert!(table.len() > 1000);
     }
 }

@@ -30,6 +30,13 @@ fn endless(content_type: &'static str) -> impl IntoResponse {
     )
 }
 
+/// A response without a `Content-Type` header.
+fn untyped(body: &'static str) -> axum::response::Response {
+    let mut response = Body::from(body).into_response();
+    response.headers_mut().remove(header::CONTENT_TYPE);
+    response
+}
+
 async fn serve(hits: Arc<AtomicUsize>) -> SocketAddr {
     let counted = move |response: axum::response::Response| {
         hits.fetch_add(1, Ordering::SeqCst);
@@ -58,7 +65,8 @@ async fn serve(hits: Arc<AtomicUsize>) -> SocketAddr {
             }),
         )
         .route("/forbidden", route(|| (StatusCode::FORBIDDEN, Html("<p>no</p>")).into_response()))
-        .route("/ok", route(|| Html("<title>ok</title>").into_response()));
+        .route("/ok", route(|| Html("<title>ok</title>").into_response()))
+        .route("/untyped/{name}", route(|| untyped("<title>untyped</title>")));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -252,4 +260,14 @@ async fn query_selectors_fail_when_nothing_matches() {
             "missing_one": "Selector 'h1' not found.",
         })
     );
+}
+
+/// A page served without a `Content-Type` is typed by the extension of its URL.
+#[tokio::test]
+async fn without_a_content_type_the_url_extension_decides() {
+    let (failed, hits) = crawl(options(), 0, &["/untyped/page.html", "/untyped/blob.bin"]).await;
+    assert_eq!(hits, 2);
+    assert_eq!(failed.len(), 1, "{failed:?}");
+    assert_eq!(failed[0].0, "/untyped/blob.bin");
+    assert!(failed[0].1[0].contains("served Content-Type application/octet-stream"), "{failed:?}");
 }

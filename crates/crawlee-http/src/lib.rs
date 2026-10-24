@@ -8,6 +8,7 @@
 pub mod body;
 pub mod html;
 pub mod http;
+mod mime_types;
 
 pub use crate::html::{Document, Element, HtmlContext, HtmlCrawler, HtmlLayer, HtmlPipeline, Selection, SelectorError};
 pub use crate::http::{ContentType, HttpContext, HttpCrawler, HttpCrawlerOptions, HttpPipeline};
