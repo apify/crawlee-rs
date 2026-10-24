@@ -59,6 +59,27 @@ pub struct StatusMessage {
     pub level: StatusLevel,
 }
 
+/// How a run ends: what [`Event::Exit`] carries (the `ExitOptions` of `Actor.exit()` in the
+/// Apify SDK for JS, which emits the event with them, its defaults applied).
+#[derive(Clone, Debug, PartialEq)]
+pub struct ExitOptions {
+    /// The last status message of the run.
+    pub status_message: Option<String>,
+    /// The exit code of the process, 0 by default.
+    pub exit_code: i32,
+    /// Whether the process exits, `true` by default.
+    pub exit: bool,
+    /// How long the listeners have to finish before the process exits anyway (`timeoutSecs`),
+    /// 30 s by default.
+    pub timeout: Duration,
+}
+
+impl Default for ExitOptions {
+    fn default() -> Self {
+        ExitOptions { status_message: None, exit_code: 0, exit: true, timeout: Duration::from_secs(30) }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 #[non_exhaustive]
 pub enum Event {
@@ -71,7 +92,8 @@ pub enum Event {
     Migrating,
     /// The run is being aborted; crawlers pause and persist.
     Aborting,
-    Exit,
+    /// The process is about to exit, as described by the options.
+    Exit(ExitOptions),
     StatusMessage(StatusMessage),
     /// An event crawlee-rs does not model, such as one of the platform events an Apify SDK
     /// relays. Listeners of [`EventKind::Custom`] get all of them and match on `name`.
@@ -88,7 +110,7 @@ impl Event {
             Event::SystemInfo(_) => EventKind::SystemInfo,
             Event::Migrating => EventKind::Migrating,
             Event::Aborting => EventKind::Aborting,
-            Event::Exit => EventKind::Exit,
+            Event::Exit(_) => EventKind::Exit,
             Event::StatusMessage(_) => EventKind::StatusMessage,
             Event::Custom { .. } => EventKind::Custom,
         }
@@ -361,6 +383,28 @@ mod tests {
         events.close().await;
         assert_eq!(persisted.load(Ordering::SeqCst), 2, "close() waits for the final PersistState");
         assert!(!events.is_initialized());
+    }
+
+    #[tokio::test]
+    async fn the_exit_event_carries_the_exit_options() {
+        let events = EventManager::new(Duration::from_secs(60));
+        let seen = Arc::new(parking_lot::Mutex::new(None));
+        let log = seen.clone();
+        events.on(EventKind::Exit, move |event| {
+            if let Event::Exit(options) = event {
+                *log.lock() = Some(options);
+            }
+            async {}
+        });
+
+        assert_eq!(
+            ExitOptions::default(),
+            ExitOptions { status_message: None, exit_code: 0, exit: true, timeout: Duration::from_secs(30) }
+        );
+        let options = ExitOptions { status_message: Some("Failed".into()), exit_code: 1, ..ExitOptions::default() };
+        events.emit(Event::Exit(options.clone()));
+        events.wait_for_all_listeners_to_complete().await;
+        assert_eq!(seen.lock().clone(), Some(options));
     }
 
     #[tokio::test(start_paused = true)]

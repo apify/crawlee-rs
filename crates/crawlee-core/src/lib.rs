@@ -16,7 +16,7 @@ pub use crate::errors::{
     CriticalError, NonRetryableError, RequestThrottledError, RetryRequestError, SessionError, StateValidationError,
     StorageError, StorageResult,
 };
-pub use crate::events::{Event, EventKind, EventManager, StatusLevel, StatusMessage};
+pub use crate::events::{Event, EventKind, EventManager, ExitOptions, StatusLevel, StatusMessage};
 pub use crate::recoverable_state::{PersistedState, RecoverableState, SerdeState};
 pub use crate::request::{Request, RequestBuilder};
 pub use crate::services::Services;
