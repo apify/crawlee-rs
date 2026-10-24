@@ -21,7 +21,7 @@ pub use crate::recoverable_state::{PersistedState, RecoverableState, SerdeState}
 pub use crate::request::{Request, RequestBuilder};
 pub use crate::services::Services;
 pub use crate::storage::backend::{StorageBackend, StorageIdentifier};
-pub use crate::storage::dataset::{Dataset, DatasetStats};
+pub use crate::storage::dataset::{Dataset, DatasetExportOptions, DatasetStats};
 #[cfg(feature = "fs-storage")]
 pub use crate::storage::file_system::FileSystemStorageBackend;
 pub use crate::storage::key_value_store::{KeyValueStore, KeyValueStoreStats, RecordValue};

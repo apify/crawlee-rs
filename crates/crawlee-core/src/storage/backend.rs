@@ -85,13 +85,26 @@ pub struct RequestQueueInfo {
     pub pending_request_count: u64,
 }
 
-/// Offset pagination for [`DatasetBackend::get_data`].
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Options of [`DatasetBackend::get_data`] (`DatasetDataOptions` in JS): offset pagination, and
+/// item transformations that a backend applies if it can. The Apify platform does; the in-memory
+/// and file-system backends ignore them, as in JS.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct DatasetListOptions {
     pub offset: usize,
     /// `None` means no limit.
     pub limit: Option<usize>,
     pub desc: bool,
+    /// Only these fields of each item, in this order.
+    pub fields: Option<Vec<String>>,
+    /// The field to unwind: an array becomes one item per element, an object is merged into
+    /// the item.
+    pub unwind: Option<String>,
+    /// Shortcut for `skip_hidden` and `skip_empty`.
+    pub clean: bool,
+    /// Leaves out the fields whose names start with `#`.
+    pub skip_hidden: bool,
+    /// Leaves out empty items (a page can then hold fewer items than the limit).
+    pub skip_empty: bool,
 }
 
 /// One page of dataset items.

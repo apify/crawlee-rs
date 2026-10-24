@@ -209,8 +209,7 @@ These are planned in this order, following `docs/plan.md`:
 1. **Remaining request sources and options:**
    - `RequestList`;
    - `extend_context`, `extend_timeout`, `skip_navigation` in `HttpCrawler`;
-   - the `stalled` readiness state of throttling;
-   - CSV export.
+   - the `stalled` readiness state of throttling.
 2. **Side-by-side crawl comparison** (level 3 of the conformance plan): the same crawl run by
    both implementations against the fixture server, comparing their outputs. Today the two are
    compared function by function (golden files) and by benchmark.
