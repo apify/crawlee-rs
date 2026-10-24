@@ -353,12 +353,14 @@ impl BasicContext {
         self.scope.shared.record_domain_rate_limit(url, wait)
     }
 
-    /// Sends an HTTP request with this request's session (cookies and proxy).
+    /// Sends an HTTP request with this request's session (cookies, proxy and fingerprint).
     pub async fn send_request(&self, request: HttpRequest) -> Result<HttpResponse, HttpClientError> {
         let options = SendOptions {
             proxy_url: self.proxy_info().map(|proxy| proxy.url.clone()),
             cookie_jar: self.session().map(|session| session.cookie_jar().clone()),
             timeout: Some(self.scope.shared.send_request_timeout),
+            ignore_tls_errors: self.proxy_info().is_some_and(|proxy| proxy.ignore_tls_errors),
+            fingerprint: self.session().and_then(|session| session.fingerprint_handle().cloned()),
             ..Default::default()
         };
         self.scope.shared.http_client.send_request(request, &options).await

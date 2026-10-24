@@ -201,11 +201,11 @@ impl<'a> Element<'a> {
 // ---------------------------------------------------------------------------------------------
 
 /// The context of [`HtmlCrawler`]: the HTTP context plus a lazily parsed [`Document`].
+///
+/// The document is parsed on first use, on the blocking pool. `scraper` is built with atomic
+/// tendrils, so the document is `Send` and can move between the pool and this context.
 pub struct HtmlContext {
     http: HttpContext,
-    /// Parsed on first use, on the blocking pool. `scraper` is built with atomic tendrils, so the
-    /// document is `Send` and can move between the pool and this context.
-    document: Arc<Mutex<Option<Document>>>,
 }
 
 impl std::fmt::Debug for HtmlContext {
@@ -236,7 +236,7 @@ impl CrawlingContext for HtmlContext {
     }
 }
 
-fn with_document<R>(body: &Body, slot: &Mutex<Option<Document>>, f: impl FnOnce(&Document) -> R) -> R {
+pub(crate) fn with_document<R>(body: &Body, slot: &Mutex<Option<Document>>, f: impl FnOnce(&Document) -> R) -> R {
     let mut slot = slot.lock();
     let document = slot.get_or_insert_with(|| Document::parse(body.text()));
     f(document)
@@ -260,15 +260,13 @@ impl HtmlContext {
         F: FnOnce(&Document) -> R + Send + 'static,
         R: Send + 'static,
     {
-        let body = self.http.body_handle().clone();
-        let slot = self.document.clone();
-        Ok(tokio::task::spawn_blocking(move || with_document(&body, &slot, f)).await?)
+        self.http.with_document(f).await
     }
 
     /// Like [`with_html`](Self::with_html), but on the current thread. Fine for small pages;
     /// large documents are better parsed with `with_html`.
     pub fn with_html_inline<R>(&self, f: impl FnOnce(&Document) -> R) -> R {
-        with_document(self.http.body_handle(), &self.document, f)
+        with_document(self.http.body_handle(), self.http.document_slot(), f)
     }
 
     /// Absolute URLs of the `href`s of elements matching `selector` (default `a`), honoring
@@ -323,7 +321,7 @@ pub struct HtmlLayer;
 impl Middleware<HttpContext> for HtmlLayer {
     type Out = HtmlContext;
     async fn run(&self, http: HttpContext) -> anyhow::Result<HtmlContext> {
-        Ok(HtmlContext { http, document: Arc::new(Mutex::new(None)) })
+        Ok(HtmlContext { http })
     }
 }
 
