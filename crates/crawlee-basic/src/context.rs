@@ -10,6 +10,7 @@ use serde::de::DeserializeOwned;
 use tokio::sync::Notify;
 
 use crawlee_core::storage::backend::BatchAddRequestsResult;
+use crawlee_core::storage::batched_adds::AddRequestsBatchedOptions;
 use crawlee_core::{
     Dataset, KeyValueStore, PacingScope, PacingSignal, Request, RequestManager, SerdeState, Services,
     StorageTransaction,
@@ -309,9 +310,16 @@ impl BasicContext {
         if requests.is_empty() {
             return Ok(BatchAddRequestsResult::default());
         }
-        let result = self.scope.shared.request_manager.add_requests(requests, false).await?;
+        // In batches, as `crawler.addRequests()`: only more than 1000 requests are added partly in
+        // the background, and the result has the first 1000.
+        let result = self
+            .scope
+            .shared
+            .request_manager
+            .add_requests_batched(requests, AddRequestsBatchedOptions::default())
+            .await?;
         self.notify_requests_added();
-        Ok(result)
+        Ok(BatchAddRequestsResult { processed_requests: result.added_requests, ..Default::default() })
     }
 
     /// Wakes the task loop if it is waiting for requests.

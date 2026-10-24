@@ -7,6 +7,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use super::backend::{BatchAddRequestsResult, QueueOperationInfo};
+use super::batched_adds::{AddRequestsBatchedOptions, AddRequestsBatchedResult};
 use super::request_queue::RequestManager;
 use crate::errors::StorageResult;
 use crate::request::Request;
@@ -82,6 +83,14 @@ impl RequestManagerTandem {
 impl RequestManager for RequestManagerTandem {
     async fn add_requests(&self, requests: Vec<Request>, forefront: bool) -> StorageResult<BatchAddRequestsResult> {
         self.manager.add_requests(requests, forefront).await
+    }
+
+    async fn add_requests_batched(
+        &self,
+        requests: Vec<Request>,
+        options: AddRequestsBatchedOptions,
+    ) -> StorageResult<AddRequestsBatchedResult> {
+        self.manager.add_requests_batched(requests, options).await
     }
 
     async fn fetch_next_request(&self) -> StorageResult<Option<Request>> {

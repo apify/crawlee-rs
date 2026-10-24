@@ -10,6 +10,9 @@ use super::backend::{
     BatchAddRequestsResult, ProcessedRequest, QueueOperationInfo, RequestQueueBackend, RequestQueueInfo,
     StorageBackend, StorageIdentifier,
 };
+use super::batched_adds::{
+    AddRequestsBatchedOptions, AddRequestsBatchedResult, InProgressBatches, drain_request_batches,
+};
 use crate::errors::StorageResult;
 use crate::request::{Request, unique_key_to_request_id};
 
@@ -18,6 +21,19 @@ use crate::request::{Request, unique_key_to_request_id};
 #[async_trait]
 pub trait RequestManager: Send + Sync {
     async fn add_requests(&self, requests: Vec<Request>, forefront: bool) -> StorageResult<BatchAddRequestsResult>;
+    /// Adds the requests in batches: the first before returning, the rest in the background
+    /// (`addRequestsBatched`). A manager that does not batch adds them all at once.
+    async fn add_requests_batched(
+        &self,
+        requests: Vec<Request>,
+        options: AddRequestsBatchedOptions,
+    ) -> StorageResult<AddRequestsBatchedResult> {
+        let added = self.add_requests(requests, options.forefront).await?;
+        Ok(AddRequestsBatchedResult {
+            added_requests: added.processed_requests,
+            wait_for_all_requests_to_be_added: None,
+        })
+    }
     async fn fetch_next_request(&self) -> StorageResult<Option<Request>>;
     async fn mark_request_as_handled(&self, request: &mut Request) -> StorageResult<Option<QueueOperationInfo>>;
     async fn reclaim_request(&self, request: &Request, forefront: bool) -> StorageResult<Option<QueueOperationInfo>>;
@@ -87,6 +103,7 @@ impl DedupCache {
 pub struct RequestQueue {
     backend: Arc<dyn RequestQueueBackend>,
     added: Arc<Mutex<DedupCache>>,
+    in_progress_batches: InProgressBatches,
 }
 
 impl std::fmt::Debug for RequestQueue {
@@ -101,7 +118,11 @@ impl RequestQueue {
     }
 
     pub fn from_backend(backend: Arc<dyn RequestQueueBackend>) -> Self {
-        RequestQueue { backend, added: Arc::new(Mutex::new(DedupCache { slots: None })) }
+        RequestQueue {
+            backend,
+            added: Arc::new(Mutex::new(DedupCache { slots: None })),
+            in_progress_batches: InProgressBatches::default(),
+        }
     }
 
     pub fn backend(&self) -> &Arc<dyn RequestQueueBackend> {
@@ -175,6 +196,32 @@ impl RequestManager for RequestQueue {
         Ok(result)
     }
 
+    async fn add_requests_batched(
+        &self,
+        requests: Vec<Request>,
+        options: AddRequestsBatchedOptions,
+    ) -> StorageResult<AddRequestsBatchedResult> {
+        let queue = self.clone();
+        let forefront = options.forefront;
+        drain_request_batches(requests, &options, &self.in_progress_batches, move |chunk, _is_initial| {
+            let queue = queue.clone();
+            async move {
+                let added = queue.add_requests(chunk, forefront).await?;
+                // What the backend reports as unprocessed is a rejection, not a transient failure
+                // (the backend retries those): warned about and skipped.
+                if !added.unprocessed_requests.is_empty() {
+                    tracing::warn!(
+                        unprocessed_requests = ?added.unprocessed_requests,
+                        "Some requests were rejected by the request queue and will be skipped. This usually means \
+                         the request data is malformed (e.g. an invalid 'userData' shape)."
+                    );
+                }
+                Ok(added.processed_requests)
+            }
+        })
+        .await
+    }
+
     async fn fetch_next_request(&self) -> StorageResult<Option<Request>> {
         self.backend.fetch_next_request().await
     }
@@ -195,6 +242,10 @@ impl RequestManager for RequestQueue {
     }
 
     async fn is_finished(&self) -> StorageResult<bool> {
+        // Not finished while requests are still being added in the background.
+        if self.in_progress_batches.any() {
+            return Ok(false);
+        }
         self.backend.is_finished().await
     }
 
@@ -210,6 +261,7 @@ impl RequestManager for RequestQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::batched_adds::AddRequestsBatchedOptions;
     use crate::storage::memory::MemoryStorageBackend;
 
     #[tokio::test]
@@ -228,6 +280,66 @@ mod tests {
         assert!(request.handled_at.is_some());
         assert!(queue.is_finished().await.unwrap());
         assert_eq!(queue.handled_count().await.unwrap(), 1);
+    }
+
+    fn urls(count: usize) -> Vec<Request> {
+        (0..count).map(|i| Request::from(format!("https://example.com/{i}"))).collect()
+    }
+
+    #[tokio::test]
+    async fn batched_adds_return_after_the_first_batch_and_keep_the_queue_unfinished() {
+        let storage = MemoryStorageBackend::new();
+        let queue = RequestQueue::open(&storage, &StorageIdentifier::Default).await.unwrap();
+        let options = AddRequestsBatchedOptions {
+            batch_size: 10,
+            wait_between_batches: Duration::from_millis(50),
+            ..Default::default()
+        };
+
+        let result = queue.add_requests_batched(urls(25), options).await.unwrap();
+        assert_eq!(result.added_requests.len(), 10);
+        let remainder = result.wait_for_all_requests_to_be_added.expect("background batches");
+
+        // While batches are still being added, the queue is not finished, even when nothing is
+        // pending or in progress.
+        while let Some(mut request) = queue.fetch_next_request().await.unwrap() {
+            queue.mark_request_as_handled(&mut request).await.unwrap();
+        }
+        assert!(!queue.is_finished().await.unwrap());
+
+        assert_eq!(remainder.await.unwrap().unwrap().len(), 15);
+        while let Some(mut request) = queue.fetch_next_request().await.unwrap() {
+            queue.mark_request_as_handled(&mut request).await.unwrap();
+        }
+        assert!(queue.is_finished().await.unwrap());
+        assert_eq!(queue.handled_count().await.unwrap(), 25);
+    }
+
+    #[tokio::test]
+    async fn batched_adds_can_wait_for_every_batch() {
+        let storage = MemoryStorageBackend::new();
+        let queue = RequestQueue::open(&storage, &StorageIdentifier::Default).await.unwrap();
+        let options = AddRequestsBatchedOptions {
+            batch_size: 10,
+            wait_between_batches: Duration::ZERO,
+            wait_for_all_requests_to_be_added: true,
+            ..Default::default()
+        };
+
+        let result = queue.add_requests_batched(urls(25), options).await.unwrap();
+        assert_eq!(result.added_requests.len(), 25);
+        assert!(result.wait_for_all_requests_to_be_added.is_none());
+        assert_eq!(queue.get_info().await.unwrap().total_request_count, 25);
+    }
+
+    #[tokio::test]
+    async fn a_single_batch_adds_nothing_in_the_background() {
+        let storage = MemoryStorageBackend::new();
+        let queue = RequestQueue::open(&storage, &StorageIdentifier::Default).await.unwrap();
+
+        let result = queue.add_requests_batched(urls(5), AddRequestsBatchedOptions::default()).await.unwrap();
+        assert_eq!(result.added_requests.len(), 5);
+        assert!(result.wait_for_all_requests_to_be_added.is_none());
     }
 
     /// A backend that records the unique keys of each batch it gets, as the Apify platform sees them

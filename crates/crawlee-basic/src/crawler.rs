@@ -10,7 +10,7 @@ use tokio::sync::{Notify, OnceCell};
 use tokio::task::JoinSet;
 use tracing::Instrument as _;
 
-use crawlee_core::storage::backend::BatchAddRequestsResult;
+use crawlee_core::storage::batched_adds::{AddRequestsBatchedOptions, AddRequestsBatchedResult};
 use crawlee_core::{
     Dataset, Event, EventKind, KeyValueStore, PacingScope, PacingSignal, RecoverableState, Request, RequestManager,
     SerdeState, Services, StatusLevel, StatusMessage, StorageIdentifier,
@@ -452,15 +452,31 @@ where
             .await
     }
 
-    /// Adds requests to the crawler's queue.
-    pub async fn add_requests<I, R>(&self, requests: I) -> anyhow::Result<BatchAddRequestsResult>
+    /// Adds requests to the crawler's queue in batches, as `crawler.addRequests()` in Crawlee for
+    /// JS: the first 1000 before returning, the rest in the background, 1000 at a time with a pause
+    /// of 1 s after each. The crawler is not finished while they are being added.
+    pub async fn add_requests<I, R>(&self, requests: I) -> anyhow::Result<AddRequestsBatchedResult>
+    where
+        I: IntoIterator<Item = R>,
+        R: Into<Request>,
+    {
+        self.add_requests_with_options(requests, AddRequestsBatchedOptions::default()).await
+    }
+
+    /// [`add_requests`](Self::add_requests) with other batching options, or at the front of the
+    /// queue.
+    pub async fn add_requests_with_options<I, R>(
+        &self,
+        requests: I,
+        options: AddRequestsBatchedOptions,
+    ) -> anyhow::Result<AddRequestsBatchedResult>
     where
         I: IntoIterator<Item = R>,
         R: Into<Request>,
     {
         let shared = self.shared().await?;
         let requests: Vec<Request> = requests.into_iter().map(Into::into).collect();
-        let result = shared.request_manager.add_requests(requests, false).await?;
+        let result = shared.request_manager.add_requests_batched(requests, options).await?;
         shared.requests_added.notify_one();
         Ok(result)
     }

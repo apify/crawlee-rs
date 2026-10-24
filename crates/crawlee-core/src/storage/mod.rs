@@ -1,6 +1,7 @@
 //! Storages and the storage backend contract.
 
 pub mod backend;
+pub mod batched_adds;
 pub mod dataset;
 #[cfg(feature = "fs-storage")]
 pub mod file_system;
