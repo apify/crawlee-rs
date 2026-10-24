@@ -18,7 +18,8 @@ use url::Url;
 
 use crawlee_basic::timeout::TimeoutWindow;
 use crawlee_basic::{
-    BasicContext, BasicCrawlerBuilder, ConcurrencyOptions, CrawlingContext, Middleware, RequestSkipped,
+    BasicContext, BasicCrawlerBuilder, ConcurrencyOptions, CrawlingContext, Middleware, NavigationSkippedError,
+    RequestSkipped,
 };
 use crawlee_core::errors::{NonRetryableError, RequestThrottledError, SessionError};
 use crawlee_http_client::{HttpClientError, HttpRequest, SendOptions, StreamingResponse};
@@ -355,23 +356,33 @@ fn extname(path: &str) -> &str {
 /// The context of [`HttpCrawler`]: the basic context plus the response.
 pub struct HttpContext {
     basic: BasicContext,
+    /// `None` when the request has `skip_navigation`.
+    response: Option<Response>,
+    /// The parsed document, once something asked for it.
+    document: Arc<Mutex<Option<Document>>>,
+}
+
+/// The response the handler gets.
+struct Response {
     status: StatusCode,
     headers: HeaderMap,
     url: Url,
     redirects: Vec<Url>,
     content_type: ContentType,
     body: Arc<Body>,
-    /// The parsed document, once something asked for it.
-    document: Arc<Mutex<Option<Document>>>,
 }
 
 impl std::fmt::Debug for HttpContext {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("HttpContext")
-            .field("url", &self.url.as_str())
-            .field("status", &self.status)
-            .field("content_type", &self.content_type)
-            .finish_non_exhaustive()
+        let mut debug = f.debug_struct("HttpContext");
+        match &self.response {
+            Some(response) => debug
+                .field("url", &response.url.as_str())
+                .field("status", &response.status)
+                .field("content_type", &response.content_type),
+            None => debug.field("navigation_skipped", &true),
+        };
+        debug.finish_non_exhaustive()
     }
 }
 
@@ -397,34 +408,66 @@ impl CrawlingContext for HttpContext {
     }
 }
 
+/// The members that need the response panic when the request has `skip_navigation`, as their
+/// getters throw in Crawlee for JS; the crawler fails the request with a
+/// [`NavigationSkippedError`], without retries. The fallible ones return that error.
 impl HttpContext {
-    pub fn status(&self) -> StatusCode {
-        self.status
+    /// The response, or the error of a skipped navigation.
+    fn response(&self, member: &str) -> Result<&Response, NavigationSkippedError> {
+        self.response.as_ref().ok_or_else(|| NavigationSkippedError::new(member))
     }
 
+    #[track_caller]
+    fn navigated(&self, member: &str) -> &Response {
+        match &self.response {
+            Some(response) => response,
+            None => panic!("{}", NavigationSkippedError::new(member)),
+        }
+    }
+
+    /// Whether the request was not fetched (`skip_navigation`): the handler has no response.
+    pub fn is_navigation_skipped(&self) -> bool {
+        self.response.is_none()
+    }
+
+    /// # Panics
+    ///
+    /// When the navigation was skipped (see the type's documentation), like the other members of
+    /// the response.
+    #[track_caller]
+    pub fn status(&self) -> StatusCode {
+        self.navigated("status").status
+    }
+
+    #[track_caller]
     pub fn headers(&self) -> &HeaderMap {
-        &self.headers
+        &self.navigated("headers").headers
     }
 
     /// The URL the body came from, after redirects (also stored as `request.loaded_url`).
+    #[track_caller]
     pub fn url(&self) -> &Url {
-        &self.url
+        &self.navigated("url").url
     }
 
+    #[track_caller]
     pub fn redirects(&self) -> &[Url] {
-        &self.redirects
+        &self.navigated("redirects").redirects
     }
 
+    #[track_caller]
     pub fn content_type(&self) -> &ContentType {
-        &self.content_type
+        &self.navigated("content_type").content_type
     }
 
+    #[track_caller]
     pub fn body(&self) -> &Bytes {
-        self.body.bytes()
+        self.navigated("body").body.bytes()
     }
 
+    #[track_caller]
     pub fn body_handle(&self) -> &Arc<Body> {
-        &self.body
+        &self.navigated("body_handle").body
     }
 
     /// The parsed document, shared with [`HtmlContext`](crate::HtmlContext).
@@ -439,15 +482,7 @@ impl HttpContext {
         F: for<'a> FnOnce(Selection<'a>) -> R + Send + 'static,
         R: Send + 'static,
     {
-        let selector = selector.to_owned();
-        self.with_document(move |document| -> anyhow::Result<R> {
-            let matches = document.select(&selector)?;
-            if matches.is_empty() {
-                anyhow::bail!("Selector '{selector}' not found.");
-            }
-            Ok(f(matches))
-        })
-        .await?
+        self.query("query_selector_all", selector, f).await
     }
 
     /// The first element matching `selector`, handed to `f` (`querySelectorOne`). Fails like
@@ -457,34 +492,52 @@ impl HttpContext {
         F: for<'a> FnOnce(Element<'a>) -> R + Send + 'static,
         R: Send + 'static,
     {
-        self.query_selector_all(selector, |matches| f(matches.first().expect("not empty"))).await
+        self.query("query_selector_one", selector, |matches| f(matches.first().expect("not empty"))).await
     }
 
     /// Fails unless an element matches `selector` (`waitForSelector`). The document of an HTTP
     /// response does not change, so there is nothing to wait for.
     pub async fn wait_for_selector(&self, selector: &str) -> anyhow::Result<()> {
-        self.query_selector_all(selector, |_| ()).await
+        self.query("wait_for_selector", selector, |_| ()).await
     }
 
-    /// Runs `f` with the parsed document (parsed once, on the blocking thread pool).
-    pub(crate) async fn with_document<R, F>(&self, f: F) -> anyhow::Result<R>
+    async fn query<R, F>(&self, member: &'static str, selector: &str, f: F) -> anyhow::Result<R>
+    where
+        F: for<'a> FnOnce(Selection<'a>) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let selector = selector.to_owned();
+        self.with_document(member, move |document| -> anyhow::Result<R> {
+            let matches = document.select(&selector)?;
+            if matches.is_empty() {
+                anyhow::bail!("Selector '{selector}' not found.");
+            }
+            Ok(f(matches))
+        })
+        .await?
+    }
+
+    /// Runs `f` with the parsed document (parsed once, on the blocking thread pool). Fails with a
+    /// [`NavigationSkippedError`] for `member` when there is no response.
+    pub(crate) async fn with_document<R, F>(&self, member: &'static str, f: F) -> anyhow::Result<R>
     where
         F: FnOnce(&Document) -> R + Send + 'static,
         R: Send + 'static,
     {
-        let body = self.body.clone();
+        let body = self.response(member)?.body.clone();
         let slot = self.document.clone();
         Ok(tokio::task::spawn_blocking(move || crate::html::with_document(&body, &slot, f)).await?)
     }
 
     /// The body decoded with the response's encoding. Valid UTF-8 is not copied.
+    #[track_caller]
     pub fn text(&self) -> &str {
-        self.body.text()
+        self.navigated("text").body.text()
     }
 
     /// Deserializes the body straight into `T` (no intermediate JSON tree).
     pub fn json<T: DeserializeOwned>(&self) -> anyhow::Result<T> {
-        Ok(serde_json::from_str(self.body.text())?)
+        Ok(serde_json::from_str(self.response("json")?.body.text())?)
     }
 }
 
@@ -617,9 +670,10 @@ impl HttpPipeline {
 
     /// `retryOnBlocked`: why the page looks blocked, if it does.
     async fn blocked_reason(&self, ctx: &HttpContext) -> anyhow::Result<Option<String>> {
-        if ctx.content_type.is_html_or_xml() {
+        let response = ctx.navigated("retry_on_blocked");
+        if response.content_type.is_html_or_xml() {
             let found = ctx
-                .with_document(|document| {
+                .with_document("retry_on_blocked", |document| {
                     RETRY_CSS_SELECTORS
                         .iter()
                         .filter(|selector| document.select(selector).is_ok_and(|matches| !matches.is_empty()))
@@ -631,7 +685,7 @@ impl HttpPipeline {
                 return Ok(Some(format!("Found selectors: {}", found.join(", "))));
             }
         }
-        let status = ctx.status.as_u16();
+        let status = response.status.as_u16();
         Ok(self.options.blocked_status_codes.contains(&status).then(|| format!("Blocked by status code {status}")))
     }
 
@@ -669,6 +723,12 @@ impl Middleware<BasicContext> for HttpPipeline {
     }
 
     async fn run(&self, mut ctx: BasicContext) -> anyhow::Result<HttpContext> {
+        // Nothing is fetched: the hooks and the navigation are skipped, and the handler gets a
+        // context without a response (`skipNavigation`).
+        if ctx.request().skip_navigation() {
+            return Ok(HttpContext { basic: ctx, response: None, document: Arc::default() });
+        }
+
         // One navigation window covers the pre-navigation hooks, the request, the post-navigation
         // hooks and reading the body; `extend_timeout` pushes it back.
         let window = ctx.timeout_window(self.options.navigation_timeout);
@@ -756,16 +816,15 @@ impl Middleware<BasicContext> for HttpPipeline {
         }
 
         ctx.request_mut().loaded_url = Some(url.to_string());
-        let http_ctx = HttpContext {
-            basic: ctx,
+        let response = Response {
             status: status_code,
             headers,
             url,
             redirects,
             content_type,
             body: Arc::new(Body::new(body, encoding)),
-            document: Arc::default(),
         };
+        let http_ctx = HttpContext { basic: ctx, response: Some(response), document: Arc::default() };
         if self.options.retry_on_blocked
             && let Some(reason) = self.blocked_reason(&http_ctx).await?
         {

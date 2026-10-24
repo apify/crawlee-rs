@@ -16,7 +16,7 @@ use url::Url;
 use crawlee_basic::enqueue::EnqueueError;
 use crawlee_basic::{
     BasicContext, BasicCrawlerBuilder, ConcurrencyOptions, CrawlingContext, EnqueueLinksOptions, EnqueueLinksResult,
-    Middleware, Then,
+    Middleware, NavigationSkippedError, Then,
 };
 use crawlee_utils::links::{DEFAULT_LINK_SELECTOR, LinkExtractionError, extract_links, is_streaming_selector};
 
@@ -260,7 +260,7 @@ impl HtmlContext {
         F: FnOnce(&Document) -> R + Send + 'static,
         R: Send + 'static,
     {
-        self.http.with_document(f).await
+        self.http.with_document("with_html", f).await
     }
 
     /// Like [`with_html`](Self::with_html), but on the current thread. Fine for small pages;
@@ -272,6 +272,13 @@ impl HtmlContext {
     /// Absolute URLs of the `href`s of elements matching `selector` (default `a`), honoring
     /// `<base href>`.
     pub async fn extract_links(&self, selector: Option<&str>) -> anyhow::Result<Vec<Url>> {
+        self.links("extract_links", selector).await
+    }
+
+    async fn links(&self, member: &'static str, selector: Option<&str>) -> anyhow::Result<Vec<Url>> {
+        if self.http.is_navigation_skipped() {
+            return Err(NavigationSkippedError::new(member).into());
+        }
         let selector = selector.unwrap_or(DEFAULT_LINK_SELECTOR).to_owned();
         let base = self.http.url().clone();
 
@@ -308,7 +315,7 @@ impl HtmlContext {
 
     /// Finds links on the page and enqueues those that pass `options` (by default: same hostname).
     pub async fn enqueue_links(&self, options: EnqueueLinksOptions) -> Result<EnqueueLinksResult, EnqueueError> {
-        let links = self.extract_links(options.selector.as_deref()).await?;
+        let links = self.links("enqueue_links", options.selector.as_deref()).await?;
         self.enqueue_urls(links, &options).await
     }
 }

@@ -1850,6 +1850,10 @@ fn panic_error(panic: Box<dyn std::any::Any + Send>) -> anyhow::Error {
         .map(|s| (*s).to_owned())
         .or_else(|| panic.downcast_ref::<String>().cloned())
         .unwrap_or_else(|| "unknown panic payload".to_owned());
+    // A response member used after `skip_navigation`, the way a getter throws in JS.
+    if let Some(skipped) = crate::errors::NavigationSkippedError::from_message(&message) {
+        return skipped.into();
+    }
     HandlerPanic { message }.into()
 }
 

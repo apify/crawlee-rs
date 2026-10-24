@@ -418,3 +418,79 @@ async fn extend_timeout_from_a_hook_extends_the_navigation_window() {
     assert!(errors.is_empty(), "{errors:?}");
     assert_eq!(titles, [("/ok".to_owned(), "ok".to_owned())]);
 }
+
+/// `skip_navigation`: nothing is fetched and the hooks do not run. The handler gets a context
+/// without a response: the members that need one fail the request, without retries.
+#[tokio::test]
+async fn skip_navigation_runs_the_handler_without_a_response() {
+    let hits = Arc::new(AtomicUsize::new(0));
+    let addr = serve(hits.clone()).await;
+    let hooks = Arc::new(AtomicUsize::new(0));
+    let (pre, post) = (hooks.clone(), hooks.clone());
+    let options = options()
+        .pre_navigation_hook(move |ctx: BasicContext| {
+            pre.fetch_add(1, Ordering::SeqCst);
+            async move { Ok(ctx) }
+        })
+        .post_navigation_hook(move |ctx: PostNavigationContext| {
+            post.fetch_add(1, Ordering::SeqCst);
+            async move { Ok(ctx) }
+        });
+    let failed = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let log = failed.clone();
+    let crawler = crawlee_http::HtmlCrawler::builder_with_options(options)
+        .services(Services::in_memory())
+        .max_request_retries(2)
+        .request_handler(|ctx: crawlee_http::HtmlContext| async move {
+            if ctx.request().label() == Some("STATUS") {
+                let _ = ctx.status();
+                unreachable!("the status of a skipped navigation");
+            }
+            let error = |result: anyhow::Result<()>| result.unwrap_err().to_string();
+            ctx.push_data(&json!({
+                "loaded_url": ctx.request().loaded_url,
+                "json": error(ctx.json::<Value>().map(drop)),
+                "with_html": error(ctx.with_html(|_| ()).await),
+                "query": error(ctx.wait_for_selector("title").await),
+                "enqueue": ctx.enqueue_links(Default::default()).await.unwrap_err().to_string(),
+            }))?;
+            Ok(())
+        })
+        .failed_request_handler(move |ctx: BasicContext, err: Arc<anyhow::Error>| {
+            let log = log.clone();
+            async move {
+                log.lock().push((err.to_string(), ctx.request().retry_count));
+                Ok(())
+            }
+        })
+        .build()
+        .unwrap();
+    let skipped = |label: Option<&str>| {
+        let mut builder = crawlee_core::Request::builder(format!("http://{addr}/ok?{label:?}")).skip_navigation(true);
+        if let Some(label) = label {
+            builder = builder.label(label);
+        }
+        builder.build().unwrap()
+    };
+    let stats = crawler.run([skipped(None), skipped(Some("STATUS"))]).await.unwrap();
+    assert_eq!((stats.requests_succeeded, stats.requests_failed), (1, 1), "{stats:#?}");
+    assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing fetched");
+    assert_eq!(hooks.load(Ordering::SeqCst), 0, "no hook ran");
+    assert_eq!(
+        *failed.lock(),
+        [("The `status` method is not available - `skip_navigation` was used".to_owned(), 0)],
+        "not retried"
+    );
+    let items: Vec<Value> = crawler.dataset().await.unwrap().get_all().await.unwrap();
+    let message = |member: &str| format!("The `{member}` method is not available - `skip_navigation` was used");
+    assert_eq!(
+        items,
+        [json!({
+            "loaded_url": null,
+            "json": message("json"),
+            "with_html": message("with_html"),
+            "query": message("wait_for_selector"),
+            "enqueue": message("enqueue_links"),
+        })]
+    );
+}
