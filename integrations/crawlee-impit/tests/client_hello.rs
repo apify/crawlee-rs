@@ -7,8 +7,12 @@
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpListener;
 
+use std::sync::Arc;
+
 use crawlee::Url;
-use crawlee::http_client::{HttpRequest, ReqwestTransport, Transport, TransportOptions};
+use crawlee::http_client::{
+    FingerprintBrowser, HttpRequest, ReqwestTransport, SessionFingerprint, Transport, TransportOptions,
+};
 use crawlee_impit::{Browser, ImpitTransport};
 
 #[derive(Debug, PartialEq)]
@@ -56,11 +60,15 @@ fn parse_client_hello(data: &[u8]) -> ClientHello {
 }
 
 async fn capture(transport: impl Transport + 'static) -> ClientHello {
+    capture_with(transport, TransportOptions::default()).await
+}
+
+async fn capture_with(transport: impl Transport + 'static, options: TransportOptions) -> ClientHello {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = Url::parse(&format!("https://127.0.0.1:{}/", listener.local_addr().unwrap().port())).unwrap();
     let client = tokio::spawn(async move {
         // The handshake cannot complete; only the ClientHello matters.
-        let _ = transport.fetch(HttpRequest::get(url), &TransportOptions::default()).await;
+        let _ = transport.fetch(HttpRequest::get(url), &options).await;
     });
 
     let (mut socket, _) = listener.accept().await.unwrap();
@@ -77,8 +85,8 @@ async fn capture(transport: impl Transport + 'static) -> ClientHello {
 #[tokio::test]
 async fn impit_sends_browser_client_hellos() {
     let reqwest = capture(ReqwestTransport::new()).await;
-    let chrome = capture(ImpitTransport::new(Browser::Chrome)).await;
-    let firefox = capture(ImpitTransport::new(Browser::Firefox)).await;
+    let chrome = capture(ImpitTransport::with_browser(Browser::Chrome)).await;
+    let firefox = capture(ImpitTransport::with_browser(Browser::Firefox)).await;
     // Extensions that identify the browser; plain rustls sends none of them.
     const RECORD_SIZE_LIMIT: u16 = 28;
     const DELEGATED_CREDENTIALS: u16 = 34;
@@ -105,4 +113,16 @@ async fn impit_sends_browser_client_hellos() {
     for hello in [&chrome, &firefox, &reqwest] {
         assert_eq!(hello.alpn, ["h2", "http/1.1"]);
     }
+}
+
+/// Without a browser of its own, the transport impersonates the browser of the session's
+/// fingerprint.
+#[tokio::test]
+async fn the_session_fingerprint_picks_the_browser() {
+    const DELEGATED_CREDENTIALS: u16 = 34;
+    let firefox = Arc::new(SessionFingerprint { browser: Some(FingerprintBrowser::Firefox), ..Default::default() });
+    let options = TransportOptions { fingerprint: Some(firefox), ..Default::default() };
+    let hello = capture_with(ImpitTransport::new(), options).await;
+    assert!(!hello.cipher_suites.iter().copied().any(is_grease), "{hello:?}");
+    assert!(hello.extensions.contains(&DELEGATED_CREDENTIALS), "{hello:?}");
 }

@@ -36,7 +36,7 @@ async fn fingerprint(name: &str, client: Arc<dyn HttpClient>) -> anyhow::Result<
 async fn main() -> anyhow::Result<()> {
     fingerprint("reqwest", Arc::new(RedirectingClient::new(ReqwestTransport::new()))).await?;
     for browser in [Browser::Chrome, Browser::Firefox] {
-        let client = Arc::new(RedirectingClient::new(ImpitTransport::new(browser)));
+        let client = Arc::new(RedirectingClient::new(ImpitTransport::with_browser(browser)));
         fingerprint(&format!("{browser:?}"), client).await?;
     }
     Ok(())
