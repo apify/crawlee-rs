@@ -13,8 +13,8 @@ pub mod transaction;
 
 pub use crate::configuration::Configuration;
 pub use crate::errors::{
-    CriticalError, NonRetryableError, RequestThrottledError, RetryRequestError, SessionError, StorageError,
-    StorageResult,
+    CriticalError, NonRetryableError, RequestThrottledError, RetryRequestError, SessionError, StateValidationError,
+    StorageError, StorageResult,
 };
 pub use crate::events::{Event, EventKind, EventManager, StatusLevel, StatusMessage};
 pub use crate::recoverable_state::{PersistedState, RecoverableState, SerdeState};

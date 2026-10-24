@@ -306,15 +306,8 @@ impl Statistics {
     }
 }
 
-impl PersistedState for Statistics {
-    fn to_record(&self) -> Value {
-        serde_json::to_value(self.record()).unwrap_or_default()
-    }
-
-    /// Restores a record written by crawlee-rs or Crawlee for JS. A record missing any field is
-    /// rejected whole. Error groups are kept only if they have the flat shape crawlee-rs writes
-    /// (JS groups errors differently).
-    fn restore(&self, record: Value) -> Result<(), BoxError> {
+impl Statistics {
+    fn restore_record(&self, record: Value) -> Result<(), BoxError> {
         let record: StatisticsRecord = serde_json::from_value(record)?;
         let started_at = parse_time(record.crawler_started_at.as_deref())?;
         let finished_at = parse_time(record.crawler_finished_at.as_deref())?;
@@ -342,6 +335,27 @@ impl PersistedState for Statistics {
         times.started_at = started_at;
         times.finished_at = finished_at;
         self.restored.store(true, Ordering::Release);
+        Ok(())
+    }
+}
+
+impl PersistedState for Statistics {
+    fn to_record(&self) -> Value {
+        serde_json::to_value(self.record()).unwrap_or_default()
+    }
+
+    /// Restores a record written by crawlee-rs or Crawlee for JS. A record missing any field is
+    /// discarded whole with a warning, starting from scratch, as statistics are bookkeeping and not
+    /// worth failing a crawl over (JS `#deserializeState`). Error groups are kept only if they have
+    /// the flat shape crawlee-rs writes (JS groups errors differently).
+    fn restore(&self, record: Value) -> Result<(), BoxError> {
+        if let Err(err) = self.restore_record(record) {
+            tracing::warn!(
+                persist_state_key = %self.persist_state_key(),
+                "Received invalid state from Key-value store, starting the statistics from scratch: {err}"
+            );
+            self.reset();
+        }
         Ok(())
     }
 
@@ -466,10 +480,13 @@ mod tests {
         assert_eq!(snapshot.retry_errors.get("boom _"), Some(&1));
         assert_eq!(snapshot.status_codes.get(&200), Some(&1));
 
-        // A record missing a field is not ours: rejected whole.
+        // A record missing a field is not ours: discarded whole, starting from scratch rather than
+        // failing the crawl.
         let mut broken = stats.to_record();
         broken.as_object_mut().unwrap().remove("requestsTotal");
-        assert!(Statistics::new().restore(broken).is_err());
+        let fresh = Statistics::new();
+        fresh.restore(broken).unwrap();
+        assert_eq!(fresh.snapshot().requests_succeeded, 0);
     }
 
     #[test]

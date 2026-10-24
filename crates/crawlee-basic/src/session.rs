@@ -123,7 +123,11 @@ impl Session {
             let text = record[field].as_str().ok_or_else(|| format!("the session has no `{field}`"))?;
             Ok(DateTime::parse_from_rfc3339(text)?.with_timezone(&Utc))
         };
-        let id = record["id"].as_str().ok_or("the session has no `id`")?.to_owned();
+        // A missing id gets a new one, as the `Session` constructor gives it in JS.
+        let id = match record["id"].as_str() {
+            Some(id) => id.to_owned(),
+            None => format!("session_{}", crawlee_core::request::crypto_random_object_id(10)),
+        };
         let proxy_info = record["proxyInfo"]["url"].as_str().map(Url::parse).transpose()?.map(ProxyInfo::from_url);
         let mut options = options.clone();
         if let Some(value) = record["maxErrorScore"].as_f64() {
@@ -491,5 +495,18 @@ mod tests {
             session.cookie_jar().cookie_header(&Url::parse("https://a.test/x").unwrap()).as_deref(),
             Some("sid=1")
         );
+    }
+
+    #[test]
+    fn a_saved_session_without_an_id_gets_a_new_one() {
+        let pool = SessionPool::with_id("0", SessionPoolOptions::default(), None);
+        pool.get_session();
+        let mut record = pool.to_record();
+        record["sessions"][0].as_object_mut().unwrap().remove("id");
+
+        let restored = SessionPool::with_id("0", SessionPoolOptions::default(), None);
+        restored.restore(record).unwrap();
+        assert_eq!(restored.usable_count(), 1);
+        assert!(restored.get_session().id().starts_with("session_"));
     }
 }
