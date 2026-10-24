@@ -509,6 +509,18 @@ impl RequestManager for ThrottlingRequestManager {
         manager.reclaim_request(request, forefront).await
     }
 
+    /// Extends the lock where the request is held, without consuming the marker that routes
+    /// `mark_request_as_handled` and `reclaim_request` later.
+    async fn extend_request_processing_time(&self, request: &Request, by: Duration) -> StorageResult<bool> {
+        let key = request.id.clone().unwrap_or_else(|| request.unique_key.clone());
+        let manager = if self.0.state.lock().in_flight_from_inner.contains(&key) {
+            self.0.inner_manager.clone()
+        } else {
+            self.0.select(&request.url).await?.ok_or_else(|| self.0.domain_limit_error(&request.url))?
+        };
+        manager.extend_request_processing_time(request, by).await
+    }
+
     /// Nothing can be fetched right now: held-back domains count as empty.
     async fn is_empty(&self) -> StorageResult<bool> {
         self.0.ensure_ready().await?;

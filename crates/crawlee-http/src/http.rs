@@ -16,6 +16,7 @@ use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use serde::de::DeserializeOwned;
 use url::Url;
 
+use crawlee_basic::timeout::TimeoutWindow;
 use crawlee_basic::{
     BasicContext, BasicCrawlerBuilder, ConcurrencyOptions, CrawlingContext, Middleware, RequestSkipped,
 };
@@ -584,8 +585,8 @@ impl HttpPipeline {
     }
 
     /// What is left of the navigation window (`remainingNavigationWindowMillis`).
-    fn remaining(&self, deadline: tokio::time::Instant) -> anyhow::Result<Duration> {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+    fn remaining(&self, window: &TimeoutWindow) -> anyhow::Result<Duration> {
+        let remaining = window.remaining();
         if remaining.is_zero() {
             return Err(self.navigation_timed_out());
         }
@@ -595,11 +596,11 @@ impl HttpPipeline {
     /// Runs a step of the navigation within what is left of its window (`windowGuard`).
     async fn within_window<T>(
         &self,
-        deadline: tokio::time::Instant,
+        window: &TimeoutWindow,
         step: impl Future<Output = anyhow::Result<T>>,
     ) -> anyhow::Result<T> {
-        self.remaining(deadline)?;
-        tokio::time::timeout_at(deadline, step).await.map_err(|_| self.navigation_timed_out())?
+        self.remaining(window)?;
+        window.run(step).await.ok_or_else(|| self.navigation_timed_out())?
     }
 
     fn map_client_error(&self, err: HttpClientError) -> anyhow::Error {
@@ -669,10 +670,10 @@ impl Middleware<BasicContext> for HttpPipeline {
 
     async fn run(&self, mut ctx: BasicContext) -> anyhow::Result<HttpContext> {
         // One navigation window covers the pre-navigation hooks, the request, the post-navigation
-        // hooks and reading the body.
-        let deadline = tokio::time::Instant::now() + self.options.navigation_timeout;
+        // hooks and reading the body; `extend_timeout` pushes it back.
+        let window = ctx.timeout_window(self.options.navigation_timeout);
         for hook in &self.options.pre_navigation_hooks {
-            ctx = self.within_window(deadline, hook(ctx)).await?;
+            ctx = self.within_window(&window, hook(ctx)).await?;
         }
         let http_request = self.build_request(&ctx)?;
 
@@ -686,7 +687,7 @@ impl Middleware<BasicContext> for HttpPipeline {
         let send_options = SendOptions {
             proxy_url: ctx.proxy_info().map(|proxy| proxy.url.clone()),
             cookie_jar,
-            timeout: Some(self.remaining(deadline)?),
+            timeout: Some(self.remaining(&window)?),
             // A man-in-the-middle proxy can only turn verification off.
             ignore_tls_errors: self.options.ignore_tls_errors
                 || ctx.proxy_info().is_some_and(|proxy| proxy.ignore_tls_errors),
@@ -706,10 +707,11 @@ impl Middleware<BasicContext> for HttpPipeline {
         self.check_content_type(&request_url, response.status.as_u16(), &content_type)?;
         let mut navigated = PostNavigationContext { context: ctx, response };
         for hook in &self.options.post_navigation_hooks {
-            navigated = self.within_window(deadline, hook(navigated)).await?;
+            navigated = self.within_window(&window, hook(navigated)).await?;
         }
-        // A hook may have replaced the response.
-        let PostNavigationContext { context: mut ctx, response } = navigated;
+        // A hook may have replaced the response, or extended the window the body is read in.
+        let PostNavigationContext { context: mut ctx, mut response } = navigated;
+        response.body.set_deadline(window.deadline(), self.options.navigation_timeout);
         let status = response.status.as_u16();
         let content_type = ContentType::from_response(&response.headers, &response.url);
 

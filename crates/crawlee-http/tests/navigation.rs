@@ -398,3 +398,23 @@ fn the_pipelines_report_their_navigation_timeout() {
     let html = Then(http, crawlee_http::HtmlLayer);
     assert_eq!(Middleware::<BasicContext>::navigation_timeout(&html), Duration::from_secs(45));
 }
+
+/// `extend_timeout` from a navigation hook pushes back the whole navigation window, as JS's
+/// `extendTimeout` moves the shared navigation deadline.
+#[tokio::test]
+async fn extend_timeout_from_a_hook_extends_the_navigation_window() {
+    let window = HttpCrawlerOptions { navigation_timeout: Duration::from_millis(500), ..Default::default() };
+    let options = window
+        .pre_navigation_hook(|ctx: BasicContext| async move {
+            ctx.extend_timeout(Duration::from_secs(1));
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            Ok(ctx)
+        })
+        .post_navigation_hook(|ctx: PostNavigationContext| async move {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            Ok(ctx)
+        });
+    let (titles, errors) = titles(options, &["/ok"]).await;
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(titles, [("/ok".to_owned(), "ok".to_owned())]);
+}

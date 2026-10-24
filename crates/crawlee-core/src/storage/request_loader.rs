@@ -132,6 +132,10 @@ impl RequestManager for RequestManagerTandem {
         self.manager.set_expected_request_processing_time(duration).await
     }
 
+    async fn extend_request_processing_time(&self, request: &Request, by: Duration) -> StorageResult<bool> {
+        self.manager.extend_request_processing_time(request, by).await
+    }
+
     fn record_pacing_signal(&self, signal: &PacingSignal) -> bool {
         self.manager.record_pacing_signal(signal)
     }

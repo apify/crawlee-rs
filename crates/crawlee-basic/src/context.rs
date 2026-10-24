@@ -22,6 +22,7 @@ use crate::proxy::ProxyInfo;
 use crate::robots::RobotsCache;
 use crate::session::Session;
 use crate::statistics::Statistics;
+use crate::timeout::{TimeoutExtensions, TimeoutWindow};
 
 /// Everything request tasks of one crawler share.
 pub struct CrawlerShared {
@@ -156,11 +157,19 @@ pub struct RequestScope {
     pub(crate) transaction: StorageTransaction,
     /// The context hands its request back here when it is dropped.
     returned: Mutex<Option<Request>>,
+    /// Extensions of the request's timeouts (`extend_timeout`).
+    pub(crate) timeouts: Arc<TimeoutExtensions>,
 }
 
 impl RequestScope {
     pub(crate) fn new(shared: Arc<CrawlerShared>, session: Option<Arc<Session>>) -> Arc<Self> {
-        Arc::new(RequestScope { shared, session, transaction: StorageTransaction::new(), returned: Mutex::new(None) })
+        Arc::new(RequestScope {
+            shared,
+            session,
+            transaction: StorageTransaction::new(),
+            returned: Mutex::new(None),
+            timeouts: Arc::default(),
+        })
     }
 
     pub(crate) fn take_returned(&self) -> Option<Request> {
@@ -223,6 +232,31 @@ impl BasicContext {
 
     pub fn request_mut(&mut self) -> &mut Request {
         self.request.as_mut().expect(PRESENT)
+    }
+
+    /// Gives the request `by` more time to finish (`context.extendTimeout`), for when how long it
+    /// needs is only apparent once it runs. Prefer `request_handler_timeout`, or a per-route
+    /// timeout, when the time needed is known up front.
+    ///
+    /// The timeout of the running phase (the request handler, or the navigation when called from a
+    /// navigation hook) and the request timeout are pushed back together. A request manager that
+    /// locks requests is asked to extend the lock by the same amount, in the background.
+    pub fn extend_timeout(&self, by: Duration) {
+        self.scope.timeouts.extend(by);
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else { return };
+        let (manager, request) = (self.scope.shared.request_manager.clone(), self.request().clone());
+        runtime.spawn(async move {
+            // Extension failure must not fail the request that asked for more time.
+            if let Err(error) = manager.extend_request_processing_time(&request, by).await {
+                tracing::debug!(url = %request.url, %error, "Extending the request processing time failed");
+            }
+        });
+    }
+
+    /// A timeout of `timeout` from now that [`extend_timeout`](Self::extend_timeout) pushes back,
+    /// for the phases of crawlers built on this context (such as the navigation).
+    pub fn timeout_window(&self, timeout: Duration) -> TimeoutWindow {
+        self.scope.timeouts.window(timeout)
     }
 
     pub fn session(&self) -> Option<&Arc<Session>> {

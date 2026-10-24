@@ -1358,9 +1358,9 @@ where
             // Committed before the request is marked as handled, so that a failed commit fails it.
             Ok::<_, anyhow::Error>(scope.transaction.commit().await?)
         };
-        let mut result = match tokio::time::timeout(request_timeout, attempt).await {
-            Ok(result) => result,
-            Err(_) => Err(anyhow::anyhow!(
+        let mut result = match scope.timeouts.window(request_timeout).run(attempt).await {
+            Some(result) => result,
+            None => Err(anyhow::anyhow!(
                 "Request timed out after {} seconds ({request_id}).",
                 request_timeout.as_secs_f64()
             )),
@@ -1418,10 +1418,11 @@ where
         };
 
         let timeout = self.handler_timeout(ctx.basic().request().label());
-        match tokio::time::timeout(timeout, AssertUnwindSafe(self.inner.handler.handle(ctx)).catch_unwind()).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(panic)) => Err(panic_error(panic)),
-            Err(_) => Err(RequestHandlerTimeout { secs: timeout.as_secs_f64() }.into()),
+        let window = ctx.basic().timeout_window(timeout);
+        match window.run(AssertUnwindSafe(self.inner.handler.handle(ctx)).catch_unwind()).await {
+            Some(Ok(result)) => result,
+            Some(Err(panic)) => Err(panic_error(panic)),
+            None => Err(RequestHandlerTimeout { secs: timeout.as_secs_f64() }.into()),
         }
     }
 

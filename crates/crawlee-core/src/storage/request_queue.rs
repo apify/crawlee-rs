@@ -67,6 +67,11 @@ pub trait RequestManager: Send + Sync {
     async fn set_expected_request_processing_time(&self, _duration: Duration) -> StorageResult<()> {
         Ok(())
     }
+    /// Prolongs the lock of a fetched request by `by` (`extendRequestProcessingTimeSecs`), for a
+    /// handler that asked for more time. `false` when the manager holds no lock.
+    async fn extend_request_processing_time(&self, _request: &Request, _by: Duration) -> StorageResult<bool> {
+        Ok(false)
+    }
     /// When a manager that has nothing to fetch now (see [`is_empty`](Self::is_empty)) will have
     /// a request ready, if it knows: for example when a held-back domain may be fetched again. The
     /// crawler wakes up then instead of waiting for its next check (`readyAt` of `checkReadiness`).
@@ -502,6 +507,11 @@ impl RequestManager for RequestQueue {
     }
 
     /// Passed on to the backend only when it raises the highest time so far.
+    async fn extend_request_processing_time(&self, request: &Request, by: Duration) -> StorageResult<bool> {
+        let Some(id) = &request.id else { return Ok(false) };
+        self.backend.extend_request_processing_time(id, by).await
+    }
+
     async fn set_expected_request_processing_time(&self, duration: Duration) -> StorageResult<()> {
         {
             let mut expected = self.expected_processing_time.lock();

@@ -15,6 +15,7 @@ pub mod sitemap;
 pub mod sitemap_loader;
 pub mod statistics;
 pub mod throttling;
+pub mod timeout;
 
 pub use crate::autoscaling::{ConcurrencyOptions, ConcurrencySystem, LoadSignal, LoadSignalsOptions};
 pub use crate::context::{BasicContext, CrawlingContext};
