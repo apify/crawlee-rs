@@ -8,6 +8,7 @@
 //! `structuredClone` equivalent on this path.
 
 use bytes::Bytes;
+use indexmap::IndexMap;
 use parking_lot::Mutex;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -24,6 +25,9 @@ pub struct KeyValueWrite {
     pub key: String,
     pub value: Option<(Bytes, String)>,
 }
+
+/// A value to write (bytes and content type), or `None` for a deletion.
+type PendingValue = Option<(Bytes, String)>;
 
 #[derive(Default)]
 struct Journal {
@@ -135,25 +139,48 @@ impl StorageTransaction {
         }
     }
 
-    /// Applies the journal to the storages, in the order the writes were made.
+    /// Applies the journal to the storages: key-value stores first, one write per key (the last
+    /// one), then datasets, each with one push of all its items in order. Key-value writes are
+    /// idempotent under retry and dataset pushes are not, so a commit that fails half-way is
+    /// retried with as little duplication as possible (`StorageTransaction.flush` in JS).
     pub async fn commit(&self) -> StorageResult<()> {
         let journal = std::mem::take(&mut *self.journal.lock());
 
+        let mut stores: Vec<(KeyValueStore, IndexMap<String, PendingValue>)> = Vec::new();
+        for write in journal.key_value {
+            let position = match stores.iter().position(|(store, _)| store.same_storage(&write.store)) {
+                Some(position) => position,
+                None => {
+                    stores.push((write.store, IndexMap::new()));
+                    stores.len() - 1
+                }
+            };
+            stores[position].1.insert(write.key, write.value);
+        }
+        let mut datasets: Vec<(Dataset, Vec<DatasetItem>)> = Vec::new();
         for (dataset, items) in journal.datasets {
-            if !items.is_empty() {
-                dataset.push_items(items).await?;
+            match datasets.iter_mut().find(|(existing, _)| existing.same_storage(&dataset)) {
+                Some((_, pending)) => pending.extend(items),
+                None => datasets.push((dataset, items)),
             }
         }
-        for write in journal.key_value {
-            match write.value {
-                Some((value, content_type)) => {
-                    write
-                        .store
-                        .backend()
-                        .set_value(KeyValueStoreRecord { key: write.key, value, content_type: Some(content_type) })
-                        .await?
+
+        for (store, writes) in stores {
+            for (key, value) in writes {
+                match value {
+                    Some((value, content_type)) => {
+                        store
+                            .backend()
+                            .set_value(KeyValueStoreRecord { key, value, content_type: Some(content_type) })
+                            .await?
+                    }
+                    None => store.backend().delete_value(&key).await?,
                 }
-                None => write.store.backend().delete_value(&write.key).await?,
+            }
+        }
+        for (dataset, items) in datasets {
+            if !items.is_empty() {
+                dataset.push_items(items).await?;
             }
         }
         for callback in journal.after_commit {
@@ -204,5 +231,102 @@ mod tests {
         assert!(committed.load(Ordering::SeqCst));
         assert_eq!(dataset.get_all::<serde_json::Value>().await.unwrap(), vec![json!({ "attempt": 2 })]);
         assert_eq!(store.get_value::<serde_json::Value>("STATE").await.unwrap(), Some(json!({ "n": 1 })));
+    }
+
+    /// Logs every write that reaches a backend, in order.
+    #[derive(Clone, Default)]
+    struct WriteLog(Arc<Mutex<Vec<String>>>);
+
+    struct LoggingDataset {
+        name: &'static str,
+        log: WriteLog,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::backend::DatasetBackend for LoggingDataset {
+        async fn get_metadata(&self) -> StorageResult<crate::storage::backend::DatasetInfo> {
+            unimplemented!()
+        }
+        async fn drop_storage(&self) -> StorageResult<()> {
+            Ok(())
+        }
+        async fn purge(&self) -> StorageResult<()> {
+            Ok(())
+        }
+        async fn push_data(&self, items: Vec<DatasetItem>) -> StorageResult<()> {
+            let items: Vec<&str> = items.iter().map(|item| item.get()).collect();
+            self.log.0.lock().push(format!("{}.push({})", self.name, items.join(",")));
+            Ok(())
+        }
+        async fn get_data(
+            &self,
+            _options: crate::storage::backend::DatasetListOptions,
+        ) -> StorageResult<crate::storage::backend::PaginatedList<DatasetItem>> {
+            unimplemented!()
+        }
+    }
+
+    struct LoggingStore {
+        name: &'static str,
+        log: WriteLog,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::backend::KeyValueStoreBackend for LoggingStore {
+        async fn get_metadata(&self) -> StorageResult<crate::storage::backend::KeyValueStoreInfo> {
+            unimplemented!()
+        }
+        async fn drop_storage(&self) -> StorageResult<()> {
+            Ok(())
+        }
+        async fn purge(&self) -> StorageResult<()> {
+            Ok(())
+        }
+        async fn get_value(&self, _key: &str) -> StorageResult<Option<KeyValueStoreRecord>> {
+            Ok(None)
+        }
+        async fn set_value(&self, record: KeyValueStoreRecord) -> StorageResult<()> {
+            let value = String::from_utf8_lossy(&record.value).replace([' ', '\n'], "");
+            self.log.0.lock().push(format!("{}.set({}={value})", self.name, record.key));
+            Ok(())
+        }
+        async fn delete_value(&self, key: &str) -> StorageResult<()> {
+            self.log.0.lock().push(format!("{}.delete({key})", self.name));
+            Ok(())
+        }
+        async fn list_keys(
+            &self,
+            _options: crate::storage::backend::KeyValueStoreListKeysOptions,
+        ) -> StorageResult<crate::storage::backend::KeyValueStoreListKeysResult> {
+            unimplemented!()
+        }
+        async fn record_exists(&self, _key: &str) -> StorageResult<bool> {
+            Ok(false)
+        }
+    }
+
+    #[tokio::test]
+    async fn commit_writes_stores_first_then_one_push_per_dataset() {
+        let log = WriteLog::default();
+        let a = Dataset::from_backend(Arc::new(LoggingDataset { name: "a", log: log.clone() }));
+        let b = Dataset::from_backend(Arc::new(LoggingDataset { name: "b", log: log.clone() }));
+        let s = KeyValueStore::from_backend(Arc::new(LoggingStore { name: "s", log: log.clone() }));
+        let t = KeyValueStore::from_backend(Arc::new(LoggingStore { name: "t", log: log.clone() }));
+
+        let tx = StorageTransaction::new();
+        tx.push_data(&a, &json!({ "n": 1 })).unwrap();
+        tx.set_value(&s, "X", &1).unwrap();
+        tx.push_data(&b, &json!({ "n": 2 })).unwrap();
+        tx.set_value(&t, "Y", &1).unwrap();
+        tx.push_data(&a, &json!([{ "n": 3 }, { "n": 4 }])).unwrap();
+        tx.set_value(&s, "Z", &1).unwrap();
+        tx.set_value(&s, "X", &2).unwrap();
+        tx.delete_value(&t, "Y").unwrap();
+        tx.commit().await.unwrap();
+
+        assert_eq!(
+            *log.0.lock(),
+            ["s.set(X=2)", "s.set(Z=1)", "t.delete(Y)", r#"a.push({"n":1},{"n":3},{"n":4})"#, r#"b.push({"n":2})"#,]
+        );
     }
 }
