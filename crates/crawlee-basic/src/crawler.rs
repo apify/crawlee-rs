@@ -12,8 +12,8 @@ use tracing::Instrument as _;
 
 use crawlee_core::storage::batched_adds::AddRequestsBatchedResult;
 use crawlee_core::{
-    Dataset, Event, EventKind, KeyValueStore, PacingScope, PacingSignal, RecoverableState, Request, RequestManager,
-    SerdeState, Services, StatusLevel, StatusMessage, StorageIdentifier,
+    CriticalError, Dataset, Event, EventKind, KeyValueStore, PacingScope, PacingSignal, RecoverableState, Request,
+    RequestManager, SerdeState, Services, StatusLevel, StatusMessage, StorageIdentifier,
 };
 use crawlee_http_client::HttpClient;
 use serde::Serialize;
@@ -28,7 +28,7 @@ use crate::errors::{
     ErrorKind, HandlerPanic, MissingSessionError, RequestHandlerTimeout, RequestSkipped, SkipRequestError,
     error_message,
 };
-use crate::handler::{ErrorHandler, Identity, Middleware, RequestHandler};
+use crate::handler::{BoxFuture, ErrorHandler, Identity, Middleware, RequestHandler};
 use crate::proxy::ProxySource;
 use crate::robots::RobotsCache;
 use crate::session::{Session, SessionPool, SessionPoolOptions};
@@ -54,6 +54,8 @@ impl Drop for ReleaseProxy {
 
 /// How long a migration or abort waits for running requests (`SAFE_MIGRATION_WAIT_MILLIS`).
 const SAFE_MIGRATION_WAIT: Duration = Duration::from_secs(20);
+/// How often the statistics are logged (`logIntervalSecs`).
+const STATISTICS_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const CRAWLEE_STATE_KEY: &str = "CRAWLEE_STATE";
 
 /// Crawler settings, with the defaults of Crawlee for JS where they exist.
@@ -89,6 +91,9 @@ pub struct CrawlerOptions {
     /// Minimum time between two requests to one site, subdomains included
     /// (`sameDomainDelaySecs`). Zero for none.
     pub same_domain_delay: Duration,
+    /// Keep running when the queue is empty, waiting for more requests, until
+    /// [`stop`](BasicCrawler::stop) is called (`keepAlive`).
+    pub keep_alive: bool,
 }
 
 impl Default for CrawlerOptions {
@@ -106,9 +111,48 @@ impl Default for CrawlerOptions {
             status_message_interval: Duration::from_secs(10),
             respect_robots_txt: None,
             same_domain_delay: Duration::ZERO,
+            keep_alive: false,
         }
     }
 }
+
+/// A predicate of the task loop: see [`TaskLoopOptions`].
+pub type TaskLoopPredicate = Arc<dyn Fn() -> BoxFuture<anyhow::Result<bool>> + Send + Sync>;
+
+/// Replacements of the task loop's predicates (`taskLoopOptions` of Crawlee for JS). The
+/// `max_requests_per_crawl` limit, [`stop`](BasicCrawler::stop) and
+/// [`keep_alive`](CrawlerOptions::keep_alive) still apply.
+#[derive(Clone, Default)]
+pub struct TaskLoopOptions {
+    /// Whether a task may start now; by default, whether the request manager has a request.
+    pub is_task_ready: Option<TaskLoopPredicate>,
+    /// Whether the crawl is over once nothing runs and nothing is ready; by default, whether
+    /// the request manager is finished.
+    pub is_finished: Option<TaskLoopPredicate>,
+}
+
+impl std::fmt::Debug for TaskLoopOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TaskLoopOptions")
+            .field("is_task_ready", &self.is_task_ready.is_some())
+            .field("is_finished", &self.is_finished.is_some())
+            .finish()
+    }
+}
+
+/// What a [`StatusMessageCallback`] gets (`statusMessageCallback` of Crawlee for JS).
+#[derive(Clone, Debug)]
+pub struct StatusMessageInfo {
+    /// The message the crawler would set.
+    pub message: String,
+    pub state: FinalStatistics,
+    /// The statistics at the previous status message.
+    pub previous_state: FinalStatistics,
+}
+
+/// Called instead of [`BasicCrawler::set_status_message`] every
+/// [`status_message_interval`](CrawlerOptions::status_message_interval).
+pub type StatusMessageCallback = Arc<dyn Fn(StatusMessageInfo) -> BoxFuture<()> + Send + Sync>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BuildError {
@@ -116,6 +160,12 @@ pub enum BuildError {
     MissingRequestHandler,
     #[error(transparent)]
     Concurrency(#[from] ConcurrencyError),
+    #[error(
+        "the `min_concurrency`/`max_concurrency`/`desired_concurrency`/`max_requests_per_minute` shortcuts cannot be \
+         combined with `concurrency_system()`: they configure the default ConcurrencySystem that a supplied one \
+         replaces. Pass them to the ConcurrencySystem instead."
+    )]
+    ConcurrencyShortcutsWithSystem,
 }
 
 struct Inner<P: Middleware<BasicContext>> {
@@ -124,18 +174,30 @@ struct Inner<P: Middleware<BasicContext>> {
     error_handler: Option<Arc<dyn ErrorHandler>>,
     failed_request_handler: Option<Arc<dyn ErrorHandler>>,
     on_skipped_request: Option<SkippedRequestCallback>,
+    status_message_callback: Option<StatusMessageCallback>,
+    task_loop: TaskLoopOptions,
     options: CrawlerOptions,
     /// The explicit id, or the instantiation index.
     id: String,
     has_explicit_id: bool,
+    instance_index: u64,
     services: Services,
     request_manager: Option<Arc<dyn RequestManager>>,
     http_client: Arc<dyn HttpClient>,
     session_pool: Arc<SessionPool>,
+    /// The session pool was built by the crawler, not supplied.
+    owns_session_pool: bool,
     statistics: Arc<Statistics>,
+    owns_statistics: bool,
     statistics_state: RecoverableState<Statistics>,
     session_pool_state: RecoverableState<SessionPool>,
-    concurrency: Arc<ConcurrencySystem>,
+    /// A supplied concurrency system; otherwise one is built for every run.
+    injected_concurrency: Option<Arc<ConcurrencySystem>>,
+    /// The concurrency system of the last run.
+    concurrency: parking_lot::Mutex<Option<Arc<ConcurrencySystem>>>,
+    /// The run in progress.
+    run: parking_lot::Mutex<Option<Arc<RunState>>>,
+    has_finished_before: std::sync::atomic::AtomicBool,
     shared: OnceCell<Arc<CrawlerShared>>,
 }
 
@@ -184,11 +246,18 @@ pub struct BasicCrawlerBuilder<P: Middleware<BasicContext>> {
     error_handler: Option<Arc<dyn ErrorHandler>>,
     failed_request_handler: Option<Arc<dyn ErrorHandler>>,
     on_skipped_request: Option<SkippedRequestCallback>,
+    status_message_callback: Option<StatusMessageCallback>,
+    task_loop: TaskLoopOptions,
     options: CrawlerOptions,
     services: Option<Services>,
     request_manager: Option<Arc<dyn RequestManager>>,
     http_client: Option<Arc<dyn HttpClient>>,
     proxies: Option<Arc<dyn ProxySource>>,
+    statistics: Option<Arc<Statistics>>,
+    session_pool: Option<Arc<SessionPool>>,
+    concurrency_system: Option<Arc<ConcurrencySystem>>,
+    /// A concurrency shortcut was set, which conflicts with a supplied concurrency system.
+    concurrency_shortcuts: bool,
 }
 
 impl<P> BasicCrawlerBuilder<P>
@@ -203,11 +272,17 @@ where
             error_handler: None,
             failed_request_handler: None,
             on_skipped_request: None,
+            status_message_callback: None,
+            task_loop: TaskLoopOptions::default(),
             options: CrawlerOptions::default(),
             services: None,
             request_manager: None,
             http_client: None,
             proxies: None,
+            statistics: None,
+            session_pool: None,
+            concurrency_system: None,
+            concurrency_shortcuts: false,
         }
     }
 
@@ -246,6 +321,52 @@ where
         self
     }
 
+    /// Called instead of [`set_status_message`](BasicCrawler::set_status_message) for the periodic
+    /// status message (`statusMessageCallback`).
+    pub fn status_message_callback<F, Fut>(mut self, callback: F) -> Self
+    where
+        F: Fn(StatusMessageInfo) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.status_message_callback = Some(Arc::new(move |info| Box::pin(callback(info))));
+        self
+    }
+
+    /// See [`TaskLoopOptions`].
+    pub fn task_loop_options(mut self, options: TaskLoopOptions) -> Self {
+        self.task_loop = options;
+        self
+    }
+
+    /// See [`CrawlerOptions::keep_alive`].
+    pub fn keep_alive(mut self, keep_alive: bool) -> Self {
+        self.options.keep_alive = keep_alive;
+        self
+    }
+
+    /// Statistics to record into instead of the crawler's own (`statistics`). Unlike the crawler's
+    /// own, they are not reset when the crawler runs again.
+    pub fn statistics(mut self, statistics: Arc<Statistics>) -> Self {
+        self.statistics = Some(statistics);
+        self
+    }
+
+    /// A session pool to take sessions from instead of the crawler's own (`sessionPool`). Its
+    /// sessions keep their proxies: [`proxy_configuration`](Self::proxy_configuration) does not
+    /// apply to it. Unlike the crawler's own, it is not reset when the crawler runs again.
+    pub fn session_pool(mut self, pool: Arc<SessionPool>) -> Self {
+        self.session_pool = Some(pool);
+        self
+    }
+
+    /// A concurrency system to book requests against instead of one the crawler builds for every
+    /// run (`concurrencySystem`), for example one shared by several crawlers. The caller starts it
+    /// before running the crawler and stops it after.
+    pub fn concurrency_system(mut self, system: Arc<ConcurrencySystem>) -> Self {
+        self.concurrency_system = Some(system);
+        self
+    }
+
     pub fn options(mut self, options: CrawlerOptions) -> Self {
         self.options = options;
         self
@@ -253,6 +374,7 @@ where
 
     /// At most this many requests in parallel (`maxConcurrency`, default 200).
     pub fn max_concurrency(mut self, max_concurrency: usize) -> Self {
+        self.concurrency_shortcuts = true;
         self.options.concurrency.max_concurrency = max_concurrency;
         self.options.concurrency.min_concurrency = self.options.concurrency.min_concurrency.min(max_concurrency);
         self
@@ -260,18 +382,21 @@ where
 
     /// At least this many requests in parallel, whatever the load (`minConcurrency`, default 1).
     pub fn min_concurrency(mut self, min_concurrency: usize) -> Self {
+        self.concurrency_shortcuts = true;
         self.options.concurrency.min_concurrency = min_concurrency;
         self
     }
 
     /// The concurrency autoscaling starts from (`initialConcurrency`).
     pub fn desired_concurrency(mut self, desired_concurrency: usize) -> Self {
+        self.concurrency_shortcuts = true;
         self.options.concurrency.desired_concurrency = Some(desired_concurrency);
         self
     }
 
     /// A fixed concurrency: `min_concurrency = max_concurrency = concurrency`.
     pub fn fixed_concurrency(mut self, concurrency: usize) -> Self {
+        self.concurrency_shortcuts = true;
         self.options.concurrency.min_concurrency = concurrency;
         self.options.concurrency.max_concurrency = concurrency;
         self
@@ -279,6 +404,7 @@ where
 
     /// Starts at most this many requests per minute (`maxRequestsPerMinute`).
     pub fn max_requests_per_minute(mut self, max: u64) -> Self {
+        self.concurrency_shortcuts = true;
         self.options.concurrency.max_tasks_per_minute = Some(max);
         self
     }
@@ -371,15 +497,32 @@ where
 
     pub fn build(self) -> Result<BasicCrawler<P>, BuildError> {
         let handler = self.handler.ok_or(BuildError::MissingRequestHandler)?;
-        let concurrency = Arc::new(ConcurrencySystem::new(self.options.concurrency.clone())?);
+        if self.concurrency_system.is_some() && self.concurrency_shortcuts {
+            return Err(BuildError::ConcurrencyShortcutsWithSystem);
+        }
+        if self.concurrency_system.is_none() {
+            // Validated here; the system itself is built for every run.
+            ConcurrencySystem::new(self.options.concurrency.clone())?;
+        }
         static INSTANCE_COUNT: AtomicU64 = AtomicU64::new(0);
         let instance_index = INSTANCE_COUNT.fetch_add(1, Ordering::Relaxed);
         let has_explicit_id = self.options.id.is_some();
         let id = self.options.id.clone().unwrap_or_else(|| instance_index.to_string());
 
         let services = self.services.unwrap_or_else(|| Services::global().clone());
-        let session_pool = Arc::new(SessionPool::new(self.options.session_pool.clone(), self.proxies));
-        let statistics = Arc::new(Statistics::with_id(id.clone()));
+        if self.session_pool.is_some() && self.proxies.is_some() {
+            tracing::warn!(
+                "Both `session_pool` and `proxy_configuration` were provided to the crawler. The \
+                 `proxy_configuration` is ignored - sessions from the supplied pool keep whatever proxy they were \
+                 created with. Configure proxies on the pool instead."
+            );
+        }
+        let owns_session_pool = self.session_pool.is_none();
+        let session_pool = self
+            .session_pool
+            .unwrap_or_else(|| Arc::new(SessionPool::new(self.options.session_pool.clone(), self.proxies)));
+        let owns_statistics = self.statistics.is_none();
+        let statistics = self.statistics.unwrap_or_else(|| Arc::new(Statistics::with_id(id.clone())));
         let statistics_state =
             RecoverableState::new(&services, statistics.persist_state_key(), statistics.clone(), true);
         let session_pool_state =
@@ -391,17 +534,25 @@ where
                 error_handler: self.error_handler,
                 failed_request_handler: self.failed_request_handler,
                 on_skipped_request: self.on_skipped_request,
+                status_message_callback: self.status_message_callback,
+                task_loop: self.task_loop,
                 options: self.options,
                 id,
                 has_explicit_id,
+                instance_index,
                 services,
                 request_manager: self.request_manager,
                 http_client: self.http_client.unwrap_or_else(crawlee_http_client::default_client),
                 session_pool,
+                owns_session_pool,
                 statistics,
+                owns_statistics,
                 statistics_state,
                 session_pool_state,
-                concurrency,
+                injected_concurrency: self.concurrency_system,
+                concurrency: parking_lot::Mutex::new(None),
+                run: parking_lot::Mutex::new(None),
+                has_finished_before: Default::default(),
                 shared: OnceCell::new(),
             }),
         })
@@ -422,7 +573,15 @@ where
                 inner.services.purge_on_start().await?;
                 let mut request_manager: Arc<dyn RequestManager> = match &inner.request_manager {
                     Some(manager) => manager.clone(),
-                    None => Arc::new(inner.services.open_request_queue(&StorageIdentifier::Default).await?),
+                    // The first crawler of the process uses the default queue, the others queues of
+                    // their own, so that they do not collide.
+                    None => {
+                        let identifier = match inner.instance_index {
+                            0 => StorageIdentifier::Default,
+                            _ => StorageIdentifier::Alias(format!("__default_{}__", inner.id)),
+                        };
+                        Arc::new(inner.services.open_request_queue(&identifier).await?)
+                    }
                 };
                 let delay = inner.options.same_domain_delay;
                 if !delay.is_zero() {
@@ -558,6 +717,10 @@ where
     /// Stops starting new requests and waits (up to `timeout`) for the running ones to finish.
     /// [`run`](Self::run) keeps going once [`resume`](Self::resume) is called.
     pub async fn pause(&self, timeout: Duration) -> anyhow::Result<()> {
+        if self.live_run().is_none() {
+            tracing::warn!("Cannot pause a crawler that is not running.");
+            return Ok(());
+        }
         let shared = self.shared().await?;
         shared.paused.store(true, Ordering::Release);
         tokio::time::timeout(timeout, shared.wait_until_drained())
@@ -566,10 +729,33 @@ where
     }
 
     pub async fn resume(&self) -> anyhow::Result<()> {
+        if self.live_run().is_none() {
+            tracing::warn!("Cannot resume a crawler that is not running.");
+            return Ok(());
+        }
         let shared = self.shared().await?;
         shared.paused.store(false, Ordering::Release);
         shared.resumed.notify_waiters();
         Ok(())
+    }
+
+    /// Stops the run gracefully: no new request starts, and the run ends once the running ones
+    /// are finished. Requests still in the queue are left there. `reason` is logged, by default
+    /// "The crawler has been gracefully stopped.".
+    pub fn stop(&self, reason: Option<&str>) {
+        match self.live_run() {
+            Some(run) => run.stop(reason.unwrap_or("The crawler has been gracefully stopped.")),
+            None => tracing::warn!("Cannot stop a crawler that is not running."),
+        }
+    }
+
+    /// Whether [`run`](Self::run) is in progress.
+    pub fn running(&self) -> bool {
+        self.live_run().is_some()
+    }
+
+    fn live_run(&self) -> Option<Arc<RunState>> {
+        self.inner.run.lock().clone()
     }
 
     /// On a migration or abort: let running requests finish, then save the statistics.
@@ -587,31 +773,67 @@ where
 
     /// Updates the status message every `status_message_interval` until the returned task is
     /// aborted.
-    fn spawn_status_logger(&self) -> tokio::task::JoinHandle<()> {
+    fn spawn_status_logger(
+        &self,
+        shared: Arc<CrawlerShared>,
+        concurrency: Arc<ConcurrencySystem>,
+    ) -> tokio::task::JoinHandle<()> {
         let crawler = self.clone();
         let interval = self.inner.options.status_message_interval;
         tokio::spawn(async move {
-            let mut previous_failed = crawler.inner.statistics.requests_failed();
+            let statistics = &crawler.inner.statistics;
+            let mut previous = statistics.snapshot();
             let mut ticker = tokio::time::interval(interval.max(Duration::from_millis(1)));
             ticker.tick().await;
             loop {
                 ticker.tick().await;
-                let (succeeded, failed) =
-                    (crawler.inner.statistics.requests_succeeded(), crawler.inner.statistics.requests_failed());
-                let failed_delta = failed.saturating_sub(previous_failed);
-                previous_failed = failed;
+                let state = statistics.snapshot();
+                let failed_delta = state.requests_failed.saturating_sub(previous.requests_failed);
                 let message = if failed_delta > 0 {
                     format!(
                         "Experiencing problems, {failed_delta} failed requests in the past {} seconds.",
                         interval.as_secs()
                     )
                 } else {
+                    let total = shared.request_manager.total_count().await.unwrap_or(0);
+                    let total = if total > 0 { format!("/{total}") } else { String::new() };
                     format!(
-                        "Crawled {succeeded} pages, {failed} failed requests, desired concurrency {}.",
-                        crawler.inner.concurrency.desired_concurrency()
+                        "Crawled {}{total} pages, {} failed requests, desired concurrency {}.",
+                        state.requests_succeeded,
+                        state.requests_failed,
+                        concurrency.desired_concurrency()
                     )
                 };
-                crawler.set_status_message(message, StatusLevel::Debug, false);
+                let previous_state = std::mem::replace(&mut previous, state.clone());
+                match &crawler.inner.status_message_callback {
+                    Some(callback) => callback(StatusMessageInfo { message, state, previous_state }).await,
+                    None => crawler.set_status_message(message, StatusLevel::Debug, false),
+                }
+            }
+        })
+    }
+
+    /// Logs the statistics every minute until the returned task is aborted (`logIntervalSecs`).
+    fn spawn_statistics_logger(&self) -> tokio::task::JoinHandle<()> {
+        let statistics = self.inner.statistics.clone();
+        let message = format!("{} request statistics:", crawler_name::<P::Out>());
+        tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(STATISTICS_LOG_INTERVAL);
+            ticker.tick().await;
+            loop {
+                ticker.tick().await;
+                let stats = statistics.snapshot();
+                tracing::info!(
+                    request_avg_failed_duration_millis = stats.request_avg_failed_duration_millis,
+                    request_avg_succeeded_duration_millis = stats.request_avg_succeeded_duration_millis,
+                    requests_succeeded_per_minute = stats.requests_succeeded_per_minute,
+                    requests_failed_per_minute = stats.requests_failed_per_minute,
+                    request_total_duration_millis = stats.request_total_duration_millis,
+                    requests_total = stats.requests_total,
+                    crawler_runtime_millis = stats.crawler_runtime_millis,
+                    retry_histogram = ?stats.retry_histogram,
+                    "{message}"
+                );
             }
         })
     }
@@ -658,10 +880,15 @@ where
         Ok(items.len())
     }
 
-    /// Adds `requests` and crawls until the queue is finished (or a limit is reached).
+    /// Adds `requests` and crawls until the queue is finished (or a limit is reached, or
+    /// [`stop`](Self::stop) is called).
     ///
-    /// Returns an error only for a critical failure (a [`CriticalError`], a missing route or a
-    /// storage failure); failed requests are reported in the statistics.
+    /// Running a crawler again continues with the same request queue: requests handled before are
+    /// not crawled again. The crawler's own statistics and session pool start over.
+    ///
+    /// Returns an error only for a critical failure (a [`CriticalError`], a missing route, an
+    /// error handler that failed or a storage failure); failed requests are reported in the
+    /// statistics.
     ///
     /// [`CriticalError`]: crawlee_core::CriticalError
     pub async fn run<I, R>(&self, requests: I) -> anyhow::Result<FinalStatistics>
@@ -670,28 +897,89 @@ where
         R: Into<Request>,
     {
         let inner = &self.inner;
-        let shared = self.shared().await?.clone();
+        let run = {
+            let mut live = inner.run.lock();
+            if live.is_some() {
+                anyhow::bail!(
+                    "This crawler instance is already running, you can add more requests to it via \
+                     `crawler.add_requests()`."
+                );
+            }
+            // A crawler-built concurrency system is built for every run, so that it starts from a
+            // clean slate; a supplied one belongs to the caller.
+            let concurrency = match &inner.injected_concurrency {
+                Some(system) => system.clone(),
+                None => Arc::new(ConcurrencySystem::new(inner.options.concurrency.clone())?),
+            };
+            *inner.concurrency.lock() = Some(concurrency.clone());
+            let run = Arc::new(RunState::new(concurrency));
+            *live = Some(run.clone());
+            run
+        };
+        // Lets the crawler run again however this run ends.
+        let _live = LiveRun(&inner.run);
+        let concurrency = run.concurrency.clone();
+        let owns_concurrency = inner.injected_concurrency.is_none();
         let events = &inner.services.events;
         let owns_event_manager = !events.is_initialized();
-        if owns_event_manager {
-            events.init().await;
-        }
-        // Loads the state of a previous run, if the crawl is resuming.
-        inner.statistics_state.initialize().await?;
-        if inner.options.use_session_pool {
-            inner.session_pool_state.initialize().await?;
-        }
 
-        self.add_requests(requests).await?;
-        inner.statistics.start();
-        inner.concurrency.start(&inner.services);
+        let started = async {
+            if inner.has_finished_before.load(Ordering::Acquire) {
+                // Only what the crawler built starts over; what was supplied keeps its state.
+                if inner.owns_statistics {
+                    inner.statistics_state.reset();
+                    inner.statistics_state.reset_store().await?;
+                }
+                if inner.owns_session_pool {
+                    inner.session_pool_state.reset();
+                    inner.session_pool_state.reset_store().await?;
+                }
+            }
+            let shared = self.shared().await?.clone();
+            if owns_event_manager {
+                events.init().await;
+            }
+            // Loads the state of a previous run, if the crawl is resuming.
+            inner.statistics_state.initialize().await?;
+            if inner.options.use_session_pool {
+                inner.session_pool_state.initialize().await?;
+            }
+            self.add_requests(requests).await?;
+            if owns_concurrency {
+                concurrency.start(&inner.services);
+            } else if !concurrency.is_running() {
+                return Err(anyhow::Error::from(CriticalError::new(
+                    "The ConcurrencySystem this crawler borrows has not been started, so system load would not be \
+                     monitored and the concurrency would never be adjusted. Whoever creates a ConcurrencySystem owns \
+                     its lifecycle: start it before running the crawlers that use it, and stop it once they are all \
+                     done.",
+                )));
+            }
+            inner.statistics.start();
+            Ok::<_, anyhow::Error>(shared)
+        };
+        let shared = match started.await {
+            Ok(shared) => shared,
+            Err(err) => {
+                // Cleaned up, so that a failed start does not leave anything running.
+                if owns_concurrency {
+                    concurrency.stop();
+                }
+                if owns_event_manager && events.is_initialized() {
+                    events.close().await;
+                }
+                return Err(err);
+            }
+        };
+
         tracing::info!(
-            min_concurrency = inner.concurrency.min_concurrency(),
-            max_concurrency = inner.concurrency.max_concurrency(),
-            desired_concurrency = inner.concurrency.desired_concurrency(),
+            min_concurrency = concurrency.min_concurrency(),
+            max_concurrency = concurrency.max_concurrency(),
+            desired_concurrency = concurrency.desired_concurrency(),
             "Starting the crawler."
         );
-        let status_logger = self.spawn_status_logger();
+        let status_logger = self.spawn_status_logger(shared.clone(), concurrency.clone());
+        let statistics_logger = self.spawn_statistics_logger();
         self.set_status_message("Starting the crawler.", StatusLevel::Info, false);
 
         let pause_listeners = [EventKind::Migrating, EventKind::Aborting].map(|kind| {
@@ -701,11 +989,23 @@ where
                 async move { crawler.pause_on_migration().await }
             })
         });
+        let sigint = sigint::listen();
+        let sigint_handler = {
+            let (crawler, run) = (self.clone(), run.clone());
+            tokio::spawn(async move {
+                sigint.notified().await;
+                tracing::warn!(
+                    "Pausing... Press CTRL+C again to force exit. To resume, do: CRAWLEE_PURGE_ON_START=0 cargo run"
+                );
+                crawler.pause_on_migration().await;
+                run.abort();
+            })
+        };
 
-        let run = RunState::default();
         let mut result = self.task_loop(&shared, &run).await;
+        sigint_handler.abort();
+        statistics_logger.abort();
         inner.statistics.finish();
-        inner.concurrency.stop();
         for id in pause_listeners {
             events.off(id);
         }
@@ -722,13 +1022,53 @@ where
             events.emit(Event::PersistState { is_migrating: false });
             events.wait_for_all_listeners_to_complete().await;
         }
+
+        let stats = inner.statistics.snapshot();
+        tracing::info!(
+            requests_succeeded = stats.requests_succeeded,
+            requests_failed = stats.requests_failed,
+            requests_retries = stats.requests_retries,
+            request_avg_succeeded_duration_millis = stats.request_avg_succeeded_duration_millis,
+            request_avg_failed_duration_millis = stats.request_avg_failed_duration_millis,
+            requests_total = stats.requests_total,
+            crawler_runtime_millis = stats.crawler_runtime_millis,
+            retry_histogram = ?stats.retry_histogram,
+            "Final request statistics:"
+        );
+        if stats.requests_total == 0 {
+            // Starting against handled requests is resuming a crawl; doing nothing then is a mistake.
+            let already_handled = shared.request_manager.handled_count().await.unwrap_or(0);
+            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if already_handled > 0 && !WARNED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "This crawl processed no requests - the request manager holds {already_handled} request{}, all of \
+                     them already handled, and a failed request counts as handled too. Nothing empties a queue \
+                     between runs, so to crawl them again, purge it or use a fresh one (e.g. a request queue opened \
+                     with an alias) with a freshly created crawler instance.",
+                    if already_handled == 1 { "" } else { "s" }
+                );
+            }
+        }
+        let total_errors: u64 = stats.errors.values().sum();
+        if total_errors > 0 {
+            let mut most_common: Vec<(&String, &u64)> = stats.errors.iter().collect();
+            most_common.sort_by(|a, b| b.1.cmp(a.1));
+            let most_common: Vec<String> =
+                most_common.iter().take(3).map(|(message, count)| format!("{count}x: {message}")).collect();
+            tracing::info!(
+                total_errors,
+                unique_errors = stats.errors.len(),
+                most_common_errors = ?most_common,
+                "Error analysis:"
+            );
+        }
+
         if let Err(err) = inner.services.storage.teardown().await {
             tracing::warn!("Failed to tear down the storage: {err}");
             result = result.and(Err(err.into()));
         }
 
         status_logger.abort();
-        let stats = inner.statistics.snapshot();
         self.set_status_message(
             format!(
                 "Finished! Total {} requests: {} succeeded, {} failed.",
@@ -737,18 +1077,13 @@ where
             StatusLevel::Info,
             true,
         );
+        if owns_concurrency {
+            concurrency.stop();
+        }
+        inner.has_finished_before.store(true, Ordering::Release);
 
         match result {
-            Ok(()) => {
-                tracing::info!(
-                    requests_succeeded = stats.requests_succeeded,
-                    requests_failed = stats.requests_failed,
-                    requests_retries = stats.requests_retries,
-                    crawler_runtime_millis = stats.crawler_runtime_millis,
-                    "Crawler finished."
-                );
-                Ok(stats)
-            }
+            Ok(()) => Ok(stats),
             Err(err) => {
                 tracing::error!("Crawler stopped by a critical error: {err:#}");
                 Err(err)
@@ -763,13 +1098,18 @@ where
     /// (`maybeRunIntervalSecs`). Once no task runs and none is ready, the crawl ends if the
     /// request manager is finished.
     async fn task_loop(&self, shared: &Arc<CrawlerShared>, run: &RunState) -> anyhow::Result<()> {
-        let concurrency = &self.inner.concurrency;
+        let concurrency = &run.concurrency;
         let mut tasks: JoinSet<anyhow::Result<()>> = JoinSet::new();
         let mut wake_at: Option<tokio::time::Instant> = None;
 
         loop {
             while let Some(joined) = tasks.try_join_next() {
                 Self::check_task(joined, &mut tasks)?;
+            }
+            if run.aborted.load(Ordering::Acquire) {
+                // Ends the run without waiting for the running requests.
+                tasks.abort_all();
+                return Ok(());
             }
 
             // `maybeRunTask`; a paused crawler starts nothing and does not finish.
@@ -797,6 +1137,7 @@ where
 
             let added = shared.requests_added.notified();
             let resumed = shared.resumed.notified();
+            let nudged = run.nudge.notified();
             let wake = async {
                 match wake_at {
                     Some(at) => tokio::time::sleep_until(at).await,
@@ -807,6 +1148,7 @@ where
                 Some(joined) = tasks.join_next(), if !tasks.is_empty() => Self::check_task(joined, &mut tasks)?,
                 () = added => {}
                 () = resumed => {}
+                () = nudged => {}
                 () = wake => wake_at = None,
                 () = tokio::time::sleep(MAYBE_RUN_INTERVAL) => {}
             }
@@ -834,6 +1176,17 @@ where
             });
             return Ok(false);
         }
+        if run.stop_requested.load(Ordering::Acquire) {
+            run.log_once("shuttingDown", || {
+                "No new requests are allowed because the `stop()` method has been called. Ongoing requests will be \
+                 allowed to complete."
+                    .to_owned()
+            });
+            return Ok(false);
+        }
+        if let Some(is_task_ready) = &self.inner.task_loop.is_task_ready {
+            return is_task_ready().await;
+        }
         let manager = &shared.request_manager;
         if !manager.is_empty().await? {
             return Ok(true);
@@ -850,7 +1203,7 @@ where
 
     /// Whether the crawl is over, asked once nothing runs and nothing is ready
     /// (`isFinishedFunction`).
-    async fn is_finished(&self, shared: &CrawlerShared, _run: &RunState) -> anyhow::Result<bool> {
+    async fn is_finished(&self, shared: &CrawlerShared, run: &RunState) -> anyhow::Result<bool> {
         if let Some(max) = self.inner.options.max_requests_per_crawl
             && self.inner.statistics.requests_finished() >= max
         {
@@ -862,9 +1215,25 @@ where
             );
             return Ok(true);
         }
-        let finished = shared.request_manager.is_finished().await?;
+        if run.stop_requested.load(Ordering::Acquire) {
+            tracing::info!("The crawler has finished all the remaining ongoing requests and will shut down now.");
+            return Ok(true);
+        }
+        // With `keep_alive`, an empty queue is waited out.
+        if self.inner.options.keep_alive {
+            return Ok(false);
+        }
+        let finished = match &self.inner.task_loop.is_finished {
+            Some(is_finished) => is_finished().await?,
+            None => shared.request_manager.is_finished().await?,
+        };
         if finished {
-            tracing::info!("All requests from the queue have been processed, the crawler will shut down.");
+            match self.inner.task_loop.is_finished {
+                Some(_) => {
+                    tracing::info!("Crawler's custom isFinishedFunction() returned true, the crawler will shut down.")
+                }
+                None => tracing::info!("All requests from the queue have been processed, the crawler will shut down."),
+            }
         }
         Ok(finished)
     }
@@ -892,9 +1261,10 @@ where
         (self.inner.options.request_handler_timeout * 2).max(Duration::from_secs(300))
     }
 
-    /// The concurrency system this crawler scales with.
-    pub fn concurrency_system(&self) -> &Arc<ConcurrencySystem> {
-        &self.inner.concurrency
+    /// The concurrency system of the run in progress, or of the last run; `None` before the
+    /// first. A crawler-built one is built for every run, so do not keep it across runs.
+    pub fn concurrency_system(&self) -> Option<Arc<ConcurrencySystem>> {
+        self.inner.concurrency.lock().clone()
     }
 
     fn check_task(
@@ -1347,17 +1717,118 @@ where
     }
 }
 
-/// What one `run()` keeps: messages logged once per run.
-#[derive(Default)]
+/// What one `run()` keeps (`CrawlerRun`).
 struct RunState {
+    concurrency: Arc<ConcurrencySystem>,
+    stop_requested: std::sync::atomic::AtomicBool,
+    /// Set by a SIGINT: the run ends without waiting for the running requests.
+    aborted: std::sync::atomic::AtomicBool,
+    /// Wakes the task loop.
+    nudge: Notify,
     logged: parking_lot::Mutex<std::collections::HashSet<&'static str>>,
 }
 
 impl RunState {
+    fn new(concurrency: Arc<ConcurrencySystem>) -> Self {
+        RunState {
+            concurrency,
+            stop_requested: Default::default(),
+            aborted: Default::default(),
+            nudge: Notify::new(),
+            logged: Default::default(),
+        }
+    }
+
+    /// Only the first call logs `reason`.
+    fn stop(&self, reason: &str) {
+        if !self.stop_requested.swap(true, Ordering::AcqRel) {
+            tracing::info!("{reason}");
+        }
+        self.nudge.notify_one();
+    }
+
+    fn abort(&self) {
+        self.aborted.store(true, Ordering::Release);
+        self.nudge.notify_one();
+    }
+
     /// Logs `message` the first time this run asks for it under `key` (`logOnce`).
     fn log_once(&self, key: &'static str, message: impl FnOnce() -> String) {
         if self.logged.lock().insert(key) {
             tracing::info!("{}", message());
+        }
+    }
+}
+
+/// Clears the run in progress when dropped.
+struct LiveRun<'a>(&'a parking_lot::Mutex<Option<Arc<RunState>>>);
+
+impl Drop for LiveRun<'_> {
+    fn drop(&mut self) {
+        self.0.lock().take();
+    }
+}
+
+/// `CheerioCrawler` for a pipeline that ends in `CheerioContext`, as `this.constructor.name`.
+fn crawler_name<C>() -> String {
+    let context = std::any::type_name::<C>().rsplit("::").next().unwrap_or("Basic");
+    format!("{}Crawler", context.strip_suffix("Context").unwrap_or(context))
+}
+
+/// SIGINT (Ctrl+C) handling. The first one during a run pauses it, saves its state and ends it;
+/// a second one exits the process, as does one when no crawler runs, which is what SIGINT did
+/// before the handler was installed.
+mod sigint {
+    use std::sync::{Arc, Weak};
+
+    use parking_lot::Mutex;
+    use tokio::sync::Notify;
+
+    /// Woken when the run that registered it gets a SIGINT.
+    pub(super) struct Sigint {
+        notify: Arc<Notify>,
+        _registration: Registration,
+    }
+
+    impl Sigint {
+        /// Waits for a SIGINT.
+        pub(super) async fn notified(&self) {
+            self.notify.notified().await;
+        }
+    }
+
+    struct Registration(Weak<Notify>);
+
+    impl Drop for Registration {
+        fn drop(&mut self) {
+            LISTENERS.lock().retain(|listener| !listener.ptr_eq(&self.0));
+        }
+    }
+
+    static LISTENERS: Mutex<Vec<Weak<Notify>>> = Mutex::new(Vec::new());
+    static WATCHER: Mutex<Option<tokio::task::JoinHandle<()>>> = Mutex::new(None);
+
+    pub(super) fn listen() -> Sigint {
+        let notify = Arc::new(Notify::new());
+        LISTENERS.lock().push(Arc::downgrade(&notify));
+        let mut watcher = WATCHER.lock();
+        if watcher.as_ref().is_none_or(|task| task.is_finished()) {
+            *watcher = Some(tokio::spawn(watch()));
+        }
+        Sigint { _registration: Registration(Arc::downgrade(&notify)), notify }
+    }
+
+    async fn watch() {
+        let mut pausing = false;
+        while tokio::signal::ctrl_c().await.is_ok() {
+            let listeners: Vec<Arc<Notify>> = LISTENERS.lock().iter().filter_map(Weak::upgrade).collect();
+            if listeners.is_empty() || pausing {
+                std::process::exit(130);
+            }
+            pausing = true;
+            for listener in listeners {
+                listener.notify_one();
+            }
         }
     }
 }

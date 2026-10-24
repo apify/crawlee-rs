@@ -471,6 +471,9 @@ async fn file_system_storage_is_purged_once_per_process() {
 
 #[tokio::test]
 async fn a_crawl_resumes_with_its_statistics_and_state() {
+    // Built first, so that neither crawl below is the first crawler of the process, which alone
+    // uses the default request queue.
+    noop_crawler().build().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let crawl = |purge_on_start: bool, urls: Vec<&'static str>| {
         let configuration =
@@ -628,7 +631,7 @@ async fn peak_concurrency(overloaded: bool) -> (usize, usize) {
         .unwrap();
     let urls: Vec<String> = (0..80).map(|i| format!("https://a.dev/{i}")).collect();
     assert_eq!(crawler.run(urls).await.unwrap().requests_succeeded, 80);
-    (peak.load(Ordering::SeqCst), crawler.concurrency_system().desired_concurrency())
+    (peak.load(Ordering::SeqCst), crawler.concurrency_system().unwrap().desired_concurrency())
 }
 
 #[tokio::test]
@@ -1253,4 +1256,169 @@ async fn requests_are_locked_for_the_longest_handler_timeout_and_a_margin() {
         crawler.add_requests(Vec::<Request>::new()).await.unwrap();
         assert_eq!(*manager.1.lock(), [Duration::from_secs(expected)]);
     }
+}
+
+fn noop_crawler() -> crawlee_basic::BasicCrawlerBuilder<crawlee_basic::Identity> {
+    BasicCrawler::builder().services(services()).request_handler(|_ctx: BasicContext| async move { Ok(()) })
+}
+
+#[tokio::test]
+async fn a_running_crawler_cannot_be_run_again() {
+    let crawler = BasicCrawler::builder()
+        .services(services())
+        .request_handler(|_ctx: BasicContext| async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            Ok(())
+        })
+        .build()
+        .unwrap();
+    let first = tokio::spawn({
+        let crawler = crawler.clone();
+        async move { crawler.run(["https://a.dev/1"]).await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let err = crawler.run(["https://a.dev/2"]).await.unwrap_err();
+    assert!(err.to_string().contains("already running"), "{err}");
+    first.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_repeated_run_starts_with_fresh_statistics_sessions_and_concurrency() {
+    let crawler = noop_crawler().build().unwrap();
+    assert!(crawler.concurrency_system().is_none(), "none before the first run");
+    let first = crawler.run(["https://a.dev/1", "https://a.dev/2"]).await.unwrap();
+    assert_eq!(first.requests_succeeded, 2);
+    let first_system = crawler.concurrency_system().unwrap();
+    assert!(crawler.session_pool().usable_count() > 0);
+
+    let second = crawler.run(["https://a.dev/3"]).await.unwrap();
+    assert_eq!(second.requests_succeeded, 1, "the statistics of the first run are reset");
+    assert!(!Arc::ptr_eq(&first_system, &crawler.concurrency_system().unwrap()));
+}
+
+#[tokio::test]
+async fn statistics_sessions_and_concurrency_can_be_injected() {
+    use crawlee_basic::{ConcurrencySystem, SessionPool, Statistics};
+
+    let statistics = Arc::new(Statistics::with_id("injected"));
+    let pool = Arc::new(SessionPool::new(Default::default(), None));
+    let system = Arc::new(ConcurrencySystem::new(Default::default()).unwrap());
+    let crawler = noop_crawler()
+        .statistics(statistics.clone())
+        .session_pool(pool.clone())
+        .concurrency_system(system.clone())
+        .build()
+        .unwrap();
+
+    // The caller starts and stops an injected concurrency system.
+    assert!(crawler.run(["https://a.dev/1"]).await.is_err());
+    let services = services();
+    system.start(&services);
+    crawler.run(["https://a.dev/1"]).await.unwrap();
+    crawler.run(["https://a.dev/2"]).await.unwrap();
+    assert!(system.is_running());
+    system.stop();
+    assert_eq!(statistics.requests_succeeded(), 2, "an injected instance is not reset");
+    assert!(Arc::ptr_eq(&crawler.concurrency_system().unwrap(), &system));
+    assert!(pool.usable_count() > 0);
+
+    let conflict = noop_crawler().max_concurrency(3).concurrency_system(system).build();
+    assert!(conflict.is_err());
+}
+
+#[tokio::test]
+async fn stop_lets_running_requests_finish_and_starts_no_more() {
+    let slot: Arc<Mutex<Option<BasicCrawler>>> = Arc::default();
+    let handled = Arc::new(AtomicUsize::new(0));
+    let (crawler_slot, counter) = (slot.clone(), handled.clone());
+    let crawler = BasicCrawler::builder()
+        .services(services())
+        .max_concurrency(1)
+        .request_handler(move |_ctx: BasicContext| {
+            let (crawler_slot, counter) = (crawler_slot.clone(), counter.clone());
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                crawler_slot.lock().as_ref().unwrap().stop(None);
+                Ok(())
+            }
+        })
+        .build()
+        .unwrap();
+    *slot.lock() = Some(crawler.clone());
+    let stats = crawler.run((1..=5).map(|i| format!("https://a.dev/{i}"))).await.unwrap();
+    assert_eq!(stats.requests_succeeded, 1);
+    assert_eq!(handled.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn keep_alive_waits_for_more_requests_until_stopped() {
+    let crawler = noop_crawler().keep_alive(true).build().unwrap();
+    let run = tokio::spawn({
+        let crawler = crawler.clone();
+        async move { crawler.run(Vec::<String>::new()).await.unwrap() }
+    });
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert!(!run.is_finished(), "an empty queue does not end the run");
+    crawler.add_requests(["https://a.dev/late"]).await.unwrap();
+    while crawler.statistics().requests_succeeded() == 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    crawler.stop(Some("done"));
+    assert_eq!(run.await.unwrap().requests_succeeded, 1);
+}
+
+#[tokio::test]
+async fn the_task_loop_predicates_can_be_replaced() {
+    let crawler = noop_crawler()
+        .task_loop_options(crawlee_basic::TaskLoopOptions {
+            is_task_ready: Some(Arc::new(|| Box::pin(async { Ok(false) }))),
+            is_finished: Some(Arc::new(|| Box::pin(async { Ok(true) }))),
+        })
+        .build()
+        .unwrap();
+    let stats = crawler.run(["https://a.dev/1"]).await.unwrap();
+    assert_eq!(stats.requests_succeeded, 0);
+}
+
+#[tokio::test]
+async fn crawlers_have_request_queues_of_their_own() {
+    let services = services();
+    let build = |id: &str| {
+        BasicCrawler::builder()
+            .services(services.clone())
+            .id(id)
+            .request_handler(|_ctx: BasicContext| async move { Ok(()) })
+            .build()
+            .unwrap()
+    };
+    let (first, second) = (build("first"), build("second"));
+    first.add_requests(["https://a.dev/first"]).await.unwrap();
+    let stats = second.run(["https://a.dev/second"]).await.unwrap();
+    assert_eq!(stats.requests_succeeded, 1, "the first crawler's request is not in its queue");
+}
+
+#[tokio::test]
+async fn the_status_message_counts_the_total_and_can_go_to_a_callback() {
+    let messages = Arc::new(Mutex::new(Vec::new()));
+    let log = messages.clone();
+    let crawler = BasicCrawler::builder()
+        .services(services())
+        .max_concurrency(1)
+        .options(crawlee_basic::CrawlerOptions {
+            status_message_interval: Duration::from_millis(50),
+            ..Default::default()
+        })
+        .status_message_callback(move |status: crawlee_basic::StatusMessageInfo| {
+            log.lock().push(status.message);
+            std::future::ready(())
+        })
+        .request_handler(|_ctx: BasicContext| async move {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            Ok(())
+        })
+        .build()
+        .unwrap();
+    crawler.run(["https://a.dev/1", "https://a.dev/2"]).await.unwrap();
+    let messages = messages.lock().clone();
+    assert!(messages.iter().any(|message| message.starts_with("Crawled 1/2 pages")), "{messages:?}");
 }

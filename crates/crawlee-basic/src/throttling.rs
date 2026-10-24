@@ -543,6 +543,15 @@ impl RequestManager for ThrottlingRequestManager {
         Ok(total.saturating_sub(self.0.state.lock().migrated_from_inner))
     }
 
+    async fn total_count(&self) -> StorageResult<u64> {
+        self.0.ensure_ready().await?;
+        let mut total = self.0.inner_manager.total_count().await?;
+        for queue in self.0.all_queues() {
+            total += queue.total_count().await?;
+        }
+        Ok(total.saturating_sub(self.0.state.lock().migrated_from_inner))
+    }
+
     async fn pending_count(&self) -> StorageResult<u64> {
         self.0.ensure_ready().await?;
         let mut total = self.0.inner_manager.pending_count().await?;

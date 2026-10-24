@@ -50,6 +50,11 @@ pub trait RequestManager: Send + Sync {
     /// All work is done: nothing pending, nothing in progress.
     async fn is_finished(&self) -> StorageResult<bool>;
     async fn handled_count(&self) -> StorageResult<u64>;
+    /// Requests ever added, handled ones included (`getTotalCount`). A manager that cannot tell
+    /// returns 0.
+    async fn total_count(&self) -> StorageResult<u64> {
+        Ok(0)
+    }
     /// Requests not handled yet, in progress included (`getPendingCount`). A manager that cannot
     /// tell returns 0.
     async fn pending_count(&self) -> StorageResult<u64> {
@@ -270,6 +275,10 @@ impl RequestManager for RequestQueue {
 
     async fn handled_count(&self) -> StorageResult<u64> {
         Ok(self.backend.get_metadata().await?.handled_request_count)
+    }
+
+    async fn total_count(&self) -> StorageResult<u64> {
+        Ok(self.backend.get_metadata().await?.total_request_count)
     }
 
     async fn pending_count(&self) -> StorageResult<u64> {
