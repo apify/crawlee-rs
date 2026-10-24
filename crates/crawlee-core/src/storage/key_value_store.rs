@@ -1,6 +1,7 @@
 //! [`KeyValueStore`]: records addressed by key, each with a content type.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use serde::Serialize;
@@ -22,6 +23,29 @@ pub const CONTENT_TYPE_BINARY: &str = "application/octet-stream";
 pub struct KeyValueStore {
     backend: Arc<dyn KeyValueStoreBackend>,
     cache_link: CacheLink,
+    counters: Arc<KeyValueStoreCounters>,
+}
+
+/// The operations a key-value store handle (and its clones) issued to the backend, counted per
+/// backend call (`KeyValueStoreStats` in JS).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct KeyValueStoreStats {
+    /// Records read.
+    pub read_count: u64,
+    /// Records written.
+    pub write_count: u64,
+    /// Records deleted.
+    pub delete_count: u64,
+    /// Pages of keys listed.
+    pub list_count: u64,
+}
+
+#[derive(Default)]
+struct KeyValueStoreCounters {
+    read: AtomicU64,
+    write: AtomicU64,
+    delete: AtomicU64,
+    list: AtomicU64,
 }
 
 impl std::fmt::Debug for KeyValueStore {
@@ -68,7 +92,7 @@ impl KeyValueStore {
     }
 
     pub fn from_backend(backend: Arc<dyn KeyValueStoreBackend>) -> Self {
-        KeyValueStore { backend, cache_link: CacheLink::default() }
+        KeyValueStore { backend, cache_link: CacheLink::default(), counters: Arc::default() }
     }
 
     pub(crate) fn with_cache_link(mut self, link: CacheLink) -> Self {
@@ -86,7 +110,7 @@ impl KeyValueStore {
 
     /// Reads a JSON record into `T`. Returns `None` if the key does not exist.
     pub async fn get_value<T: DeserializeOwned>(&self, key: &str) -> StorageResult<Option<T>> {
-        match self.backend.get_value(key).await? {
+        match self.read_record(key).await? {
             Some(record) => Ok(Some(serde_json::from_slice(&record.value)?)),
             None => Ok(None),
         }
@@ -94,7 +118,7 @@ impl KeyValueStore {
 
     /// Reads a textual record (`text/*`, JSON or XML) as a string.
     pub async fn get_text(&self, key: &str) -> StorageResult<Option<String>> {
-        let Some(record) = self.backend.get_value(key).await? else {
+        let Some(record) = self.read_record(key).await? else {
             return Ok(None);
         };
         if let Some(content_type) = &record.content_type
@@ -111,19 +135,44 @@ impl KeyValueStore {
 
     /// Reads the raw record.
     pub async fn get_record(&self, key: &str) -> StorageResult<Option<KeyValueStoreRecord>> {
+        self.read_record(key).await
+    }
+
+    async fn read_record(&self, key: &str) -> StorageResult<Option<KeyValueStoreRecord>> {
+        self.counters.read.fetch_add(1, Ordering::Relaxed);
         self.backend.get_value(key).await
+    }
+
+    /// Writes a record that was already validated and serialized.
+    pub(crate) async fn write_record(&self, record: KeyValueStoreRecord) -> StorageResult<()> {
+        self.counters.write.fetch_add(1, Ordering::Relaxed);
+        self.backend.set_value(record).await
+    }
+
+    /// Deletes a record whose key was already validated.
+    pub(crate) async fn delete_record(&self, key: &str) -> StorageResult<()> {
+        self.counters.delete.fetch_add(1, Ordering::Relaxed);
+        self.backend.delete_value(key).await
+    }
+
+    pub fn stats(&self) -> KeyValueStoreStats {
+        KeyValueStoreStats {
+            read_count: self.counters.read.load(Ordering::Relaxed),
+            write_count: self.counters.write.load(Ordering::Relaxed),
+            delete_count: self.counters.delete.load(Ordering::Relaxed),
+            list_count: self.counters.list.load(Ordering::Relaxed),
+        }
     }
 
     /// Stores `value` as pretty-printed JSON.
     pub async fn set_value<T: Serialize + ?Sized>(&self, key: &str, value: &T) -> StorageResult<()> {
         validate_key(key)?;
-        self.backend
-            .set_value(KeyValueStoreRecord {
-                key: key.to_owned(),
-                value: serialize_json(value)?,
-                content_type: Some(CONTENT_TYPE_JSON.to_owned()),
-            })
-            .await
+        self.write_record(KeyValueStoreRecord {
+            key: key.to_owned(),
+            value: serialize_json(value)?,
+            content_type: Some(CONTENT_TYPE_JSON.to_owned()),
+        })
+        .await
     }
 
     pub async fn set_text(&self, key: &str, text: impl Into<String>) -> StorageResult<()> {
@@ -133,18 +182,17 @@ impl KeyValueStore {
     /// Stores raw bytes; the content type defaults to `application/octet-stream`.
     pub async fn set_bytes(&self, key: &str, value: Bytes, content_type: Option<&str>) -> StorageResult<()> {
         validate_key(key)?;
-        self.backend
-            .set_value(KeyValueStoreRecord {
-                key: key.to_owned(),
-                value,
-                content_type: Some(content_type.unwrap_or(CONTENT_TYPE_BINARY).to_owned()),
-            })
-            .await
+        self.write_record(KeyValueStoreRecord {
+            key: key.to_owned(),
+            value,
+            content_type: Some(content_type.unwrap_or(CONTENT_TYPE_BINARY).to_owned()),
+        })
+        .await
     }
 
     pub async fn delete_value(&self, key: &str) -> StorageResult<()> {
         validate_key(key)?;
-        self.backend.delete_value(key).await
+        self.delete_record(key).await
     }
 
     pub async fn record_exists(&self, key: &str) -> StorageResult<bool> {
@@ -161,6 +209,7 @@ impl KeyValueStore {
         let mut out = Vec::new();
         let mut cursor = None;
         loop {
+            self.counters.list.fetch_add(1, Ordering::Relaxed);
             let page = self
                 .backend
                 .list_keys(KeyValueStoreListKeysOptions {
@@ -220,5 +269,19 @@ mod tests {
         assert!(store.set_value("bad key", &1).await.is_err());
         store.delete_value("note").await.unwrap();
         assert!(!store.record_exists("note").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn counts_backend_calls() {
+        let storage = MemoryStorageBackend::new();
+        let store = KeyValueStore::open(&storage, &StorageIdentifier::Default).await.unwrap();
+        store.set_value("a", &1).await.unwrap();
+        store.set_text("b", "x").await.unwrap();
+        store.get_value::<i32>("a").await.unwrap();
+        store.get_record("b").await.unwrap();
+        store.delete_value("a").await.unwrap();
+        store.keys(None).await.unwrap();
+        store.record_exists("b").await.unwrap();
+        assert_eq!(store.stats(), KeyValueStoreStats { read_count: 2, write_count: 2, delete_count: 1, list_count: 1 });
     }
 }

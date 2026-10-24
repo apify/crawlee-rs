@@ -21,15 +21,15 @@ pub use crate::recoverable_state::{PersistedState, RecoverableState, SerdeState}
 pub use crate::request::{Request, RequestBuilder};
 pub use crate::services::Services;
 pub use crate::storage::backend::{StorageBackend, StorageIdentifier};
-pub use crate::storage::dataset::Dataset;
+pub use crate::storage::dataset::{Dataset, DatasetStats};
 #[cfg(feature = "fs-storage")]
 pub use crate::storage::file_system::FileSystemStorageBackend;
-pub use crate::storage::key_value_store::KeyValueStore;
+pub use crate::storage::key_value_store::{KeyValueStore, KeyValueStoreStats};
 pub use crate::storage::memory::MemoryStorageBackend;
 pub use crate::storage::request_loader::{
     LoaderStatus, PacingScope, PacingSignal, RequestLoader, RequestManagerTandem,
 };
-pub use crate::storage::request_queue::{RequestManager, RequestQueue};
+pub use crate::storage::request_queue::{RequestManager, RequestQueue, RequestQueueStats};
 pub use crate::system_info::SystemInfo;
 pub use crate::transaction::StorageTransaction;
 

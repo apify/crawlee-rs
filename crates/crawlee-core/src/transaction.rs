@@ -169,12 +169,9 @@ impl StorageTransaction {
             for (key, value) in writes {
                 match value {
                     Some((value, content_type)) => {
-                        store
-                            .backend()
-                            .set_value(KeyValueStoreRecord { key, value, content_type: Some(content_type) })
-                            .await?
+                        store.write_record(KeyValueStoreRecord { key, value, content_type: Some(content_type) }).await?
                     }
-                    None => store.backend().delete_value(&key).await?,
+                    None => store.delete_record(&key).await?,
                 }
             }
         }

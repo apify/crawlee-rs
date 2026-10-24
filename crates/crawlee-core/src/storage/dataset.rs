@@ -1,6 +1,7 @@
 //! [`Dataset`]: an append-only table of JSON objects, typically the crawl results.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -18,6 +19,23 @@ pub const DATASET_ITERATORS_DEFAULT_LIMIT: usize = 10_000;
 pub struct Dataset {
     backend: Arc<dyn DatasetBackend>,
     cache_link: CacheLink,
+    counters: Arc<DatasetCounters>,
+}
+
+/// The operations a dataset handle (and its clones) issued to the backend, counted per backend
+/// call (`DatasetStats` in JS).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DatasetStats {
+    /// `get_data` calls.
+    pub read_count: u64,
+    /// `push_data` calls.
+    pub write_count: u64,
+}
+
+#[derive(Default)]
+struct DatasetCounters {
+    read: AtomicU64,
+    write: AtomicU64,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -43,7 +61,7 @@ impl Dataset {
     }
 
     pub fn from_backend(backend: Arc<dyn DatasetBackend>) -> Self {
-        Dataset { backend, cache_link: CacheLink::default() }
+        Dataset { backend, cache_link: CacheLink::default(), counters: Arc::default() }
     }
 
     pub(crate) fn with_cache_link(mut self, link: CacheLink) -> Self {
@@ -60,17 +78,26 @@ impl Dataset {
         Arc::ptr_eq(&self.backend, &other.backend)
     }
 
+    pub fn stats(&self) -> DatasetStats {
+        DatasetStats {
+            read_count: self.counters.read.load(Ordering::Relaxed),
+            write_count: self.counters.write.load(Ordering::Relaxed),
+        }
+    }
+
     /// Appends one object, or every object of an array.
     pub async fn push_data<T: Serialize + ?Sized>(&self, data: &T) -> StorageResult<()> {
-        self.backend.push_data(serialize_items(data)?).await
+        self.push_items(serialize_items(data)?).await
     }
 
     /// Appends already-serialized items.
     pub async fn push_items(&self, items: Vec<DatasetItem>) -> StorageResult<()> {
+        self.counters.write.fetch_add(1, Ordering::Relaxed);
         self.backend.push_data(items).await
     }
 
     pub async fn get_data<T: DeserializeOwned>(&self, options: DatasetListOptions) -> StorageResult<DatasetPage<T>> {
+        self.counters.read.fetch_add(1, Ordering::Relaxed);
         let page = self.backend.get_data(options).await?;
         let items = page.items.iter().map(|item| serde_json::from_str(item.get())).collect::<Result<Vec<T>, _>>()?;
         Ok(DatasetPage { total: page.total, offset: page.offset, items })
@@ -201,6 +228,16 @@ mod tests {
         assert_eq!(dataset.get_all::<serde_json::Value>().await.unwrap().len(), 10_001);
         let limits: Vec<_> = backend.calls.lock().iter().map(|call| (call.offset, call.limit)).collect();
         assert_eq!(limits, [(0, Some(10_000)), (10_000, Some(10_000))]);
+    }
+
+    #[tokio::test]
+    async fn counts_backend_calls() {
+        let storage = MemoryStorageBackend::new();
+        let dataset = Dataset::open(&storage, &StorageIdentifier::Default).await.unwrap();
+        dataset.push_data(&json!([{ "a": 1 }, { "a": 2 }])).await.unwrap();
+        dataset.clone().push_data(&json!({ "a": 3 })).await.unwrap();
+        dataset.get_all::<serde_json::Value>().await.unwrap();
+        assert_eq!(dataset.stats(), DatasetStats { read_count: 1, write_count: 2 });
     }
 
     #[test]

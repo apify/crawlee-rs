@@ -1,6 +1,7 @@
 //! [`RequestQueue`] and the [`RequestManager`] trait crawlers consume requests through.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -83,8 +84,9 @@ impl DedupCache {
     }
 
     fn slot(fingerprint: u64) -> usize {
-        // Use the high bits for the slot and the full value for the check.
-        (fingerprint >> 44) as usize % DEDUP_CACHE_SLOTS
+        // FNV-1a barely moves the high bits for keys that differ in their last bytes (URLs that
+        // differ in a trailing digit), so they are mixed before picking the slot from them.
+        (fingerprint.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 44) as usize % DEDUP_CACHE_SLOTS
     }
 
     /// Whether the request was handled, or `None` if it is not cached.
@@ -105,6 +107,22 @@ impl DedupCache {
     }
 }
 
+/// The operations a request queue handle (and its clones) issued to the backend, counted per
+/// backend call (`RequestQueueStats` in JS).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RequestQueueStats {
+    /// Adds, `mark_request_as_handled` and `reclaim_request` calls.
+    pub write_count: u64,
+    /// `fetch_next_request` calls.
+    pub head_item_read_count: u64,
+}
+
+#[derive(Default)]
+struct RequestQueueCounters {
+    write: AtomicU64,
+    head_item_read: AtomicU64,
+}
+
 /// A queue of requests to crawl, deduplicated by unique key. Cloning is cheap and clones share
 /// the queue.
 #[derive(Clone)]
@@ -114,6 +132,7 @@ pub struct RequestQueue {
     added: Arc<Mutex<DedupCache>>,
     /// The highest expected processing time passed on to the backend.
     expected_processing_time: Arc<Mutex<Duration>>,
+    counters: Arc<RequestQueueCounters>,
     in_progress_batches: InProgressBatches,
 }
 
@@ -137,6 +156,7 @@ impl RequestQueue {
             cache_link: CacheLink::default(),
             added: Arc::new(Mutex::new(DedupCache { slots: None })),
             expected_processing_time: Arc::default(),
+            counters: Arc::default(),
             in_progress_batches: InProgressBatches::default(),
         }
     }
@@ -177,6 +197,17 @@ impl RequestQueue {
         self.added.lock().clear();
         *self.expected_processing_time.lock() = Duration::ZERO;
         Ok(())
+    }
+
+    pub fn stats(&self) -> RequestQueueStats {
+        RequestQueueStats {
+            write_count: self.counters.write.load(Ordering::Relaxed),
+            head_item_read_count: self.counters.head_item_read.load(Ordering::Relaxed),
+        }
+    }
+
+    fn count_write(&self) {
+        self.counters.write.fetch_add(1, Ordering::Relaxed);
     }
 
     fn cache_request(&self, unique_key: &str, handled: bool) {
@@ -220,6 +251,7 @@ impl RequestManager for RequestQueue {
             return Ok(result);
         }
 
+        self.count_write();
         let added = self.backend.add_batch_of_requests(to_add, forefront).await?;
         {
             let mut cache = self.added.lock();
@@ -259,6 +291,7 @@ impl RequestManager for RequestQueue {
     }
 
     async fn fetch_next_request(&self) -> StorageResult<Option<Request>> {
+        self.counters.head_item_read.fetch_add(1, Ordering::Relaxed);
         self.backend.fetch_next_request().await
     }
 
@@ -267,6 +300,7 @@ impl RequestManager for RequestQueue {
         if request.handled_at.is_none() {
             request.handled_at = Some(crate::now_iso());
         }
+        self.count_write();
         let info = self.backend.mark_request_as_handled(request).await?;
         match &info {
             // The request was not in progress: nothing changed, the request included.
@@ -277,6 +311,7 @@ impl RequestManager for RequestQueue {
     }
 
     async fn reclaim_request(&self, request: &Request, forefront: bool) -> StorageResult<Option<QueueOperationInfo>> {
+        self.count_write();
         let info = self.backend.reclaim_request(request, forefront).await?;
         if let Some(info) = &info {
             self.cache_request(&request.unique_key, info.was_already_handled);
@@ -561,6 +596,19 @@ mod tests {
         assert!(!queue.add_request("https://example.com/a", false).await.unwrap().was_already_present);
     }
 
+    #[tokio::test]
+    async fn counts_backend_calls() {
+        let storage = MemoryStorageBackend::new();
+        let queue = RequestQueue::open(&storage, &StorageIdentifier::Default).await.unwrap();
+        queue.add_requests(urls(2), false).await.unwrap();
+        queue.add_requests(urls(2), false).await.unwrap(); // served from the cache
+        let mut request = queue.fetch_next_request().await.unwrap().unwrap();
+        queue.reclaim_request(&request, false).await.unwrap();
+        request = queue.fetch_next_request().await.unwrap().unwrap();
+        queue.mark_request_as_handled(&mut request).await.unwrap();
+        assert_eq!(queue.stats(), RequestQueueStats { write_count: 3, head_item_read_count: 2 });
+    }
+
     #[test]
     fn dedup_cache_fingerprints() {
         let mut cache = DedupCache { slots: None };
@@ -570,5 +618,11 @@ mod tests {
         cache.insert("https://a.dev", true);
         assert_eq!(cache.get("https://a.dev"), Some(true));
         assert_eq!(cache.get("https://b.dev"), None);
+
+        // Keys that differ only in their last character land in different slots.
+        for i in 0..100 {
+            cache.insert(&format!("https://example.com/{i}"), false);
+        }
+        assert!((0..100).all(|i| cache.get(&format!("https://example.com/{i}")).is_some()));
     }
 }
