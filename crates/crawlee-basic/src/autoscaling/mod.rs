@@ -190,7 +190,7 @@ impl SystemStatus {
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConcurrencyError {
-    #[error("min_concurrency and max_concurrency must be at least 1, and min_concurrency at most max_concurrency")]
+    #[error("min_concurrency and max_concurrency must be at least 1")]
     InvalidBounds,
     #[error("duplicate load signal name {0:?}; switch the built-in signal off to replace it, or rename yours")]
     DuplicateSignal(String),
@@ -235,7 +235,8 @@ impl std::fmt::Debug for ConcurrencySystem {
 
 impl ConcurrencySystem {
     pub fn new(options: ConcurrencyOptions) -> Result<Self, ConcurrencyError> {
-        if options.min_concurrency == 0 || options.max_concurrency < options.min_concurrency {
+        // min > max is allowed: the desired concurrency is clamped to the max (concurrency_system.ts).
+        if options.min_concurrency == 0 || options.max_concurrency == 0 {
             return Err(ConcurrencyError::InvalidBounds);
         }
         let signal_options = &options.load_signals;
@@ -495,6 +496,18 @@ mod tests {
         .unwrap()
     }
 
+    /// A contradictory pair (min above max) resolves in favour of the maximum, as in JS.
+    #[test]
+    fn min_above_max_clamps_the_desired_concurrency_to_the_max() {
+        let system = ConcurrencySystem::new(ConcurrencyOptions {
+            min_concurrency: 10,
+            max_concurrency: 4,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(system.desired_concurrency(), 4);
+    }
+
     #[test]
     fn capacity_follows_desired_and_load() {
         let switch = Arc::new(Switch::default());
@@ -559,7 +572,7 @@ mod tests {
     #[test]
     fn bounds_and_duplicate_names_are_rejected() {
         assert!(matches!(
-            ConcurrencySystem::new(ConcurrencyOptions { min_concurrency: 5, max_concurrency: 2, ..Default::default() }),
+            ConcurrencySystem::new(ConcurrencyOptions { max_concurrency: 0, ..Default::default() }),
             Err(ConcurrencyError::InvalidBounds)
         ));
         let a: Arc<dyn LoadSignal> = Arc::new(Switch::default());

@@ -31,6 +31,7 @@ url.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
+futures.workspace = true
 flate2.workspace = true
 encoding_rs.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net"] }

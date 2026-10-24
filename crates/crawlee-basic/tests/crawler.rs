@@ -650,9 +650,12 @@ struct NumberedProxies(AtomicUsize);
 impl crawlee_basic::ProxySource for NumberedProxies {
     fn new_proxy_info(&self, _session_id: &str) -> Option<crawlee_basic::ProxyInfo> {
         let n = self.0.fetch_add(1, Ordering::Relaxed);
-        Some(crawlee_basic::ProxyInfo::from_url(
-            url::Url::parse(&format!("http://session-{n}@proxy.example:8000")).unwrap(),
-        ))
+        Some(crawlee_basic::ProxyInfo {
+            session_specific: true,
+            ..crawlee_basic::ProxyInfo::from_url(
+                url::Url::parse(&format!("http://session-{n}@proxy.example:8000")).unwrap(),
+            )
+        })
     }
 }
 
@@ -1440,4 +1443,28 @@ async fn the_default_queue_downloads_url_lists_with_the_crawler_http_client() {
     };
     let queue = services.open_request_queue(&identifier).await.unwrap();
     assert!(queue.has_url_list_fetcher());
+}
+
+/// The URLs of a static `ProxyConfiguration` are shared by many attempts: their clients (and
+/// connections) are kept, as JS keeps its clients per proxy URL.
+#[tokio::test]
+async fn without_a_session_pool_shared_proxies_are_not_released() {
+    let client = Arc::new(RecordingClient::default());
+    let crawler = BasicCrawler::builder()
+        .services(services())
+        .use_session_pool(false)
+        .proxy_configuration(Arc::new(
+            crawlee_basic::ProxyConfiguration::new(["http://p1.example:8000", "http://p2.example:8000"]).unwrap(),
+        ))
+        .http_client(client.clone())
+        .request_handler(|ctx: BasicContext| async move {
+            let url = url::Url::parse(&ctx.request().url)?;
+            ctx.send_request(crawlee_http_client::HttpRequest::get(url)).await?;
+            Ok(())
+        })
+        .build()
+        .unwrap();
+
+    crawler.run(["https://a.dev/1", "https://a.dev/2", "https://a.dev/3"]).await.unwrap();
+    assert!(client.released.lock().is_empty(), "released: {:?}", client.released.lock());
 }

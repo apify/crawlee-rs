@@ -37,8 +37,8 @@ use crate::throttling::{ThrottleBy, ThrottledDomains, ThrottlingOptions, Throttl
 
 /// How often the task loop checks whether a task can start (`maybeRunIntervalSecs`).
 const MAYBE_RUN_INTERVAL: Duration = Duration::from_millis(500);
-/// Releases the proxy of a session nothing will use again, once the attempt (with its error
-/// handlers) is over, however it ends.
+/// Releases the session-specific proxy of a session nothing will use again, once the attempt
+/// (with its error handlers) is over, however it ends.
 struct ReleaseProxy {
     client: Arc<dyn HttpClient>,
     session: Arc<Session>,
@@ -46,7 +46,7 @@ struct ReleaseProxy {
 
 impl Drop for ReleaseProxy {
     fn drop(&mut self) {
-        if let Some(proxy) = self.session.proxy_info() {
+        if let Some(proxy) = self.session.proxy_info().filter(|proxy| proxy.session_specific) {
             self.client.release_proxy(&proxy.url);
         }
     }
@@ -637,7 +637,10 @@ where
                     resumed: Notify::new(),
                     in_flight: AtomicUsize::new(0),
                     drained: Notify::new(),
-                    robots: inner.options.respect_robots_txt.clone().map(RobotsCache::new),
+                    robots: inner.options.respect_robots_txt.clone().map(|user_agent| {
+                        RobotsCache::new(user_agent)
+                            .with_sessions(inner.session_pool.clone(), inner.options.use_session_pool)
+                    }),
                     warned: Default::default(),
                 }))
             })
