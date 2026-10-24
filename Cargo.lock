@@ -440,6 +440,7 @@ dependencies = [
  "indexmap",
  "parking_lot",
  "rand 0.9.5",
+ "regex",
  "serde",
  "serde_json",
  "sha2",

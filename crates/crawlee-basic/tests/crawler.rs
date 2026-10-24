@@ -1422,3 +1422,22 @@ async fn the_status_message_counts_the_total_and_can_go_to_a_callback() {
     let messages = messages.lock().clone();
     assert!(messages.iter().any(|message| message.starts_with("Crawled 1/2 pages")), "{messages:?}");
 }
+
+#[tokio::test]
+async fn the_default_queue_downloads_url_lists_with_the_crawler_http_client() {
+    let services = services();
+    let crawler = BasicCrawler::builder()
+        .services(services.clone())
+        .request_handler(|_ctx: BasicContext| async { Ok(()) })
+        .build()
+        .unwrap();
+    crawler.run(Vec::<Request>::new()).await.unwrap();
+    // The first crawler of the process uses the default queue, later ones a queue of their own;
+    // other tests in this binary create crawlers too.
+    let identifier = match crawler.id() {
+        "0" => crawlee_core::StorageIdentifier::Default,
+        id => crawlee_core::StorageIdentifier::Alias(format!("__default_{id}__")),
+    };
+    let queue = services.open_request_queue(&identifier).await.unwrap();
+    assert!(queue.has_url_list_fetcher());
+}

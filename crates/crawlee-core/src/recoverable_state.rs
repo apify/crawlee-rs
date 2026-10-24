@@ -16,7 +16,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 use tokio::sync::OnceCell;
 
-use crate::errors::{StorageError, StorageResult};
+use crate::errors::{StateValidationError, StorageError, StorageResult};
 use crate::events::{EventKind, ListenerId};
 use crate::services::Services;
 use crate::storage::backend::StorageIdentifier;
@@ -32,7 +32,8 @@ const PERSISTENCE_TIMEOUT: Duration = Duration::from_secs(60);
 pub trait PersistedState: Send + Sync + 'static {
     /// The record to save, as JSON.
     fn to_record(&self) -> Value;
-    /// Replaces the state with a saved record. An error leaves the state as it was.
+    /// Replaces the state with a saved record. An error leaves the state as it was and fails
+    /// [`RecoverableState::initialize`] with a [`StateValidationError`].
     fn restore(&self, record: Value) -> Result<(), BoxError>;
     /// Back to the initial state.
     fn reset(&self);
@@ -151,14 +152,15 @@ impl<S: PersistedState> RecoverableState<S> {
 
         // Load first, then listen: an event arriving in between would otherwise save the
         // initial state over the record before it is read.
+        let mut invalid = None;
         if !self.inner.loaded.swap(true, Ordering::AcqRel) {
             let record: Option<Value> = tokio::time::timeout(PERSISTENCE_TIMEOUT, store.get_value(&self.inner.key))
                 .await
                 .map_err(|_| self.timeout_error("Loading"))??;
             if let Some(record) = record.filter(|record| !record.is_null())
-                && let Err(err) = self.inner.state.restore(record)
+                && let Err(source) = self.inner.state.restore(record)
             {
-                tracing::warn!(key = %self.inner.key, "Ignoring the saved state, which could not be restored: {err}");
+                invalid = Some(StateValidationError { persist_state_key: self.inner.key.clone(), source });
             }
         }
 
@@ -168,7 +170,12 @@ impl<S: PersistedState> RecoverableState<S> {
             async move { this.persist_quietly().await }
         });
         *self.inner.listener.lock() = Some(id);
-        Ok(())
+        // As in JS, a record that cannot be restored fails the initialization, leaving the state
+        // initialized (and saved on events) with its default value.
+        match invalid {
+            Some(err) => Err(err.into()),
+            None => Ok(()),
+        }
     }
 
     /// Stops saving on events and saves one last time.
@@ -320,6 +327,26 @@ mod tests {
 
         assert_eq!(state.state().lock().count, 5);
         assert_eq!(store.get_value::<Counter>("COUNTER").await.unwrap(), Some(Counter { count: 5 }));
+    }
+
+    #[tokio::test]
+    async fn an_invalid_saved_record_fails_initialization_on_the_default_state() {
+        let services = Services::in_memory();
+        let store = services.open_key_value_store(&StorageIdentifier::Default).await.unwrap();
+        store.set_value("COUNTER", &serde_json::json!({ "count": "five" })).await.unwrap();
+
+        let state = RecoverableState::new(&services, "COUNTER", Arc::new(SerdeState::new(Counter::default)), true);
+        let err = state.initialize().await.unwrap_err();
+        assert!(
+            matches!(&err, StorageError::StateValidation(invalid) if invalid.persist_state_key == "COUNTER"),
+            "{err}"
+        );
+        assert!(err.to_string().starts_with("State persisted under key 'COUNTER' failed validation"), "{err}");
+
+        // Left running on the default state, saving it like any other.
+        assert_eq!(state.state().lock().count, 0);
+        assert_eq!(services.events.listener_count(EventKind::PersistState), 1);
+        state.initialize().await.unwrap();
     }
 
     #[tokio::test]
