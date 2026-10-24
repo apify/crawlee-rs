@@ -4,9 +4,9 @@
 
 use std::future::Future;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 
 use super::backend::ProcessedRequest;
@@ -61,25 +61,47 @@ pub struct AddRequestsBatchedResult {
 /// Counts background batches that have not finished, so that a request manager does not report
 /// itself finished while requests are still being added (`#inProgressRequestBatchCount`).
 #[derive(Clone, Debug, Default)]
-pub struct InProgressBatches(Arc<AtomicUsize>);
+pub struct InProgressBatches(Arc<Mutex<BatchCount>>);
+
+#[derive(Debug, Default)]
+struct BatchCount {
+    /// Bumped by [`reset`](InProgressBatches::reset): batches started before no longer count.
+    generation: u64,
+    count: usize,
+}
 
 impl InProgressBatches {
     pub fn any(&self) -> bool {
-        self.0.load(Ordering::Acquire) > 0
+        self.0.lock().count > 0
+    }
+
+    /// Forgets the batches being added, as a purge does in JS (`#inProgressRequestBatchCount = 0`).
+    /// They keep running, but no longer count, not even when they end.
+    pub fn reset(&self) {
+        let mut batches = self.0.lock();
+        batches.generation += 1;
+        batches.count = 0;
     }
 
     fn start(&self) -> InProgressGuard {
-        self.0.fetch_add(1, Ordering::AcqRel);
-        InProgressGuard(self.0.clone())
+        let mut batches = self.0.lock();
+        batches.count += 1;
+        InProgressGuard { batches: self.0.clone(), generation: batches.generation }
     }
 }
 
 /// Decrements the count when the background batches end, even if they panic.
-struct InProgressGuard(Arc<AtomicUsize>);
+struct InProgressGuard {
+    batches: Arc<Mutex<BatchCount>>,
+    generation: u64,
+}
 
 impl Drop for InProgressGuard {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::AcqRel);
+        let mut batches = self.batches.lock();
+        if batches.generation == self.generation {
+            batches.count -= 1;
+        }
     }
 }
 

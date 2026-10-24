@@ -292,6 +292,7 @@ impl RequestQueue {
     pub async fn purge(&self) -> StorageResult<()> {
         self.backend.purge().await?;
         self.added.lock().clear();
+        self.in_progress_batches.reset();
         *self.expected_processing_time.lock() = Duration::ZERO;
         Ok(())
     }
@@ -760,6 +761,28 @@ mod tests {
         queue.purge().await.unwrap();
         assert!(queue.is_finished().await.unwrap());
         assert!(!queue.add_request("https://example.com/a", false).await.unwrap().was_already_present);
+    }
+
+    #[tokio::test]
+    async fn purge_forgets_the_batches_still_being_added() {
+        let storage = MemoryStorageBackend::new();
+        let queue = RequestQueue::open(&storage, &StorageIdentifier::Default).await.unwrap();
+        let options = AddRequestsBatchedOptions {
+            batch_size: 1,
+            wait_between_batches: Duration::from_secs(60),
+            ..Default::default()
+        };
+        let result = queue.add_requests_batched(urls(3), options).await.unwrap();
+        assert!(result.wait_for_all_requests_to_be_added.is_some());
+        // The second batch is added right away, the third after a minute.
+        while queue.get_info().await.unwrap().total_request_count < 2 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!queue.is_finished().await.unwrap());
+
+        // As if freshly opened: the batches of before do not keep it unfinished.
+        queue.purge().await.unwrap();
+        assert!(queue.is_finished().await.unwrap());
     }
 
     #[tokio::test]
