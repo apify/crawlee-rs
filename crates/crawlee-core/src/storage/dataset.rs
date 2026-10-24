@@ -8,6 +8,7 @@ use serde_json::value::RawValue;
 
 use super::backend::{DatasetBackend, DatasetInfo, DatasetItem, DatasetListOptions, StorageBackend, StorageIdentifier};
 use crate::errors::{StorageError, StorageResult};
+use crate::services::CacheLink;
 
 /// Page size of the dataset iterators and exports.
 pub const DATASET_ITERATORS_DEFAULT_LIMIT: usize = 10_000;
@@ -16,6 +17,7 @@ pub const DATASET_ITERATORS_DEFAULT_LIMIT: usize = 10_000;
 #[derive(Clone)]
 pub struct Dataset {
     backend: Arc<dyn DatasetBackend>,
+    cache_link: CacheLink,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -33,12 +35,20 @@ pub struct DatasetPage<T> {
 }
 
 impl Dataset {
+    /// Opens a new handle on `storage`, outside the instance cache of [`Services`](crate::Services);
+    /// [`Services::open_dataset`](crate::Services::open_dataset)
+    /// returns the same instance on every call.
     pub async fn open(storage: &dyn StorageBackend, id: &StorageIdentifier) -> StorageResult<Self> {
-        Ok(Dataset { backend: storage.create_dataset_backend(id).await? })
+        Ok(Dataset::from_backend(storage.create_dataset_backend(id).await?))
     }
 
     pub fn from_backend(backend: Arc<dyn DatasetBackend>) -> Self {
-        Dataset { backend }
+        Dataset { backend, cache_link: CacheLink::default() }
+    }
+
+    pub(crate) fn with_cache_link(mut self, link: CacheLink) -> Self {
+        self.cache_link = link;
+        self
     }
 
     pub fn backend(&self) -> &Arc<dyn DatasetBackend> {
@@ -90,7 +100,9 @@ impl Dataset {
     }
 
     pub async fn drop_storage(self) -> StorageResult<()> {
-        self.backend.drop_storage().await
+        self.backend.drop_storage().await?;
+        self.cache_link.evict(Arc::as_ptr(&self.backend) as *const ());
+        Ok(())
     }
 }
 

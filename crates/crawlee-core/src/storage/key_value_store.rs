@@ -11,6 +11,7 @@ use super::backend::{
     StorageBackend, StorageIdentifier,
 };
 use crate::errors::{StorageError, StorageResult};
+use crate::services::CacheLink;
 
 pub const CONTENT_TYPE_JSON: &str = "application/json; charset=utf-8";
 pub const CONTENT_TYPE_TEXT: &str = "text/plain; charset=utf-8";
@@ -20,6 +21,7 @@ pub const CONTENT_TYPE_BINARY: &str = "application/octet-stream";
 #[derive(Clone)]
 pub struct KeyValueStore {
     backend: Arc<dyn KeyValueStoreBackend>,
+    cache_link: CacheLink,
 }
 
 impl std::fmt::Debug for KeyValueStore {
@@ -58,12 +60,20 @@ fn is_textual(content_type: &str) -> bool {
 }
 
 impl KeyValueStore {
+    /// Opens a new handle on `storage`, outside the instance cache of [`Services`](crate::Services);
+    /// [`Services::open_key_value_store`](crate::Services::open_key_value_store)
+    /// returns the same instance on every call.
     pub async fn open(storage: &dyn StorageBackend, id: &StorageIdentifier) -> StorageResult<Self> {
-        Ok(KeyValueStore { backend: storage.create_key_value_store_backend(id).await? })
+        Ok(KeyValueStore::from_backend(storage.create_key_value_store_backend(id).await?))
     }
 
     pub fn from_backend(backend: Arc<dyn KeyValueStoreBackend>) -> Self {
-        KeyValueStore { backend }
+        KeyValueStore { backend, cache_link: CacheLink::default() }
+    }
+
+    pub(crate) fn with_cache_link(mut self, link: CacheLink) -> Self {
+        self.cache_link = link;
+        self
     }
 
     pub fn backend(&self) -> &Arc<dyn KeyValueStoreBackend> {
@@ -175,7 +185,9 @@ impl KeyValueStore {
     }
 
     pub async fn drop_storage(self) -> StorageResult<()> {
-        self.backend.drop_storage().await
+        self.backend.drop_storage().await?;
+        self.cache_link.evict(Arc::as_ptr(&self.backend) as *const ());
+        Ok(())
     }
 }
 

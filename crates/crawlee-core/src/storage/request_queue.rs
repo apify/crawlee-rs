@@ -15,6 +15,7 @@ use super::batched_adds::{
 };
 use crate::errors::StorageResult;
 use crate::request::{Request, unique_key_to_request_id};
+use crate::services::CacheLink;
 
 /// Source and sink of requests for a crawler. [`RequestQueue`] is the default implementation;
 /// other request sources (lists, sitemaps, per-domain throttling) implement it as well.
@@ -102,6 +103,7 @@ impl DedupCache {
 #[derive(Clone)]
 pub struct RequestQueue {
     backend: Arc<dyn RequestQueueBackend>,
+    cache_link: CacheLink,
     added: Arc<Mutex<DedupCache>>,
     in_progress_batches: InProgressBatches,
 }
@@ -113,6 +115,9 @@ impl std::fmt::Debug for RequestQueue {
 }
 
 impl RequestQueue {
+    /// Opens a new handle on `storage`, outside the instance cache of [`Services`](crate::Services);
+    /// [`Services::open_request_queue`](crate::Services::open_request_queue)
+    /// returns the same instance on every call.
     pub async fn open(storage: &dyn StorageBackend, id: &StorageIdentifier) -> StorageResult<Self> {
         Ok(Self::from_backend(storage.create_request_queue_backend(id).await?))
     }
@@ -120,9 +125,15 @@ impl RequestQueue {
     pub fn from_backend(backend: Arc<dyn RequestQueueBackend>) -> Self {
         RequestQueue {
             backend,
+            cache_link: CacheLink::default(),
             added: Arc::new(Mutex::new(DedupCache { slots: None })),
             in_progress_batches: InProgressBatches::default(),
         }
+    }
+
+    pub(crate) fn with_cache_link(mut self, link: CacheLink) -> Self {
+        self.cache_link = link;
+        self
     }
 
     pub fn backend(&self) -> &Arc<dyn RequestQueueBackend> {
@@ -151,7 +162,9 @@ impl RequestQueue {
 
     pub async fn drop_storage(self) -> StorageResult<()> {
         self.added.lock().clear();
-        self.backend.drop_storage().await
+        self.backend.drop_storage().await?;
+        self.cache_link.evict(Arc::as_ptr(&self.backend) as *const ());
+        Ok(())
     }
 }
 

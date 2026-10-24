@@ -102,6 +102,9 @@ storage/
 - **Settings:** `CRAWLEE_STORAGE_DIR`, `CRAWLEE_PURGE_ON_START`, `CRAWLEE_PERSIST_STORAGE`
   (`false` keeps everything in memory), or the same keys in `crawlee.json`.
 - **In code:** `Services::from_configuration(...)`, or `Services::in_memory()` for tests.
+- **One instance per storage.** `Services::open_dataset` (and the other `open_*`) returns the
+  instance already open for the same id, name or alias, as `StorageInstanceManager` does in JS.
+  `Dataset::open(backend, id)` and the like open a new handle without that cache.
 
 ## Events and saved state
 
