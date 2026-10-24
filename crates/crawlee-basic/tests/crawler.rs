@@ -49,6 +49,51 @@ async fn handles_every_request_once() {
 }
 
 #[tokio::test]
+async fn run_starts_crawling_after_the_first_batch_and_adds_the_rest_in_the_background() {
+    // As in Crawlee for JS, `run` adds the first 1000 requests, starts crawling, and adds the rest
+    // in batches of 1000 with a pause of 1 s after each.
+    let handled = Arc::new(AtomicUsize::new(0));
+    let first_handled_after = Arc::new(Mutex::new(None));
+    let started = std::time::Instant::now();
+    let (counter, first) = (handled.clone(), first_handled_after.clone());
+    let crawler = BasicCrawler::builder()
+        .services(services())
+        .request_handler(move |_ctx: BasicContext| {
+            let (counter, first) = (counter.clone(), first.clone());
+            async move {
+                first.lock().get_or_insert(started.elapsed());
+                counter.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }
+        })
+        .build()
+        .unwrap();
+
+    let urls: Vec<String> = (0..2500).map(|i| format!("https://a.dev/{i}")).collect();
+    let stats = crawler.run(urls).await.unwrap();
+
+    assert_eq!(stats.requests_succeeded, 2500, "the background batches are crawled too");
+    assert_eq!(handled.load(Ordering::Relaxed), 2500);
+    // The last batch lands after about 1 s; the first request is handled well before.
+    assert!(first_handled_after.lock().unwrap() < Duration::from_millis(900));
+}
+
+#[tokio::test]
+async fn add_requests_returns_after_the_first_batch() {
+    let crawler = BasicCrawler::builder()
+        .services(services())
+        .request_handler(|_ctx: BasicContext| async move { Ok(()) })
+        .build()
+        .unwrap();
+
+    let urls: Vec<String> = (0..1500).map(|i| format!("https://a.dev/{i}")).collect();
+    let result = crawler.add_requests(urls).await.unwrap();
+    assert_eq!(result.added_requests.len(), 1000);
+    let rest = result.wait_for_all_requests_to_be_added.expect("a background batch");
+    assert_eq!(rest.await.unwrap().unwrap().len(), 500);
+}
+
+#[tokio::test]
 async fn skip_request_marks_the_request_handled_without_retries_or_failures() {
     let attempts = Arc::new(AtomicUsize::new(0));
     let counter = attempts.clone();
