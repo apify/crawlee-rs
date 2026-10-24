@@ -266,9 +266,12 @@ impl Session {
     }
 
     /// The request succeeded: count the use and lower the error score. Retires the session when
-    /// it is no longer usable (used up or expired).
+    /// it is no longer usable (used up or expired). Does nothing to a retired session.
     pub fn mark_good(&self) {
         let mut state = self.state.lock();
+        if state.retired {
+            return;
+        }
         state.usage_count += 1;
         if state.error_score > 0.0 {
             state.error_score -= self.options.error_score_decrement;
@@ -286,13 +289,10 @@ impl Session {
     }
 
     /// Takes the session out of rotation for good: adds the maximum error score and counts a use.
-    /// Retiring a retired session does nothing.
+    /// Retiring a session that is already retired and blocked does nothing.
     pub fn retire(&self) {
-        self.retire_locked(&mut self.state.lock());
-    }
-
-    fn retire_locked(&self, state: &mut SessionState) {
-        if state.retired {
+        let mut state = self.state.lock();
+        if state.retired && state.error_score >= self.options.max_error_score {
             return;
         }
         state.error_score += self.options.max_error_score;
@@ -300,9 +300,11 @@ impl Session {
         state.retired = true;
     }
 
+    /// Makes an unusable session's state terminal. Unlike `retire`, the error score is left alone,
+    /// so that `is_blocked` keeps telling a burned identity from one that ran out of uses.
     fn maybe_self_retire(&self, state: &mut SessionState) {
         if !self.usable(state) {
-            self.retire_locked(state);
+            state.retired = true;
         }
     }
 }
@@ -489,12 +491,18 @@ impl SessionPool {
     }
 
     /// Adds a session to the pool, also beyond the maximum pool size. A full pool first drops its
-    /// sessions that are no longer usable. A session with the same id, usable or not, makes it
-    /// fail with [`SessionPoolError::AlreadyExists`].
+    /// sessions that are no longer usable.
+    ///
+    /// A session with the same id is replaced when it is no longer usable (retired, expired or used
+    /// up), otherwise [`SessionPoolError::AlreadyExists`] is returned.
     pub fn add_session(&self, session: Session) -> Result<Arc<Session>, SessionPoolError> {
         let mut state = self.state.lock();
-        if state.sessions.iter().any(|existing| existing.id() == session.id()) {
-            return Err(SessionPoolError::AlreadyExists(session.id));
+        if let Some(index) = state.sessions.iter().position(|existing| existing.id() == session.id()) {
+            if state.sessions[index].is_usable() {
+                return Err(SessionPoolError::AlreadyExists(session.id));
+            }
+            let removed = state.sessions.remove(index);
+            tracing::debug!("Removed Session - {}", removed.id());
         }
         if !self.has_space_for_session(&state) {
             state.remove_retired_sessions();
@@ -604,16 +612,17 @@ mod tests {
     }
 
     #[test]
-    fn add_session_rejects_any_duplicate_id() {
+    fn add_session_replaces_an_unusable_session_with_the_same_id() {
         let pool = SessionPool::new(SessionPoolOptions { max_pool_size: 1, ..Default::default() }, None);
         let pinned = pool.add_session(Session::new("pinned".into(), None, SessionOptions::default())).unwrap();
         let duplicate = Session::new("pinned".into(), None, SessionOptions::default());
         assert!(matches!(pool.add_session(duplicate), Err(SessionPoolError::AlreadyExists(id)) if id == "pinned"));
 
-        // Even a retired session keeps its id taken, as in JS.
         pinned.retire();
-        let again = Session::new("pinned".into(), None, SessionOptions::default());
-        assert!(matches!(pool.add_session(again), Err(SessionPoolError::AlreadyExists(_))));
+        let replacement = pool.add_session(Session::new("pinned".into(), None, SessionOptions::default())).unwrap();
+        assert!(!Arc::ptr_eq(&pinned, &replacement));
+        assert!(Arc::ptr_eq(&pool.get_session_by_id("pinned").unwrap(), &replacement));
+        assert_eq!(pool.retired_count(), 0, "the retired session is gone");
     }
 
     /// A full pool makes room by dropping its retired sessions first (`removeRetiredSessions`).
@@ -629,28 +638,39 @@ mod tests {
     }
 
     #[test]
-    fn retire_is_idempotent_and_adds_the_max_error_score() {
+    fn retire_adds_the_max_error_score_once() {
         let session = Session::new("s".into(), None, SessionOptions::default());
         session.mark_bad();
         session.retire();
         assert_eq!((session.error_score(), session.usage_count()), (4.0, 2));
         session.retire();
         assert_eq!((session.error_score(), session.usage_count()), (4.0, 2), "a second retire does nothing");
+        session.mark_good();
+        assert_eq!((session.error_score(), session.usage_count()), (4.0, 2), "a retired session is not revived");
+
+        // Used up, not blocked: retiring it still marks it as blocked (session.ts `retire`).
+        let used_up =
+            Session::new("u".into(), None, SessionOptions { max_usage_count: 1, ..SessionOptions::default() });
+        used_up.mark_good();
+        used_up.retire();
+        assert_eq!((used_up.error_score(), used_up.usage_count()), (3.0, 2));
     }
 
     #[test]
     fn marking_retires_a_session_that_is_no_longer_usable() {
+        // Self-retirement leaves the score alone, so that blocked and used up stay apart.
         let blocked = Session::new("b".into(), None, SessionOptions::default());
         for _ in 0..3 {
             blocked.mark_bad();
         }
         assert!(blocked.is_retired());
-        assert_eq!((blocked.error_score(), blocked.usage_count()), (6.0, 4));
+        assert_eq!((blocked.error_score(), blocked.usage_count()), (3.0, 3));
 
         let used_up =
             Session::new("u".into(), None, SessionOptions { max_usage_count: 1, ..SessionOptions::default() });
         used_up.mark_good();
         assert!(used_up.is_retired());
+        assert!(!used_up.is_blocked());
 
         // The decrement applies whenever the score is positive, without a floor at 0 (session.ts).
         let record = Session::new("d".into(), None, SessionOptions::default()).to_state();
