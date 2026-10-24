@@ -102,6 +102,12 @@ storage/
 - **Settings:** `CRAWLEE_STORAGE_DIR`, `CRAWLEE_PURGE_ON_START`, `CRAWLEE_PERSIST_STORAGE`
   (`false` keeps everything in memory), or the same keys in `crawlee.json`.
 - **In code:** `Services::from_configuration(...)`, or `Services::in_memory()` for tests.
+- **One instance per storage.** `Services::open_dataset` (and the other `open_*`) returns the
+  instance already open for the same id, name or alias, as `StorageInstanceManager` does in JS.
+  `Dataset::open(backend, id)` and the like open a new handle without that cache.
+- **Remote URL lists.** `RequestQueue::add_requests_from_url(RequestsFromUrl::new(url), ..)` is the
+  `{ requestsFromUrl }` source of JS. It downloads with the queue's `UrlListFetcher`; crawlers set
+  one on the default queue that uses their HTTP client.
 
 ## Events and saved state
 
@@ -206,8 +212,7 @@ These are planned in this order, following `docs/plan.md`:
 1. **Remaining request sources and options:**
    - `RequestList`;
    - `extend_context`, `extend_timeout`, `skip_navigation` in `HttpCrawler`;
-   - the `stalled` readiness state of throttling;
-   - CSV export.
+   - the `stalled` readiness state of throttling.
 2. **Side-by-side crawl comparison** (level 3 of the conformance plan): the same crawl run by
    both implementations against the fixture server, comparing their outputs. Today the two are
    compared function by function (golden files) and by benchmark.

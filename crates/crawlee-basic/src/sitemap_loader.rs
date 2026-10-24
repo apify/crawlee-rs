@@ -88,9 +88,10 @@ impl SitemapRequestLoaderOptions {
     }
 }
 
-/// The saved record, in the shape Crawlee for JS writes.
+/// The saved record, in the shape Crawlee for JS writes. Fields JS restores leniently
+/// (`new Set(undefined)`, `undefined` flags) default when missing.
 #[derive(Default, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", default)]
 struct Progress {
     pending_sitemap_urls: Vec<String>,
     in_progress_sitemap_url: Option<String>,
@@ -104,7 +105,9 @@ struct Record {
     url_queue: Vec<String>,
     #[serde(default)]
     request_data: Vec<(String, Request)>,
+    #[serde(default)]
     abort_loading: bool,
+    #[serde(default)]
     closed: bool,
 }
 
@@ -416,5 +419,14 @@ mod tests {
         assert_eq!(state.queue, ["https://a.test/1", "https://a.test/2"], "in-progress pages are queued again");
         assert!(state.request_data.contains_key("https://a.test/1"));
         assert!(!state.fully_loaded());
+    }
+
+    #[test]
+    fn restores_a_record_with_only_the_url_queue() {
+        let restored = shared();
+        restored
+            .restore(serde_json::json!({ "urlQueue": ["https://a.test/1"], "sitemapParsingProgress": {} }))
+            .unwrap();
+        assert_eq!(restored.state.lock().queue, ["https://a.test/1"]);
     }
 }

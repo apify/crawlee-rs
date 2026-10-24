@@ -18,6 +18,22 @@ pub struct RequestSkipped {
     pub reason: String,
 }
 
+/// Returned by [`BasicContext::skip_request`](crate::BasicContext::skip_request): the request is
+/// settled as skipped rather than failed (`ContextPipelineInterruptedError('manual')`).
+#[derive(Debug, thiserror::Error)]
+#[error("{}", .message.as_deref().unwrap_or("Request was skipped"))]
+pub struct SkipRequestError {
+    pub message: Option<String>,
+}
+
+/// A request is pinned to a session (`session_id`) that the session pool does not have, or that is
+/// no longer usable.
+#[derive(Debug, thiserror::Error)]
+#[error("The current SessionPool instance couldn't find a valid session for the following id: {session_id}.")]
+pub struct MissingSessionError {
+    pub session_id: String,
+}
+
 /// The request handler did not finish in time.
 #[derive(Debug, thiserror::Error)]
 #[error("requestHandler timed out after {secs} seconds.")]
@@ -63,7 +79,7 @@ impl ErrorKind {
             if cause.is::<RequestThrottledError>() {
                 return ErrorKind::Throttled;
             }
-            if cause.is::<RequestSkipped>() {
+            if cause.is::<RequestSkipped>() || cause.is::<SkipRequestError>() {
                 return ErrorKind::Skipped;
             }
         }

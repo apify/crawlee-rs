@@ -154,7 +154,8 @@ async fn retries_then_fails_and_rolls_back_writes() {
 
     assert_eq!(attempts.load(Ordering::SeqCst), 3, "1 attempt + 2 retries");
     assert_eq!(stats.requests_failed, 1);
-    assert_eq!(stats.requests_retries, 2);
+    // One finished request that needed retries, however many (`requestsRetries` of JS).
+    assert_eq!(stats.requests_retries, 1);
     assert_eq!(stats.retry_histogram, vec![0, 0, 1]);
 
     let failed = failed.lock().clone().unwrap();
@@ -327,6 +328,25 @@ async fn max_requests_per_crawl_is_respected() {
 }
 
 #[tokio::test]
+async fn skipped_requests_do_not_count_towards_max_requests_per_crawl() {
+    let crawler = BasicCrawler::builder()
+        .services(services())
+        .max_concurrency(1)
+        .max_requests_per_crawl(2)
+        .request_handler(|ctx: BasicContext| async move {
+            if ctx.request().url.ends_with("/skip") {
+                return Err(ctx.skip_request(None));
+            }
+            ctx.add_requests(["https://a.dev/2", "https://a.dev/3"]).await?;
+            Ok(())
+        })
+        .build()
+        .unwrap();
+    let stats = crawler.run(["https://a.dev/skip", "https://a.dev/1"]).await.unwrap();
+    assert_eq!((stats.requests_succeeded, stats.requests_skipped), (2, 1));
+}
+
+#[tokio::test]
 async fn handler_timeouts_and_panics_are_request_errors() {
     let crawler = BasicCrawler::builder()
         .services(services())
@@ -451,6 +471,9 @@ async fn file_system_storage_is_purged_once_per_process() {
 
 #[tokio::test]
 async fn a_crawl_resumes_with_its_statistics_and_state() {
+    // Built first, so that neither crawl below is the first crawler of the process, which alone
+    // uses the default request queue.
+    noop_crawler().build().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let crawl = |purge_on_start: bool, urls: Vec<&'static str>| {
         let configuration =
@@ -608,7 +631,7 @@ async fn peak_concurrency(overloaded: bool) -> (usize, usize) {
         .unwrap();
     let urls: Vec<String> = (0..80).map(|i| format!("https://a.dev/{i}")).collect();
     assert_eq!(crawler.run(urls).await.unwrap().requests_succeeded, 80);
-    (peak.load(Ordering::SeqCst), crawler.concurrency_system().desired_concurrency())
+    (peak.load(Ordering::SeqCst), crawler.concurrency_system().unwrap().desired_concurrency())
 }
 
 #[tokio::test]
@@ -752,6 +775,674 @@ async fn without_a_session_pool_the_proxy_of_an_attempt_is_released_after_it() {
             assert_eq!(released, used, "each proxy released once");
         }
     }
+}
+
+type Skipped = Arc<Mutex<Vec<(String, crawlee_basic::SkipReason)>>>;
+
+fn skip_log() -> (Skipped, impl Fn(crawlee_basic::SkippedRequest) -> std::future::Ready<()> + Send + Sync + 'static) {
+    let skipped: Skipped = Arc::default();
+    let log = skipped.clone();
+    (skipped, move |skipped: crawlee_basic::SkippedRequest| {
+        log.lock().push((skipped.request.url, skipped.reason));
+        std::future::ready(())
+    })
+}
+
+#[tokio::test]
+async fn max_requests_per_crawl_caps_what_is_enqueued() {
+    let (skipped, on_skipped) = skip_log();
+    let crawler = BasicCrawler::builder()
+        .services(services())
+        .max_requests_per_crawl(3)
+        .on_skipped_request(on_skipped)
+        .request_handler(|ctx: BasicContext| async move {
+            if ctx.request().crawl_depth() == 0 {
+                ctx.add_requests((0..10).map(|i| format!("https://a.dev/{i}"))).await?;
+            }
+            Ok(())
+        })
+        .build()
+        .unwrap();
+
+    let stats = crawler.run(["https://a.dev/"]).await.unwrap();
+    assert_eq!(stats.requests_succeeded, 3);
+    // 3 less the start request, which was pending: 2 were added, and the rest skipped.
+    let manager = crawler.request_manager().await.unwrap();
+    assert_eq!(manager.pending_count().await.unwrap(), 0);
+    assert_eq!(manager.handled_count().await.unwrap(), 3);
+    let skipped = skipped.lock().clone();
+    assert_eq!(skipped.len(), 8);
+    assert!(skipped.iter().all(|(_, reason)| *reason == crawlee_basic::SkipReason::Limit));
+}
+
+#[tokio::test]
+async fn the_enqueue_limit_counts_only_new_requests() {
+    let added = Arc::new(Mutex::new(Vec::new()));
+    let log = added.clone();
+    let crawler = BasicCrawler::builder()
+        .services(services())
+        .request_handler(move |ctx: BasicContext| {
+            let log = log.clone();
+            async move {
+                if ctx.request().crawl_depth() > 0 {
+                    return Ok(());
+                }
+                ctx.add_requests(["https://a.dev/a", "https://a.dev/b"]).await?;
+                let urls =
+                    ["a", "b", "c", "d", "e"].map(|path| url::Url::parse(&format!("https://a.dev/{path}")).unwrap());
+                let result = ctx.enqueue_urls(urls, &crawlee_basic::EnqueueLinksOptions::new().limit(2)).await?;
+                log.lock().push((result.newly_added(), result.skipped.len()));
+                Ok(())
+            }
+        })
+        .build()
+        .unwrap();
+
+    let stats = crawler.run(["https://a.dev/"]).await.unwrap();
+    assert_eq!(*added.lock(), [(2, 1)], "c and d are added, e is over the limit");
+    assert_eq!(stats.requests_succeeded, 5);
+}
+
+/// Serves a robots.txt that disallows `/private`, and an empty page for everything else.
+struct RobotsClient;
+
+#[async_trait::async_trait]
+impl crawlee_http_client::HttpClient for RobotsClient {
+    async fn send_request(
+        &self,
+        request: crawlee_http_client::HttpRequest,
+        _: &crawlee_http_client::SendOptions,
+    ) -> Result<crawlee_http_client::HttpResponse, crawlee_http_client::HttpClientError> {
+        let body = if request.url.path() == "/robots.txt" { "User-agent: *\nDisallow: /private\n" } else { "" };
+        Ok(crawlee_http_client::HttpResponse {
+            status: http::StatusCode::OK,
+            headers: http::HeaderMap::new(),
+            url: request.url,
+            body: body.into(),
+            redirects: Vec::new(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn context_add_requests_skips_what_is_too_deep_disallowed_or_filtered_out() {
+    let (skipped, on_skipped) = skip_log();
+    let handled = Arc::new(Mutex::new(Vec::new()));
+    let log = handled.clone();
+    let crawler = BasicCrawler::builder()
+        .services(services())
+        .max_crawl_depth(1)
+        .respect_robots_txt(true)
+        .http_client(Arc::new(RobotsClient))
+        .on_skipped_request(on_skipped)
+        .request_handler(move |ctx: BasicContext| {
+            let log = log.clone();
+            async move {
+                log.lock().push(ctx.request().url.clone());
+                let next = format!("https://a.dev/level/{}", ctx.request().crawl_depth() + 1);
+                ctx.add_requests([next, "https://a.dev/private/1".to_owned()]).await?;
+                if ctx.request().crawl_depth() == 0 {
+                    let options = crawlee_basic::CrawlerAddRequestsOptions::new()
+                        .exclude(["https://a.dev/excluded*"])
+                        .label("LABELED");
+                    let result = ctx
+                        .add_requests_with_options(["https://a.dev/excluded", "https://a.dev/kept"], options)
+                        .await?;
+                    assert_eq!(result.added_requests.len(), 1);
+                }
+                Ok(())
+            }
+        })
+        .build()
+        .unwrap();
+
+    crawler.run(["https://a.dev/"]).await.unwrap();
+    let mut handled = handled.lock().clone();
+    handled.sort();
+    assert_eq!(handled, ["https://a.dev/", "https://a.dev/kept", "https://a.dev/level/1"]);
+    let skipped = skipped.lock().clone();
+    use crawlee_basic::SkipReason::{Depth, Filters, RobotsTxt};
+    assert!(skipped.contains(&("https://a.dev/excluded".to_owned(), Filters)), "{skipped:?}");
+    assert!(skipped.contains(&("https://a.dev/private/1".to_owned(), RobotsTxt)), "{skipped:?}");
+    assert!(skipped.contains(&("https://a.dev/level/2".to_owned(), Depth)), "{skipped:?}");
+}
+
+/// A request queue that answers fetches after a delay, like a remote one.
+struct SlowFetches(crawlee_core::RequestQueue);
+
+#[async_trait::async_trait]
+impl crawlee_core::RequestManager for SlowFetches {
+    async fn add_requests(
+        &self,
+        requests: Vec<Request>,
+        forefront: bool,
+    ) -> crawlee_core::StorageResult<crawlee_core::storage::backend::BatchAddRequestsResult> {
+        self.0.add_requests(requests, forefront).await
+    }
+    async fn fetch_next_request(&self) -> crawlee_core::StorageResult<Option<Request>> {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        self.0.fetch_next_request().await
+    }
+    async fn mark_request_as_handled(
+        &self,
+        request: &mut Request,
+    ) -> crawlee_core::StorageResult<Option<crawlee_core::storage::backend::QueueOperationInfo>> {
+        self.0.mark_request_as_handled(request).await
+    }
+    async fn reclaim_request(
+        &self,
+        request: &Request,
+        forefront: bool,
+    ) -> crawlee_core::StorageResult<Option<crawlee_core::storage::backend::QueueOperationInfo>> {
+        self.0.reclaim_request(request, forefront).await
+    }
+    async fn is_empty(&self) -> crawlee_core::StorageResult<bool> {
+        self.0.is_empty().await
+    }
+    async fn is_finished(&self) -> crawlee_core::StorageResult<bool> {
+        self.0.is_finished().await
+    }
+    async fn handled_count(&self) -> crawlee_core::StorageResult<u64> {
+        self.0.handled_count().await
+    }
+}
+
+#[tokio::test]
+async fn requests_are_fetched_in_parallel_by_the_tasks() {
+    let services = services();
+    let queue = services.open_request_queue(&crawlee_core::StorageIdentifier::Default).await.unwrap();
+    let crawler = BasicCrawler::builder()
+        .services(services)
+        .request_manager(Arc::new(SlowFetches(queue)))
+        .fixed_concurrency(10)
+        .request_handler(|_ctx: BasicContext| async move { Ok(()) })
+        .build()
+        .unwrap();
+
+    let started = std::time::Instant::now();
+    let urls: Vec<String> = (0..30).map(|i| format!("https://a.dev/{i}")).collect();
+    let stats = crawler.run(urls).await.unwrap();
+    assert_eq!(stats.requests_succeeded, 30);
+    // One fetch after another would take 30 × 50 ms.
+    assert!(started.elapsed() < Duration::from_millis(1000), "{:?}", started.elapsed());
+}
+
+#[tokio::test]
+async fn a_paced_crawl_wakes_up_when_its_domain_is_ready() {
+    let starts = Arc::new(Mutex::new(Vec::new()));
+    let log = starts.clone();
+    let crawler = BasicCrawler::builder()
+        .services(services())
+        .same_domain_delay(Duration::from_millis(700))
+        .request_handler(move |_ctx: BasicContext| {
+            let log = log.clone();
+            async move {
+                log.lock().push(std::time::Instant::now());
+                Ok(())
+            }
+        })
+        .build()
+        .unwrap();
+
+    crawler.run(["https://a.dev/1", "https://a.dev/2"]).await.unwrap();
+    let starts = starts.lock().clone();
+    let gap = starts[1] - starts[0];
+    // Polling every 500 ms would start the second one about 1 s after the first.
+    assert!(gap >= Duration::from_millis(690) && gap < Duration::from_millis(900), "{gap:?}");
+}
+
+#[tokio::test]
+async fn a_failing_error_handler_ends_the_run_with_its_error() {
+    for failed_request_handler in [false, true] {
+        let builder = BasicCrawler::builder()
+            .services(services())
+            .max_request_retries(1)
+            .request_handler(|_ctx: BasicContext| async move { anyhow::bail!("handler failed") });
+        let handler =
+            |_ctx: BasicContext, _error: Arc<anyhow::Error>| async move { anyhow::bail!("error handler failed") };
+        let builder = if failed_request_handler {
+            builder.failed_request_handler(handler)
+        } else {
+            builder.error_handler(handler)
+        };
+        let crawler = builder.build().unwrap();
+        let err = crawler.run(["https://a.dev/"]).await.unwrap_err();
+        assert_eq!(err.to_string(), "error handler failed");
+    }
+}
+
+#[tokio::test]
+async fn a_request_that_stopped_the_crawl_is_given_back_to_the_queue() {
+    let crawler = BasicCrawler::builder()
+        .services(services())
+        .request_handler(|_ctx: BasicContext| async move { Err(CriticalError::new("stop everything").into()) })
+        .build()
+        .unwrap();
+    crawler.run(["https://a.dev/"]).await.unwrap_err();
+    let manager = crawler.request_manager().await.unwrap();
+    let request = manager.fetch_next_request().await.unwrap().expect("reclaimed, not left in progress");
+    assert_eq!(request.url, "https://a.dev/");
+}
+
+#[tokio::test]
+async fn a_request_pinned_to_a_missing_session_fails() {
+    let sessions = Arc::new(Mutex::new(Vec::new()));
+    let log = sessions.clone();
+    let crawler = BasicCrawler::builder()
+        .services(services())
+        .max_request_retries(1)
+        .request_handler(|_ctx: BasicContext| async move { Ok(()) })
+        .failed_request_handler(move |ctx: BasicContext, _error: Arc<anyhow::Error>| {
+            let log = log.clone();
+            async move {
+                log.lock().push((ctx.session().is_some(), ctx.request().error_messages.clone()));
+                Ok(())
+            }
+        })
+        .build()
+        .unwrap();
+    let request = Request::builder("https://a.dev/").session_id("missing").build().unwrap();
+    let stats = crawler.run([request]).await.unwrap();
+    assert_eq!(stats.requests_failed, 1);
+    let sessions = sessions.lock();
+    let (has_session, messages) = &sessions[0];
+    assert!(!has_session);
+    assert_eq!(messages.len(), 2);
+    assert_eq!(
+        messages[0],
+        "The current SessionPool instance couldn't find a valid session for the following id: missing."
+    );
+}
+
+/// A request queue whose first marks of a request as handled fail.
+struct FlakyMarks(crawlee_core::RequestQueue, AtomicUsize);
+
+#[async_trait::async_trait]
+impl crawlee_core::RequestManager for FlakyMarks {
+    async fn add_requests(
+        &self,
+        requests: Vec<Request>,
+        forefront: bool,
+    ) -> crawlee_core::StorageResult<crawlee_core::storage::backend::BatchAddRequestsResult> {
+        self.0.add_requests(requests, forefront).await
+    }
+    async fn fetch_next_request(&self) -> crawlee_core::StorageResult<Option<Request>> {
+        self.0.fetch_next_request().await
+    }
+    async fn mark_request_as_handled(
+        &self,
+        request: &mut Request,
+    ) -> crawlee_core::StorageResult<Option<crawlee_core::storage::backend::QueueOperationInfo>> {
+        if self.1.fetch_add(1, Ordering::SeqCst) < 2 {
+            return Err(crawlee_core::StorageError::InvalidArgument("flaky".into()));
+        }
+        self.0.mark_request_as_handled(request).await
+    }
+    async fn reclaim_request(
+        &self,
+        request: &Request,
+        forefront: bool,
+    ) -> crawlee_core::StorageResult<Option<crawlee_core::storage::backend::QueueOperationInfo>> {
+        self.0.reclaim_request(request, forefront).await
+    }
+    async fn is_empty(&self) -> crawlee_core::StorageResult<bool> {
+        self.0.is_empty().await
+    }
+    async fn is_finished(&self) -> crawlee_core::StorageResult<bool> {
+        self.0.is_finished().await
+    }
+    async fn handled_count(&self) -> crawlee_core::StorageResult<u64> {
+        self.0.handled_count().await
+    }
+}
+
+#[tokio::test]
+async fn storage_operations_of_a_request_are_retried() {
+    let services = services();
+    let queue = services.open_request_queue(&crawlee_core::StorageIdentifier::Default).await.unwrap();
+    let crawler = BasicCrawler::builder()
+        .services(services)
+        .request_manager(Arc::new(FlakyMarks(queue, AtomicUsize::new(0))))
+        .request_handler(|_ctx: BasicContext| async move { Ok(()) })
+        .build()
+        .unwrap();
+    let stats = crawler.run(["https://a.dev/"]).await.unwrap();
+    assert_eq!((stats.requests_succeeded, stats.requests_failed, stats.requests_retries), (1, 0, 0));
+}
+
+#[tokio::test]
+async fn each_attempt_starts_without_a_loaded_url() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let crawler = BasicCrawler::builder()
+        .services(services())
+        .request_handler(move |mut ctx: BasicContext| {
+            let log = log.clone();
+            async move {
+                log.lock().push(ctx.request().loaded_url.clone());
+                ctx.request_mut().loaded_url = Some("https://a.dev/loaded".into());
+                if ctx.request().retry_count == 0 {
+                    anyhow::bail!("again");
+                }
+                Ok(())
+            }
+        })
+        .build()
+        .unwrap();
+    crawler.run(["https://a.dev/"]).await.unwrap();
+    assert_eq!(*seen.lock(), [None, None]);
+}
+
+#[tokio::test]
+async fn skipped_requests_are_reported_with_their_reason_and_message() {
+    let skipped = Arc::new(Mutex::new(Vec::new()));
+    let log = skipped.clone();
+    let crawler = BasicCrawler::builder()
+        .services(services())
+        .on_skipped_request(move |skipped: crawlee_basic::SkippedRequest| {
+            log.lock().push((skipped.request.url, skipped.reason, skipped.message));
+            std::future::ready(())
+        })
+        .request_handler(|ctx: BasicContext| async move {
+            if ctx.request().url.ends_with("/manual") {
+                return Err(ctx.skip_request(Some("not interesting")));
+            }
+            anyhow::bail!("fails, then skipped by the error handler")
+        })
+        .error_handler(|ctx: BasicContext, _error: Arc<anyhow::Error>| async move { Err(ctx.skip_request(None)) })
+        .build()
+        .unwrap();
+    let stats = crawler.run(["https://a.dev/manual", "https://a.dev/from-error-handler"]).await.unwrap();
+    assert_eq!((stats.requests_succeeded, stats.requests_failed, stats.requests_skipped), (0, 0, 2));
+    let mut skipped = skipped.lock().clone();
+    skipped.sort_by(|a, b| a.0.cmp(&b.0));
+    use crawlee_basic::SkipReason::Manual;
+    assert_eq!(
+        skipped,
+        [
+            ("https://a.dev/from-error-handler".to_owned(), Manual, None),
+            ("https://a.dev/manual".to_owned(), Manual, Some("not interesting".to_owned())),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_route_can_have_a_handler_timeout_of_its_own() {
+    let mut router = Router::<BasicContext>::new();
+    router.add_handler_with_timeout(
+        "SLOW",
+        |_ctx: BasicContext| async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok(())
+        },
+        Duration::from_millis(50),
+    );
+    router.add_default_handler(|_ctx: BasicContext| async move { Ok(()) });
+    let crawler = BasicCrawler::builder()
+        .services(services())
+        .max_request_retries(0)
+        .router(router)
+        .failed_request_handler(|ctx: BasicContext, _e: Arc<anyhow::Error>| async move {
+            ctx.push_data(&json!({ "error": ctx.request().error_messages[0] }))?;
+            Ok(())
+        })
+        .build()
+        .unwrap();
+    let slow = Request::builder("https://a.dev/slow").label("SLOW").build().unwrap();
+    let stats = crawler.run([slow, Request::new("https://a.dev/fast")]).await.unwrap();
+    assert_eq!((stats.requests_succeeded, stats.requests_failed), (1, 1));
+    assert_eq!(items(&crawler).await, [json!({ "error": "requestHandler timed out after 0.05 seconds." })]);
+}
+
+/// A request queue that records the processing time it is told to expect.
+struct ExpectedTime(crawlee_core::RequestQueue, Mutex<Vec<Duration>>);
+
+#[async_trait::async_trait]
+impl crawlee_core::RequestManager for ExpectedTime {
+    async fn add_requests(
+        &self,
+        requests: Vec<Request>,
+        forefront: bool,
+    ) -> crawlee_core::StorageResult<crawlee_core::storage::backend::BatchAddRequestsResult> {
+        self.0.add_requests(requests, forefront).await
+    }
+    async fn fetch_next_request(&self) -> crawlee_core::StorageResult<Option<Request>> {
+        self.0.fetch_next_request().await
+    }
+    async fn mark_request_as_handled(
+        &self,
+        request: &mut Request,
+    ) -> crawlee_core::StorageResult<Option<crawlee_core::storage::backend::QueueOperationInfo>> {
+        self.0.mark_request_as_handled(request).await
+    }
+    async fn reclaim_request(
+        &self,
+        request: &Request,
+        forefront: bool,
+    ) -> crawlee_core::StorageResult<Option<crawlee_core::storage::backend::QueueOperationInfo>> {
+        self.0.reclaim_request(request, forefront).await
+    }
+    async fn is_empty(&self) -> crawlee_core::StorageResult<bool> {
+        self.0.is_empty().await
+    }
+    async fn is_finished(&self) -> crawlee_core::StorageResult<bool> {
+        self.0.is_finished().await
+    }
+    async fn handled_count(&self) -> crawlee_core::StorageResult<u64> {
+        self.0.handled_count().await
+    }
+    async fn set_expected_request_processing_time(&self, duration: Duration) -> crawlee_core::StorageResult<()> {
+        self.1.lock().push(duration);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn requests_are_locked_for_the_longest_handler_timeout_and_a_margin() {
+    for (handler_timeout, route_timeout, expected) in [(10, None, 60), (100, None, 105), (10, Some(120), 125)] {
+        let services = services();
+        let queue = services.open_request_queue(&crawlee_core::StorageIdentifier::Default).await.unwrap();
+        let manager = Arc::new(ExpectedTime(queue, Mutex::new(Vec::new())));
+        let mut router = Router::<BasicContext>::new();
+        let handler = |_ctx: BasicContext| async move { Ok(()) };
+        match route_timeout {
+            Some(secs) => router.add_handler_with_timeout("LABEL", handler, Duration::from_secs(secs)),
+            None => router.add_default_handler(handler),
+        };
+        let crawler = BasicCrawler::builder()
+            .services(services)
+            .request_manager(manager.clone())
+            .request_handler_timeout(Duration::from_secs(handler_timeout))
+            .router(router)
+            .build()
+            .unwrap();
+        crawler.add_requests(Vec::<Request>::new()).await.unwrap();
+        assert_eq!(*manager.1.lock(), [Duration::from_secs(expected)]);
+    }
+}
+
+fn noop_crawler() -> crawlee_basic::BasicCrawlerBuilder<crawlee_basic::Identity> {
+    BasicCrawler::builder().services(services()).request_handler(|_ctx: BasicContext| async move { Ok(()) })
+}
+
+#[tokio::test]
+async fn a_running_crawler_cannot_be_run_again() {
+    let crawler = BasicCrawler::builder()
+        .services(services())
+        .request_handler(|_ctx: BasicContext| async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            Ok(())
+        })
+        .build()
+        .unwrap();
+    let first = tokio::spawn({
+        let crawler = crawler.clone();
+        async move { crawler.run(["https://a.dev/1"]).await }
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let err = crawler.run(["https://a.dev/2"]).await.unwrap_err();
+    assert!(err.to_string().contains("already running"), "{err}");
+    first.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn a_repeated_run_starts_with_fresh_statistics_sessions_and_concurrency() {
+    let crawler = noop_crawler().build().unwrap();
+    assert!(crawler.concurrency_system().is_none(), "none before the first run");
+    let first = crawler.run(["https://a.dev/1", "https://a.dev/2"]).await.unwrap();
+    assert_eq!(first.requests_succeeded, 2);
+    let first_system = crawler.concurrency_system().unwrap();
+    assert!(crawler.session_pool().usable_count() > 0);
+
+    let second = crawler.run(["https://a.dev/3"]).await.unwrap();
+    assert_eq!(second.requests_succeeded, 1, "the statistics of the first run are reset");
+    assert!(!Arc::ptr_eq(&first_system, &crawler.concurrency_system().unwrap()));
+}
+
+#[tokio::test]
+async fn statistics_sessions_and_concurrency_can_be_injected() {
+    use crawlee_basic::{ConcurrencySystem, SessionPool, Statistics};
+
+    let statistics = Arc::new(Statistics::with_id("injected"));
+    let pool = Arc::new(SessionPool::new(Default::default(), None));
+    let system = Arc::new(ConcurrencySystem::new(Default::default()).unwrap());
+    let crawler = noop_crawler()
+        .statistics(statistics.clone())
+        .session_pool(pool.clone())
+        .concurrency_system(system.clone())
+        .build()
+        .unwrap();
+
+    // The caller starts and stops an injected concurrency system.
+    assert!(crawler.run(["https://a.dev/1"]).await.is_err());
+    let services = services();
+    system.start(&services);
+    crawler.run(["https://a.dev/1"]).await.unwrap();
+    crawler.run(["https://a.dev/2"]).await.unwrap();
+    assert!(system.is_running());
+    system.stop();
+    assert_eq!(statistics.requests_succeeded(), 2, "an injected instance is not reset");
+    assert!(Arc::ptr_eq(&crawler.concurrency_system().unwrap(), &system));
+    assert!(pool.usable_count() > 0);
+
+    let conflict = noop_crawler().max_concurrency(3).concurrency_system(system).build();
+    assert!(conflict.is_err());
+}
+
+#[tokio::test]
+async fn stop_lets_running_requests_finish_and_starts_no_more() {
+    let slot: Arc<Mutex<Option<BasicCrawler>>> = Arc::default();
+    let handled = Arc::new(AtomicUsize::new(0));
+    let (crawler_slot, counter) = (slot.clone(), handled.clone());
+    let crawler = BasicCrawler::builder()
+        .services(services())
+        .max_concurrency(1)
+        .request_handler(move |_ctx: BasicContext| {
+            let (crawler_slot, counter) = (crawler_slot.clone(), counter.clone());
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                crawler_slot.lock().as_ref().unwrap().stop(None);
+                Ok(())
+            }
+        })
+        .build()
+        .unwrap();
+    *slot.lock() = Some(crawler.clone());
+    let stats = crawler.run((1..=5).map(|i| format!("https://a.dev/{i}"))).await.unwrap();
+    assert_eq!(stats.requests_succeeded, 1);
+    assert_eq!(handled.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn keep_alive_waits_for_more_requests_until_stopped() {
+    let crawler = noop_crawler().keep_alive(true).build().unwrap();
+    let run = tokio::spawn({
+        let crawler = crawler.clone();
+        async move { crawler.run(Vec::<String>::new()).await.unwrap() }
+    });
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert!(!run.is_finished(), "an empty queue does not end the run");
+    crawler.add_requests(["https://a.dev/late"]).await.unwrap();
+    while crawler.statistics().requests_succeeded() == 0 {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    crawler.stop(Some("done"));
+    assert_eq!(run.await.unwrap().requests_succeeded, 1);
+}
+
+#[tokio::test]
+async fn the_task_loop_predicates_can_be_replaced() {
+    let crawler = noop_crawler()
+        .task_loop_options(crawlee_basic::TaskLoopOptions {
+            is_task_ready: Some(Arc::new(|| Box::pin(async { Ok(false) }))),
+            is_finished: Some(Arc::new(|| Box::pin(async { Ok(true) }))),
+        })
+        .build()
+        .unwrap();
+    let stats = crawler.run(["https://a.dev/1"]).await.unwrap();
+    assert_eq!(stats.requests_succeeded, 0);
+}
+
+#[tokio::test]
+async fn crawlers_have_request_queues_of_their_own() {
+    let services = services();
+    let build = |id: &str| {
+        BasicCrawler::builder()
+            .services(services.clone())
+            .id(id)
+            .request_handler(|_ctx: BasicContext| async move { Ok(()) })
+            .build()
+            .unwrap()
+    };
+    let (first, second) = (build("first"), build("second"));
+    first.add_requests(["https://a.dev/first"]).await.unwrap();
+    let stats = second.run(["https://a.dev/second"]).await.unwrap();
+    assert_eq!(stats.requests_succeeded, 1, "the first crawler's request is not in its queue");
+}
+
+#[tokio::test]
+async fn the_status_message_counts_the_total_and_can_go_to_a_callback() {
+    let messages = Arc::new(Mutex::new(Vec::new()));
+    let log = messages.clone();
+    let crawler = BasicCrawler::builder()
+        .services(services())
+        .max_concurrency(1)
+        .options(crawlee_basic::CrawlerOptions {
+            status_message_interval: Duration::from_millis(50),
+            ..Default::default()
+        })
+        .status_message_callback(move |status: crawlee_basic::StatusMessageInfo| {
+            log.lock().push(status.message);
+            std::future::ready(())
+        })
+        .request_handler(|_ctx: BasicContext| async move {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            Ok(())
+        })
+        .build()
+        .unwrap();
+    crawler.run(["https://a.dev/1", "https://a.dev/2"]).await.unwrap();
+    let messages = messages.lock().clone();
+    assert!(messages.iter().any(|message| message.starts_with("Crawled 1/2 pages")), "{messages:?}");
+}
+
+#[tokio::test]
+async fn the_default_queue_downloads_url_lists_with_the_crawler_http_client() {
+    let services = services();
+    let crawler = BasicCrawler::builder()
+        .services(services.clone())
+        .request_handler(|_ctx: BasicContext| async { Ok(()) })
+        .build()
+        .unwrap();
+    crawler.run(Vec::<Request>::new()).await.unwrap();
+    // The first crawler of the process uses the default queue, later ones a queue of their own;
+    // other tests in this binary create crawlers too.
+    let identifier = match crawler.id() {
+        "0" => crawlee_core::StorageIdentifier::Default,
+        id => crawlee_core::StorageIdentifier::Alias(format!("__default_{id}__")),
+    };
+    let queue = services.open_request_queue(&identifier).await.unwrap();
+    assert!(queue.has_url_list_fetcher());
 }
 
 /// The URLs of a static `ProxyConfiguration` are shared by many attempts: their clients (and

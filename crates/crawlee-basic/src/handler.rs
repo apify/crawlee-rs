@@ -14,6 +14,17 @@ pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 /// [`Router`](crate::Router).
 pub trait RequestHandler<C>: Send + Sync + 'static {
     fn handle(&self, ctx: C) -> BoxFuture<anyhow::Result<()>>;
+
+    /// The timeout of requests with this label, when the handler overrides the crawler's
+    /// `request_handler_timeout` (a [`Router`](crate::Router) route can).
+    fn timeout_for(&self, _label: Option<&str>) -> Option<std::time::Duration> {
+        None
+    }
+
+    /// The longest timeout [`timeout_for`](Self::timeout_for) returns for any label.
+    fn max_timeout(&self) -> Option<std::time::Duration> {
+        None
+    }
 }
 
 impl<C, F, Fut> RequestHandler<C> for F

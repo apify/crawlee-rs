@@ -429,6 +429,22 @@ impl DatasetBackend for FsDataset {
     }
 
     async fn get_data(&self, options: DatasetListOptions) -> StorageResult<PaginatedList<DatasetItem>> {
+        // As in JS, the file-system dataset only paginates; it warns about the rest.
+        let ignored: Vec<&str> = [
+            ("clean", options.clean),
+            ("fields", options.fields.is_some()),
+            ("skipHidden", options.skip_hidden),
+            ("skipEmpty", options.skip_empty),
+        ]
+        .into_iter()
+        .filter_map(|(name, set)| set.then_some(name))
+        .collect();
+        if !ignored.is_empty() {
+            tracing::warn!(
+                "getData() options [{}] are not supported by the file-system dataset and were ignored. Only \"offset\", \"limit\" and \"desc\" are honored.",
+                ignored.join(", ")
+            );
+        }
         let page = self.client.get_data(options.offset, options.limit, options.desc, false).await?;
         let items =
             page.items.iter().map(serde_json::value::to_raw_value).collect::<Result<Vec<Box<RawValue>>, _>>()?;
