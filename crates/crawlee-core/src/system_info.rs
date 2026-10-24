@@ -123,15 +123,29 @@ fn cgroup_cpu_usage(version: CgroupVersion) -> std::io::Result<f64> {
     }
 }
 
-/// CPU time of the whole system (user through softirq), in nanoseconds.
-fn system_cpu_usage(clock_ticks_per_second: f64) -> std::io::Result<f64> {
-    let stat = std::fs::read_to_string("/proc/stat")?;
+/// CPU time of the whole system (user through softirq), in nanoseconds, and the number of the
+/// host's online cores (the `cpuN` lines, as `os.cpus()` counts them).
+fn system_cpu_usage(clock_ticks_per_second: f64) -> std::io::Result<(f64, usize)> {
+    parse_proc_stat(&std::fs::read_to_string("/proc/stat")?, clock_ticks_per_second)
+}
+
+fn parse_proc_stat(stat: &str, clock_ticks_per_second: f64) -> std::io::Result<(f64, usize)> {
     let line = stat
         .lines()
         .find(|line| line.starts_with("cpu "))
         .ok_or_else(|| std::io::Error::other("no cpu line in /proc/stat"))?;
     let ticks: f64 = line.split_whitespace().skip(1).take(7).filter_map(|v| v.parse::<f64>().ok()).sum();
-    Ok(ticks * 1e9 / clock_ticks_per_second)
+    let cores = stat
+        .lines()
+        .filter(|line| line.strip_prefix("cpu").is_some_and(|rest| rest.starts_with(|c: char| c.is_ascii_digit())))
+        .count();
+    Ok((ticks * 1e9 / clock_ticks_per_second, cores.max(1)))
+}
+
+/// The container's CPU usage against its allowance. Its share of the host's time is scaled by the
+/// host's cores, not by the parallelism available to the process, which the quota already limits.
+fn container_cpu_ratio(container_delta: f64, system_delta: f64, host_cores: usize, allowance: f64) -> f64 {
+    container_delta / system_delta * host_cores as f64 / allowance
 }
 
 fn clock_ticks_per_second() -> f64 {
@@ -236,15 +250,15 @@ impl SystemInfoSampler {
             return Ok(None);
         };
         let ticks = *self.clock_ticks_per_second.get_or_insert_with(clock_ticks_per_second);
-        let sample = CgroupCpuSample { container: cgroup_cpu_usage(version)?, system: system_cpu_usage(ticks)? };
+        let (system, host_cores) = system_cpu_usage(ticks)?;
+        let sample = CgroupCpuSample { container: cgroup_cpu_usage(version)?, system };
         let container_delta = sample.container - self.previous_cgroup_sample.container;
         let system_delta = sample.system - self.previous_cgroup_sample.system;
         self.previous_cgroup_sample = sample;
         if system_delta <= 0.0 {
             return Ok(Some(0.0));
         }
-        let cores = std::thread::available_parallelism().map_or(1, |n| n.get()) as f64;
-        Ok(Some(container_delta / system_delta * cores / allowance))
+        Ok(Some(container_cpu_ratio(container_delta, system_delta, host_cores, allowance)))
     }
 
     /// Resident memory of this process and all its descendants.
@@ -309,6 +323,19 @@ impl SystemInfoSampler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Like `os.cpus().length` in JS, the container's share of the host is scaled by the host's
+    /// cores, not by the (quota-limited) parallelism available to the process.
+    #[test]
+    fn proc_stat_gives_the_system_time_and_the_host_cores() {
+        let stat = "cpu  100 0 100 800 0 0 0 7 0 0\ncpu0 50 0 50 400 0 0 0 0 0 0\n\
+                    cpu1 50 0 50 400 0 0 0 0 0 0\nintr 1 2 3\nctxt 4\n";
+        let (nanos, cores) = parse_proc_stat(stat, 100.0).unwrap();
+        assert_eq!(nanos, 1000.0 * 1e7, "user through softirq, steal excluded");
+        assert_eq!(cores, 2);
+        // A container using one core of a 2-core host, with an allowance of 1 core, is at 100 %.
+        assert_eq!(container_cpu_ratio(1.0, 2.0, cores, 1.0), 1.0);
+    }
 
     #[test]
     fn samples_this_process() {
