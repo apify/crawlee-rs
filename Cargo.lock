@@ -437,6 +437,7 @@ dependencies = [
  "chrono",
  "crawlee-storage",
  "crawlee-utils",
+ "flate2",
  "indexmap",
  "parking_lot",
  "rand 0.9.5",

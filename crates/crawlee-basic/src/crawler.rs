@@ -13,7 +13,8 @@ use tracing::Instrument as _;
 use crawlee_core::storage::batched_adds::AddRequestsBatchedResult;
 use crawlee_core::{
     CriticalError, Dataset, Event, EventKind, KeyValueStore, PacingScope, PacingSignal, RecoverableState, Request,
-    RequestManager, SerdeState, Services, StatusLevel, StatusMessage, StorageIdentifier,
+    RequestLoader, RequestManager, RequestManagerTandem, SerdeState, Services, StatusLevel, StatusMessage,
+    StorageIdentifier,
 };
 use crawlee_http_client::HttpClient;
 use serde::Serialize;
@@ -158,6 +159,12 @@ pub type StatusMessageCallback = Arc<dyn Fn(StatusMessageInfo) -> BoxFuture<()> 
 pub enum BuildError {
     #[error("a request handler is required: call `request_handler()` or `router()`")]
     MissingRequestHandler,
+    #[error(
+        "The `request_manager` option cannot be used in conjunction with `request_list`: combine them with \
+         `RequestManagerTandem::new(list, manager)` (or `RequestList::to_tandem`) and pass the tandem as the \
+         `request_manager`"
+    )]
+    RequestListWithRequestManager,
     #[error(transparent)]
     Concurrency(#[from] ConcurrencyError),
     #[error(
@@ -183,6 +190,7 @@ struct Inner<P: Middleware<BasicContext>> {
     instance_index: u64,
     services: Services,
     request_manager: Option<Arc<dyn RequestManager>>,
+    request_list: Option<Arc<dyn RequestLoader>>,
     http_client: Arc<dyn HttpClient>,
     session_pool: Arc<SessionPool>,
     /// The session pool was built by the crawler, not supplied.
@@ -251,6 +259,7 @@ pub struct BasicCrawlerBuilder<P: Middleware<BasicContext>> {
     options: CrawlerOptions,
     services: Option<Services>,
     request_manager: Option<Arc<dyn RequestManager>>,
+    request_list: Option<Arc<dyn RequestLoader>>,
     http_client: Option<Arc<dyn HttpClient>>,
     proxies: Option<Arc<dyn ProxySource>>,
     statistics: Option<Arc<Statistics>>,
@@ -277,6 +286,7 @@ where
             options: CrawlerOptions::default(),
             services: None,
             request_manager: None,
+            request_list: None,
             http_client: None,
             proxies: None,
             statistics: None,
@@ -484,6 +494,17 @@ where
         self
     }
 
+    /// A read-only source of requests, such as a [`RequestList`](crawlee_core::RequestList),
+    /// read before the default request queue (`requestList`): its requests are moved to the
+    /// front of the queue one by one, which keeps the retries and the new requests (see
+    /// [`RequestManagerTandem`]). Cannot be combined with
+    /// [`request_manager`](Self::request_manager); pass a tandem of the two as the request
+    /// manager instead.
+    pub fn request_list(mut self, list: Arc<dyn RequestLoader>) -> Self {
+        self.request_list = Some(list);
+        self
+    }
+
     pub fn http_client(mut self, client: Arc<dyn HttpClient>) -> Self {
         self.http_client = Some(client);
         self
@@ -497,6 +518,9 @@ where
 
     pub fn build(self) -> Result<BasicCrawler<P>, BuildError> {
         let handler = self.handler.ok_or(BuildError::MissingRequestHandler)?;
+        if self.request_list.is_some() && self.request_manager.is_some() {
+            return Err(BuildError::RequestListWithRequestManager);
+        }
         if self.concurrency_system.is_some() && self.concurrency_shortcuts {
             return Err(BuildError::ConcurrencyShortcutsWithSystem);
         }
@@ -542,6 +566,7 @@ where
                 instance_index,
                 services,
                 request_manager: self.request_manager,
+                request_list: self.request_list,
                 http_client: self.http_client.unwrap_or_else(crawlee_http_client::default_client),
                 session_pool,
                 owns_session_pool,
@@ -583,7 +608,7 @@ where
                         let queue = inner.services.open_request_queue(&identifier).await?;
                         // So that `add_requests_from_url` downloads with the crawler's HTTP client.
                         if !queue.has_url_list_fetcher() {
-                            queue.set_url_list_fetcher(Arc::new(HttpUrlListFetcher(inner.http_client.clone())));
+                            queue.set_url_list_fetcher(Arc::new(HttpUrlListFetcher::new(inner.http_client.clone())));
                         }
                         Arc::new(queue)
                     }
@@ -606,6 +631,10 @@ where
                         request_manager =
                             Arc::new(ThrottlingRequestManager::new(options, &inner.services, request_manager));
                     }
+                }
+                // The list is read first, while new requests still have somewhere writable to go.
+                if let Some(list) = &inner.request_list {
+                    request_manager = Arc::new(RequestManagerTandem::new(list.clone(), request_manager));
                 }
                 let dataset = inner.services.open_dataset(&StorageIdentifier::Default).await?;
                 let key_value_store = inner.services.open_key_value_store(&StorageIdentifier::Default).await?;
@@ -1868,7 +1897,17 @@ impl Drop for ConcurrencySlot {
 
 /// Downloads the URL lists of `RequestQueue::add_requests_from_url` with an [`HttpClient`]
 /// (`downloadListOfUrls` in JS, which reads the body whatever the status).
-struct HttpUrlListFetcher(Arc<dyn HttpClient>);
+/// Downloads the lists of URLs of `requestsFromUrl` sources with an [`HttpClient`] (the
+/// `httpClient` of `downloadListOfUrls`): give it to a
+/// [`RequestList`](crawlee_core::RequestList) or a [`RequestQueue`](crawlee_core::RequestQueue).
+/// Crawlers set one on their default request queue.
+pub struct HttpUrlListFetcher(Arc<dyn HttpClient>);
+
+impl HttpUrlListFetcher {
+    pub fn new(client: Arc<dyn HttpClient>) -> Self {
+        HttpUrlListFetcher(client)
+    }
+}
 
 #[async_trait::async_trait]
 impl crawlee_core::UrlListFetcher for HttpUrlListFetcher {

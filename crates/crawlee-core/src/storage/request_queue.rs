@@ -148,6 +148,44 @@ impl RequestsFromUrl {
         self.request = Arc::new(make);
         self
     }
+
+    /// Downloads the list with `fetcher` (through `proxy_url`, if set), and makes a request of
+    /// every URL in it (`#fetchRequestsFromUrl`). A list without URLs is warned about.
+    pub(crate) async fn fetch_requests(
+        &self,
+        fetcher: Option<&dyn UrlListFetcher>,
+        proxy_url: Option<&str>,
+    ) -> StorageResult<Vec<Request>> {
+        let requests_from_url = &self.requests_from_url;
+        let cannot_fetch = |err: &dyn std::fmt::Display| {
+            StorageError::Backend(format!("Cannot fetch a request list from {requests_from_url}: {err}").into())
+        };
+        let fetcher = fetcher.ok_or_else(|| {
+            cannot_fetch(&"no URL list fetcher was set; set one with RequestQueue::set_url_list_fetcher")
+        })?;
+        // A Google Sheets sharing link is fetched as the CSV export of the sheet.
+        static GOOGLE_SHEETS: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"^(https://docs\.google\.com/spreadsheets/d/[A-Za-z0-9_-]+)/?").unwrap());
+        let url = match GOOGLE_SHEETS.captures(requests_from_url) {
+            Some(sheet) => format!("{}/gviz/tq?tqx=out:csv", &sheet[1]),
+            None => requests_from_url.clone(),
+        };
+        let body = fetcher.fetch(&url, proxy_url).await.map_err(|err| cannot_fetch(&err))?;
+        let urls = extract_urls(&String::from_utf8_lossy(&body), self.regex.as_ref());
+        if urls.is_empty() {
+            tracing::warn!(requests_from_url, regex = ?self.regex, "The fetched list contains no valid URLs.");
+            return Ok(Vec::new());
+        }
+        urls.iter()
+            .map(|url| (self.request)(url))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| StorageError::InvalidArgument(err.to_string()))
+    }
+
+    /// The first five URLs of `requests`, for the log.
+    pub(crate) fn sample(&self, requests: &[Request]) -> Vec<String> {
+        requests.iter().take(5).map(|request| request.url.clone()).collect()
+    }
 }
 
 /// Number of slots of the add-deduplication cache, as in Crawlee for JS.
@@ -333,42 +371,22 @@ impl RequestQueue {
         source: RequestsFromUrl,
         forefront: bool,
     ) -> StorageResult<Vec<ProcessedRequest>> {
-        let RequestsFromUrl { requests_from_url, regex, request } = source;
         let fetcher = self.url_list_fetcher.lock().clone();
-        let cannot_fetch = |err: &dyn std::fmt::Display| {
-            StorageError::Backend(format!("Cannot fetch a request list from {requests_from_url}: {err}").into())
-        };
-        let fetcher = fetcher.ok_or_else(|| {
-            cannot_fetch(&"no URL list fetcher was set; set one with RequestQueue::set_url_list_fetcher")
-        })?;
-        // A Google Sheets sharing link is fetched as the CSV export of the sheet.
-        static GOOGLE_SHEETS: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"^(https://docs\.google\.com/spreadsheets/d/[A-Za-z0-9_-]+)/?").unwrap());
-        let url = match GOOGLE_SHEETS.captures(&requests_from_url) {
-            Some(sheet) => format!("{}/gviz/tq?tqx=out:csv", &sheet[1]),
-            None => requests_from_url.clone(),
-        };
-        let body = fetcher.fetch(&url, None).await.map_err(|err| cannot_fetch(&err))?;
-        let urls = extract_urls(&String::from_utf8_lossy(&body), regex.as_ref());
-        if urls.is_empty() {
-            tracing::warn!(requests_from_url, regex = ?regex, "The fetched list contains no valid URLs.");
+        let requests = source.fetch_requests(fetcher.as_deref(), None).await?;
+        if requests.is_empty() {
             return Ok(Vec::new());
         }
-        let requests = urls
-            .iter()
-            .map(|url| request(url))
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|err| StorageError::InvalidArgument(err.to_string()))?;
         let fetched_count = requests.len();
+        let sample = source.sample(&requests);
         let options = AddRequestsBatchedOptions { forefront, ..Default::default() };
         let added = self.add_requests_batched(requests, options).await?.added_requests;
         tracing::info!(
-            requests_from_url,
-            regex = ?regex,
+            requests_from_url = source.requests_from_url,
+            regex = ?source.regex,
             fetched_count,
             imported_count = added.len(),
             duplicate_count = fetched_count.saturating_sub(added.len()),
-            sample = ?&urls[..urls.len().min(5)],
+            sample = ?sample,
             "Fetched and loaded Requests from a remote resource."
         );
         Ok(added)

@@ -1500,3 +1500,48 @@ async fn the_internal_timeout_comes_from_the_configuration() {
     assert_eq!(stats.requests_succeeded, 1);
     assert_eq!(attempts.load(Ordering::SeqCst), 2);
 }
+
+#[tokio::test]
+async fn crawls_a_request_list_through_the_queue() {
+    use crawlee_core::storage::request_loader::{LoaderStatus, RequestLoader};
+    use crawlee_core::RequestList;
+
+    let services = services();
+    let list = RequestList::open(&services, None, ["https://a.dev/1", "https://a.dev/2"]).await.unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let crawler = BasicCrawler::builder()
+        .services(services.clone())
+        .max_concurrency(1)
+        .request_list(Arc::new(list.clone()))
+        .request_handler(move |ctx: BasicContext| {
+            let log = log.clone();
+            async move {
+                let url = ctx.request().url.clone();
+                if url == "https://a.dev/1" {
+                    ctx.add_requests(["https://a.dev/3"]).await?;
+                }
+                log.lock().push(url);
+                Ok(())
+            }
+        })
+        .build()
+        .unwrap();
+
+    let stats = crawler.run(Vec::<String>::new()).await.unwrap();
+    assert_eq!(stats.requests_succeeded, 3);
+    // The list's requests go to the front of the queue, before the added one.
+    assert_eq!(*seen.lock(), ["https://a.dev/1", "https://a.dev/2", "https://a.dev/3"]);
+    assert_eq!(list.status().await.unwrap(), LoaderStatus::Finished);
+    let manager = crawler.request_manager().await.unwrap();
+    assert_eq!(manager.handled_count().await.unwrap(), 3);
+
+    // A request manager is combined with a list by the caller (`RequestList::to_tandem`).
+    let built = BasicCrawler::builder()
+        .services(services.clone())
+        .request_list(Arc::new(list.clone()))
+        .request_manager(manager)
+        .request_handler(|_ctx: BasicContext| async { Ok(()) })
+        .build();
+    assert!(matches!(built, Err(crawlee_basic::BuildError::RequestListWithRequestManager)));
+}

@@ -51,6 +51,10 @@ pub trait RequestLoader: Send + Sync {
     async fn handled_count(&self) -> StorageResult<u64>;
     /// Requests not handled yet (buffered or in progress).
     async fn pending_count(&self) -> StorageResult<u64>;
+    /// Requests handled or not (`getTotalCount`).
+    async fn total_count(&self) -> StorageResult<u64> {
+        Ok(self.handled_count().await? + self.pending_count().await?)
+    }
 }
 
 /// A [`RequestLoader`] in front of a [`RequestManager`]: each fetch first moves one request from
@@ -66,16 +70,24 @@ impl RequestManagerTandem {
         RequestManagerTandem { loader, manager }
     }
 
-    async fn transfer_next_request(&self) -> StorageResult<()> {
+    /// Moves one request from the loader to the front of the manager. A request the manager
+    /// refuses is dropped, and `false` returned: nothing is fetched from the manager then.
+    async fn transfer_next_request(&self) -> StorageResult<bool> {
         let Some(request) = self.loader.fetch_next_request().await? else {
-            return Ok(());
+            return Ok(true);
         };
         let added = self.manager.add_requests(vec![request.clone()], true).await;
+        // Handled either way, so that it does not stay in progress in the loader.
         self.loader.mark_request_as_handled(&request).await?;
         if let Err(err) = added {
-            tracing::error!(url = %request.url, "Adding a request from the loader to the queue failed; dropped: {err}");
+            tracing::error!(
+                url = %request.url,
+                unique_key = %request.unique_key,
+                "Adding request from the RequestLoader to the RequestManager failed, the request has been dropped. {err}"
+            );
+            return Ok(false);
         }
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -94,8 +106,10 @@ impl RequestManager for RequestManagerTandem {
     }
 
     async fn fetch_next_request(&self) -> StorageResult<Option<Request>> {
-        if self.loader.status().await? == LoaderStatus::Ready {
-            self.transfer_next_request().await?;
+        // Only the loader's state decides: a manager waiting out a backoff must not hold back
+        // the loader's requests.
+        if self.loader.status().await? == LoaderStatus::Ready && !self.transfer_next_request().await? {
+            return Ok(None);
         }
         self.manager.fetch_next_request().await
     }
@@ -195,5 +209,52 @@ mod tests {
         assert!(tandem.is_finished().await.unwrap());
         assert_eq!(loader.handled_count().await.unwrap(), 2);
         assert_eq!(tandem.handled_count().await.unwrap(), 3);
+    }
+
+    /// A manager that refuses every add, and counts the fetches.
+    #[derive(Default)]
+    struct RefusingManager {
+        fetches: Mutex<u32>,
+    }
+
+    #[async_trait]
+    impl RequestManager for RefusingManager {
+        async fn add_requests(&self, _: Vec<Request>, _: bool) -> StorageResult<BatchAddRequestsResult> {
+            Err(crate::StorageError::Backend("Add failed".into()))
+        }
+        async fn fetch_next_request(&self) -> StorageResult<Option<Request>> {
+            *self.fetches.lock() += 1;
+            Ok(None)
+        }
+        async fn mark_request_as_handled(&self, _: &mut Request) -> StorageResult<Option<QueueOperationInfo>> {
+            Ok(None)
+        }
+        async fn reclaim_request(&self, _: &Request, _: bool) -> StorageResult<Option<QueueOperationInfo>> {
+            Ok(None)
+        }
+        async fn is_empty(&self) -> StorageResult<bool> {
+            Ok(true)
+        }
+        async fn is_finished(&self) -> StorageResult<bool> {
+            Ok(true)
+        }
+        async fn handled_count(&self) -> StorageResult<u64> {
+            Ok(0)
+        }
+    }
+
+    #[tokio::test]
+    async fn a_request_the_manager_refuses_is_dropped() {
+        let loader = Arc::new(ListLoader {
+            pending: Mutex::new(vec!["https://a.test/2".into(), "https://a.test/1".into()]),
+            handled: Mutex::new(0),
+        });
+        let manager = Arc::new(RefusingManager::default());
+        let tandem = RequestManagerTandem::new(loader.clone(), manager.clone());
+
+        // Marked as handled on the loader, and the manager is not fetched from this round.
+        assert!(tandem.fetch_next_request().await.unwrap().is_none());
+        assert_eq!(loader.handled_count().await.unwrap(), 1);
+        assert_eq!(*manager.fetches.lock(), 0);
     }
 }

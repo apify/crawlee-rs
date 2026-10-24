@@ -26,6 +26,7 @@ pub use crate::storage::dataset::{Dataset, DatasetExportOptions, DatasetStats};
 pub use crate::storage::file_system::FileSystemStorageBackend;
 pub use crate::storage::key_value_store::{KeyValueStore, KeyValueStoreStats, RecordValue};
 pub use crate::storage::memory::MemoryStorageBackend;
+pub use crate::storage::request_list::{RequestList, RequestListOptions, RequestListSource, RequestListState};
 pub use crate::storage::request_loader::{
     LoaderStatus, PacingScope, PacingSignal, RequestLoader, RequestManagerTandem,
 };

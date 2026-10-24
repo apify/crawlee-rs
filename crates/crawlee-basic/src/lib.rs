@@ -19,8 +19,8 @@ pub mod throttling;
 pub use crate::autoscaling::{ConcurrencyOptions, ConcurrencySystem, LoadSignal, LoadSignalsOptions};
 pub use crate::context::{BasicContext, CrawlingContext};
 pub use crate::crawler::{
-    BasicCrawler, BasicCrawlerBuilder, BuildError, CrawlerOptions, StatusMessageCallback, StatusMessageInfo,
-    TaskLoopOptions, TaskLoopPredicate,
+    BasicCrawler, BasicCrawlerBuilder, BuildError, CrawlerOptions, HttpUrlListFetcher, StatusMessageCallback,
+    StatusMessageInfo, TaskLoopOptions, TaskLoopPredicate,
 };
 pub use crate::enqueue::{
     CrawlerAddRequestsOptions, EnqueueLinksOptions, EnqueueLinksResult, SkipReason, SkippedRequest,
