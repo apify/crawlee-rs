@@ -120,6 +120,10 @@ impl RequestManager for RequestManagerTandem {
         self.manager.handled_count().await
     }
 
+    async fn pending_count(&self) -> StorageResult<u64> {
+        Ok(self.manager.pending_count().await? + self.loader.pending_count().await?)
+    }
+
     async fn set_expected_request_processing_time(&self, duration: Duration) -> StorageResult<()> {
         self.manager.set_expected_request_processing_time(duration).await
     }

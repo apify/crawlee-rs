@@ -12,6 +12,7 @@ use super::backend::{
 };
 use super::batched_adds::{
     AddRequestsBatchedOptions, AddRequestsBatchedResult, InProgressBatches, drain_request_batches,
+    drain_request_batches_inline,
 };
 use crate::errors::StorageResult;
 use crate::request::{Request, unique_key_to_request_id};
@@ -22,17 +23,24 @@ use crate::request::{Request, unique_key_to_request_id};
 pub trait RequestManager: Send + Sync {
     async fn add_requests(&self, requests: Vec<Request>, forefront: bool) -> StorageResult<BatchAddRequestsResult>;
     /// Adds the requests in batches: the first before returning, the rest in the background
-    /// (`addRequestsBatched`). A manager that does not batch adds them all at once.
+    /// (`addRequestsBatched`). A manager that does not batch in the background adds every batch
+    /// before returning. Either way, at most
+    /// [`max_new_requests`](AddRequestsBatchedOptions::max_new_requests) new requests are added.
     async fn add_requests_batched(
         &self,
         requests: Vec<Request>,
         options: AddRequestsBatchedOptions,
     ) -> StorageResult<AddRequestsBatchedResult> {
-        let added = self.add_requests(requests, options.forefront).await?;
-        Ok(AddRequestsBatchedResult {
-            added_requests: added.processed_requests,
-            wait_for_all_requests_to_be_added: None,
-        })
+        let forefront = options.forefront;
+        let (added_requests, requests_over_limit) = drain_request_batches_inline(
+            requests,
+            options.batch_size,
+            options.max_new_requests,
+            Duration::ZERO,
+            |chunk, _| async move { Ok(self.add_requests(chunk, forefront).await?.processed_requests) },
+        )
+        .await?;
+        Ok(AddRequestsBatchedResult { added_requests, wait_for_all_requests_to_be_added: None, requests_over_limit })
     }
     async fn fetch_next_request(&self) -> StorageResult<Option<Request>>;
     async fn mark_request_as_handled(&self, request: &mut Request) -> StorageResult<Option<QueueOperationInfo>>;
@@ -42,6 +50,11 @@ pub trait RequestManager: Send + Sync {
     /// All work is done: nothing pending, nothing in progress.
     async fn is_finished(&self) -> StorageResult<bool>;
     async fn handled_count(&self) -> StorageResult<u64>;
+    /// Requests not handled yet, in progress included (`getPendingCount`). A manager that cannot
+    /// tell returns 0.
+    async fn pending_count(&self) -> StorageResult<u64> {
+        Ok(0)
+    }
     async fn set_expected_request_processing_time(&self, _duration: Duration) -> StorageResult<()> {
         Ok(())
     }
@@ -251,6 +264,11 @@ impl RequestManager for RequestQueue {
 
     async fn handled_count(&self) -> StorageResult<u64> {
         Ok(self.backend.get_metadata().await?.handled_request_count)
+    }
+
+    async fn pending_count(&self) -> StorageResult<u64> {
+        let info = self.backend.get_metadata().await?;
+        Ok(info.total_request_count.saturating_sub(info.handled_request_count))
     }
 
     async fn set_expected_request_processing_time(&self, duration: Duration) -> StorageResult<()> {
