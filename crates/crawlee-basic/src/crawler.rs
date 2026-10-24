@@ -434,6 +434,7 @@ where
                             domains: ThrottledDomains::All,
                             throttle_by: ThrottleBy::RegistrableDomain,
                             min_crawl_delay: delay,
+                            persist_state_key: format!("CRAWLEE_THROTTLED_DOMAINS_{}", inner.id),
                             ..ThrottlingOptions::default()
                         };
                         request_manager =
