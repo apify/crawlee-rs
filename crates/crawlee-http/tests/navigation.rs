@@ -221,3 +221,35 @@ async fn the_session_fingerprint_and_its_proxy_tls_mode_reach_the_client() {
     assert!(sent[0].ignore_tls_errors);
     assert!(sent[0].fingerprint.is_some());
 }
+
+/// `querySelectorAll` / `querySelectorOne` / `waitForSelector` of the HTTP crawler's context.
+#[tokio::test]
+async fn query_selectors_fail_when_nothing_matches() {
+    let addr = serve(Arc::new(AtomicUsize::new(0))).await;
+    let crawler = HttpCrawler::builder()
+        .services(Services::in_memory())
+        .max_request_retries(0)
+        .request_handler(|ctx: HttpContext| async move {
+            let count = ctx.query_selector_all("title", |matches| matches.len()).await?;
+            let title = ctx.query_selector_one("title", |element| element.text()).await?;
+            ctx.wait_for_selector("title").await?;
+            let missing = ctx.wait_for_selector("h1").await.unwrap_err().to_string();
+            let missing_one = ctx.query_selector_one("h1", |element| element.text()).await.unwrap_err().to_string();
+            ctx.push_data(&json!({ "count": count, "title": title, "missing": missing, "missing_one": missing_one }))?;
+            Ok(())
+        })
+        .build()
+        .unwrap();
+    let stats = crawler.run([format!("http://{addr}/ok")]).await.unwrap();
+    assert_eq!(stats.requests_succeeded, 1);
+    let items: Vec<Value> = crawler.dataset().await.unwrap().get_all().await.unwrap();
+    assert_eq!(
+        items[0],
+        json!({
+            "count": 1,
+            "title": "ok",
+            "missing": "Selector 'h1' not found.",
+            "missing_one": "Selector 'h1' not found.",
+        })
+    );
+}

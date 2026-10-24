@@ -23,7 +23,7 @@ use crawlee_http_client::{HttpClientError, HttpRequest, SendOptions, StreamingRe
 use crawlee_utils::{extract_charset_from_html_bytes, matches_enqueue_strategy};
 
 use crate::body::{Body, encoding_for_label};
-use crate::html::Document;
+use crate::html::{Document, Element, Selection};
 
 /// Called before the request is sent; may change it (headers, method, body).
 pub type PreNavigationHook = Arc<dyn Fn(&BasicContext, &mut HttpRequest) -> anyhow::Result<()> + Send + Sync>;
@@ -236,6 +236,40 @@ impl HttpContext {
     /// The parsed document, shared with [`HtmlContext`](crate::HtmlContext).
     pub(crate) fn document_slot(&self) -> &Arc<Mutex<Option<Document>>> {
         &self.document
+    }
+
+    /// The elements matching `selector`, handed to `f` on the blocking thread pool
+    /// (`querySelectorAll`). Fails with "Selector '…' not found." when nothing matches.
+    pub async fn query_selector_all<R, F>(&self, selector: &str, f: F) -> anyhow::Result<R>
+    where
+        F: for<'a> FnOnce(Selection<'a>) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        let selector = selector.to_owned();
+        self.with_document(move |document| -> anyhow::Result<R> {
+            let matches = document.select(&selector)?;
+            if matches.is_empty() {
+                anyhow::bail!("Selector '{selector}' not found.");
+            }
+            Ok(f(matches))
+        })
+        .await?
+    }
+
+    /// The first element matching `selector`, handed to `f` (`querySelectorOne`). Fails like
+    /// [`query_selector_all`](Self::query_selector_all) when nothing matches.
+    pub async fn query_selector_one<R, F>(&self, selector: &str, f: F) -> anyhow::Result<R>
+    where
+        F: for<'a> FnOnce(Element<'a>) -> R + Send + 'static,
+        R: Send + 'static,
+    {
+        self.query_selector_all(selector, |matches| f(matches.first().expect("not empty"))).await
+    }
+
+    /// Fails unless an element matches `selector` (`waitForSelector`). The document of an HTTP
+    /// response does not change, so there is nothing to wait for.
+    pub async fn wait_for_selector(&self, selector: &str) -> anyhow::Result<()> {
+        self.query_selector_all(selector, |_| ()).await
     }
 
     /// Runs `f` with the parsed document (parsed once, on the blocking thread pool).

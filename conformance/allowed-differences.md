@@ -19,7 +19,7 @@ _None._ All 755 checks match.
 |---|---|---|---|
 | Crawling context | Flat object; `extendContext` merges properties | Nested typed contexts (`HtmlContext` → `HttpContext` → `BasicContext` via `Deref`); handlers take the context by value | Rust cannot grow a struct at runtime |
 | Error handlers | Receive the (partial) context of the failed attempt | Receive a fresh `BasicContext` for the same request and session, plus `Arc<anyhow::Error>` | The failed attempt's context was consumed by the handler |
-| HTML API | cheerio `$` (jQuery API) | `Document` / `Selection` / `Element` facade over `scraper`, used through `with_html` | No jQuery in Rust; parsing runs off the async threads |
+| HTML API | cheerio `$` (jQuery API); `querySelectorAll` / `querySelectorOne` return Cheerio objects | `Document` / `Selection` / `Element` facade over `scraper`, used through `with_html`; `query_selector_all` / `query_selector_one` hand the matches to a closure | No jQuery in Rust; parsing runs off the async threads |
 | `errorMessages` | `error.stack` | The error with its cause chain (`{error:#}`) | Rust errors have no JS stack traces |
 | Error grouping in statistics | By error code, name, stack path and message placeholders | By first message line with digits masked | Same reason |
 | Event loop load signal | Lateness of a Node timer | Lateness of a tokio timer task | There is no single event loop; a starved tokio runtime is the equivalent |
