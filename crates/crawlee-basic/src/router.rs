@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 
@@ -38,11 +39,13 @@ type Route<C> = Arc<dyn RequestHandler<C>>;
 pub struct Router<C> {
     routes: HashMap<String, Route<C>>,
     default: Option<Route<C>>,
+    /// Handler timeouts of the routes that override the crawler's.
+    timeouts: HashMap<Option<String>, Duration>,
 }
 
 impl<C> Default for Router<C> {
     fn default() -> Self {
-        Router { routes: HashMap::new(), default: None }
+        Router { routes: HashMap::new(), default: None, timeouts: HashMap::new() }
     }
 }
 
@@ -59,6 +62,29 @@ impl<C: CrawlingContext> Router<C> {
     pub fn add_default_handler(&mut self, handler: impl RequestHandler<C>) -> &mut Self {
         self.default = Some(Arc::new(handler));
         self
+    }
+
+    /// Like [`add_handler`](Self::add_handler), with a handler timeout of its own instead of the
+    /// crawler's `request_handler_timeout` (`requestHandlerTimeoutSecs` of `RouteOptions`).
+    pub fn add_handler_with_timeout(
+        &mut self,
+        label: impl Into<String>,
+        handler: impl RequestHandler<C>,
+        timeout: Duration,
+    ) -> &mut Self {
+        let label = label.into();
+        self.timeouts.insert(Some(label.clone()), timeout);
+        self.add_handler(label, handler)
+    }
+
+    /// Like [`add_default_handler`](Self::add_default_handler), with a handler timeout of its own.
+    pub fn add_default_handler_with_timeout(
+        &mut self,
+        handler: impl RequestHandler<C>,
+        timeout: Duration,
+    ) -> &mut Self {
+        self.timeouts.insert(None, timeout);
+        self.add_default_handler(handler)
     }
 
     /// Adds a handler that receives the request's `user_data` deserialized into `T`. A request
@@ -100,5 +126,17 @@ impl<C: CrawlingContext> RequestHandler<C> for Router<C> {
             Ok(route) => route.handle(ctx),
             Err(err) => Box::pin(async move { Err(err.into()) }),
         }
+    }
+
+    /// The route's timeout; a label without a route of its own gets the default route's.
+    fn timeout_for(&self, label: Option<&str>) -> Option<Duration> {
+        match label.filter(|label| self.routes.contains_key(*label)) {
+            Some(label) => self.timeouts.get(&Some(label.to_owned())).copied(),
+            None => self.timeouts.get(&None).copied(),
+        }
+    }
+
+    fn max_timeout(&self) -> Option<Duration> {
+        self.timeouts.values().copied().max()
     }
 }

@@ -22,16 +22,26 @@ use crate::handler::BoxFuture;
 /// Changes a request before it is enqueued, or drops it by returning `None`.
 pub type RequestTransform = Arc<dyn Fn(Request) -> Option<Request> + Send + Sync>;
 
-/// Called with each request that is not added or not crawled, and why (`onSkippedRequest`).
-pub type SkippedRequestCallback = Arc<dyn Fn(Request, SkipReason) -> BoxFuture<()> + Send + Sync>;
+/// A request that was not added or not crawled, and why: the argument of
+/// [`SkippedRequestCallback`].
+#[derive(Clone, Debug)]
+pub struct SkippedRequest {
+    pub request: Request,
+    pub reason: SkipReason,
+    /// The message given to [`BasicContext::skip_request`], if any.
+    pub message: Option<String>,
+}
+
+/// Called with each request that is not added or not crawled (`onSkippedRequest`).
+pub type SkippedRequestCallback = Arc<dyn Fn(SkippedRequest) -> BoxFuture<()> + Send + Sync>;
 
 /// A [`SkippedRequestCallback`] from an async closure.
 pub fn skipped_request_callback<F, Fut>(callback: F) -> SkippedRequestCallback
 where
-    F: Fn(Request, SkipReason) -> Fut + Send + Sync + 'static,
+    F: Fn(SkippedRequest) -> Fut + Send + Sync + 'static,
     Fut: Future<Output = ()> + Send + 'static,
 {
-    Arc::new(move |request, reason| Box::pin(callback(request, reason)))
+    Arc::new(move |skipped| Box::pin(callback(skipped)))
 }
 
 /// Options of `enqueue_links`, mirroring `EnqueueLinksOptions` of Crawlee for JS.
@@ -142,7 +152,7 @@ impl EnqueueLinksOptions {
 
     pub fn on_skipped_request<F, Fut>(mut self, callback: F) -> Self
     where
-        F: Fn(Request, SkipReason) -> Fut + Send + Sync + 'static,
+        F: Fn(SkippedRequest) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
         self.on_skipped_request = Some(skipped_request_callback(callback));
@@ -291,7 +301,7 @@ impl CrawlerAddRequestsOptions {
 
     pub fn on_skipped_request<F, Fut>(mut self, callback: F) -> Self
     where
-        F: Fn(Request, SkipReason) -> Fut + Send + Sync + 'static,
+        F: Fn(SkippedRequest) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = ()> + Send + 'static,
     {
         self.on_skipped_request = Some(skipped_request_callback(callback));
@@ -315,6 +325,8 @@ pub enum SkipReason {
     Redirect,
     /// Deeper than `max_crawl_depth`.
     Depth,
+    /// Skipped with [`BasicContext::skip_request`].
+    Manual,
 }
 
 /// Result of `enqueue_links`.
@@ -356,8 +368,8 @@ impl CrawlerShared {
 
     /// Reports a skipped request: logs the limits once and calls the crawler's callback
     /// (`#handleSkippedRequest`).
-    pub(crate) async fn handle_skipped_request(&self, request: Request, reason: SkipReason) {
-        match reason {
+    pub(crate) async fn handle_skipped_request(&self, skipped: SkippedRequest) {
+        match skipped.reason {
             SkipReason::Limit => self.info_once("limit", || {
                 format!(
                     "The number of requests enqueued by the crawler reached the maxRequestsPerCrawl limit of {} \
@@ -374,7 +386,7 @@ impl CrawlerShared {
             _ => {}
         }
         if let Some(callback) = &self.on_skipped_request {
-            callback(request, reason).await;
+            callback(skipped).await;
         }
     }
 
@@ -493,9 +505,10 @@ impl CrawlerShared {
             }
         }
         for (request, reason) in skipped {
-            self.handle_skipped_request(request.clone(), *reason).await;
+            let skipped = SkippedRequest { request: request.clone(), reason: *reason, message: None };
+            self.handle_skipped_request(skipped.clone()).await;
             if let Some(callback) = &options.on_skipped_request {
-                callback(request.clone(), *reason).await;
+                callback(skipped).await;
             }
         }
     }

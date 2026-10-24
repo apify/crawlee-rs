@@ -21,8 +21,13 @@ use serde::de::DeserializeOwned;
 
 use crate::autoscaling::{ConcurrencyError, ConcurrencyOptions, ConcurrencySystem};
 use crate::context::{BasicContext, CrawlerShared, CrawlingContext, InFlight, RequestScope};
-use crate::enqueue::{CrawlerAddRequestsOptions, SkipReason, SkippedRequestCallback, skipped_request_callback};
-use crate::errors::{ErrorKind, HandlerPanic, RequestHandlerTimeout, error_message};
+use crate::enqueue::{
+    CrawlerAddRequestsOptions, SkipReason, SkippedRequest, SkippedRequestCallback, skipped_request_callback,
+};
+use crate::errors::{
+    ErrorKind, HandlerPanic, MissingSessionError, RequestHandlerTimeout, RequestSkipped, SkipRequestError,
+    error_message,
+};
 use crate::handler::{ErrorHandler, Identity, Middleware, RequestHandler};
 use crate::proxy::ProxySource;
 use crate::robots::RobotsCache;
@@ -234,7 +239,7 @@ where
     /// (`onSkippedRequest`).
     pub fn on_skipped_request<F, Fut>(mut self, callback: F) -> Self
     where
-        F: Fn(Request, SkipReason) -> Fut + Send + Sync + 'static,
+        F: Fn(SkippedRequest) -> Fut + Send + Sync + 'static,
         Fut: std::future::Future<Output = ()> + Send + 'static,
     {
         self.on_skipped_request = Some(skipped_request_callback(callback));
@@ -440,7 +445,13 @@ where
                 }
                 let dataset = inner.services.open_dataset(&StorageIdentifier::Default).await?;
                 let key_value_store = inner.services.open_key_value_store(&StorageIdentifier::Default).await?;
-                request_manager.set_expected_request_processing_time(inner.options.request_handler_timeout * 2).await?;
+                // Locked for slightly longer than the longest handler timeout, and at least a minute,
+                // so that a request is not handed out again while it is processed
+                // (`applyRequestManagerTimeouts`).
+                let handler_timeout =
+                    inner.options.request_handler_timeout.max(inner.handler.max_timeout().unwrap_or_default());
+                let lock_time = (handler_timeout + Duration::from_secs(5)).max(Duration::from_secs(60));
+                request_manager.set_expected_request_processing_time(lock_time).await?;
                 Ok::<_, anyhow::Error>(Arc::new(CrawlerShared {
                     services: inner.services.clone(),
                     request_manager,
@@ -904,32 +915,53 @@ where
         }
     }
 
-    fn session_for(&self, request: &Request) -> Arc<Session> {
+    /// The session of a request (`resolveSession`): the one it is pinned to, or one from the pool.
+    /// A pinned session the pool does not have (or that is no longer usable) is an error.
+    fn session_for(&self, request: &Request) -> Result<Arc<Session>, MissingSessionError> {
         if !self.inner.options.use_session_pool {
-            return self.inner.session_pool.detached_session();
+            return Ok(self.inner.session_pool.detached_session());
         }
-        request
-            .session_id()
-            .and_then(|id| self.inner.session_pool.get_session_by_id(id))
-            .unwrap_or_else(|| self.inner.session_pool.get_session())
+        match request.session_id() {
+            Some(id) => self
+                .inner
+                .session_pool
+                .get_session_by_id(id)
+                .ok_or_else(|| MissingSessionError { session_id: id.to_owned() }),
+            None => Ok(self.inner.session_pool.get_session()),
+        }
     }
 
     /// Processes one request. Returns `Err` only for errors that must stop the crawl.
-    async fn process_request(&self, shared: Arc<CrawlerShared>, mut request: Request) -> anyhow::Result<()> {
+    async fn process_request(&self, shared: Arc<CrawlerShared>, request: Request) -> anyhow::Result<()> {
+        let started = Instant::now();
+        let internal_timeout = self.internal_timeout();
+
         if !shared.is_allowed_by_robots(&request.url).await {
             tracing::warn!(
                 "Skipping request {} ({}) because it is disallowed based on robots.txt",
                 request.url,
                 request.id.as_deref().unwrap_or_default()
             );
-            request.no_retry = true;
-            shared.request_manager.mark_request_as_handled(&mut request).await?;
-            shared.statistics.record_skipped();
-            shared.handle_skipped_request(request, SkipReason::RobotsTxt).await;
-            return Ok(());
+            let skipped = SkippedRequest { request, reason: SkipReason::RobotsTxt, message: None };
+            return match self.try_skip_request(&shared, skipped).await {
+                Ok(()) => Ok(()),
+                Err(failed) => {
+                    let (request, err) = *failed;
+                    self.handle_request_failure(&shared, None, request, err, started).await
+                }
+            };
         }
-        let started = Instant::now();
-        let session = self.session_for(&request);
+
+        let session = match timeout_and_retry(
+            internal_timeout,
+            &format!("Fetching session timed out after {} seconds.", internal_timeout.as_secs_f64()),
+            || std::future::ready(self.session_for(&request).map_err(anyhow::Error::from)),
+        )
+        .await
+        {
+            Ok(session) => session,
+            Err(err) => return self.handle_request_failure(&shared, None, request, err, started).await,
+        };
         // Without a session pool, nothing uses the session's proxy after this attempt.
         let _release_proxy = (!self.inner.options.use_session_pool)
             .then(|| ReleaseProxy { client: shared.http_client.clone(), session: session.clone() });
@@ -937,73 +969,220 @@ where
         // Fallback in case the handler leaks its context into a task that outlives it.
         let snapshot = request.clone();
 
-        let (result, handler_ran) = self.run_pipeline_and_handler(BasicContext::new(request, scope.clone())).await;
+        // The phases have timeouts of their own, but what is between them has not: the internal
+        // timeout is the catch-all (`withRequestTimeout`).
+        let request_timeout = internal_timeout.max(self.handler_timeout(request.label()));
+        let request_id = request.id.clone().unwrap_or_default();
+        let attempt = async {
+            self.run_pipeline_and_handler(BasicContext::new(request, scope.clone())).await?;
+            // Committed before the request is marked as handled, so that a failed commit fails it.
+            Ok::<_, anyhow::Error>(scope.transaction.commit().await?)
+        };
+        let mut result = match tokio::time::timeout(request_timeout, attempt).await {
+            Ok(result) => result,
+            Err(_) => Err(anyhow::anyhow!(
+                "Request timed out after {} seconds ({request_id}).",
+                request_timeout.as_secs_f64()
+            )),
+        };
+        if result.is_err() {
+            scope.transaction.rollback();
+        }
         let mut request = scope.take_returned().unwrap_or(snapshot);
 
-        let result = match result {
-            Ok(()) => scope.transaction.commit().await.map_err(anyhow::Error::from),
-            Err(err) => {
-                scope.transaction.rollback();
-                Err(err)
+        if result.is_ok() {
+            let manager = shared.request_manager.clone();
+            let marked = timeout_and_retry(
+                internal_timeout,
+                &format!(
+                    "Marking request {} ({}) as handled timed out after {} seconds.",
+                    request.url,
+                    request.id.as_deref().unwrap_or_default(),
+                    internal_timeout.as_secs_f64()
+                ),
+                || {
+                    let (manager, mut request) = (manager.clone(), request.clone());
+                    async move {
+                        manager.mark_request_as_handled(&mut request).await?;
+                        Ok(request)
+                    }
+                },
+            )
+            .await;
+            match marked {
+                Ok(marked) => request = marked,
+                Err(err) => result = Err(err),
             }
-        };
+        }
 
         match result {
             Ok(()) => {
-                shared.request_manager.mark_request_as_handled(&mut request).await?;
                 session.mark_good();
                 shared.statistics.record_success(started.elapsed(), request.retry_count);
                 Ok(())
             }
-            Err(err) => {
-                let kind = ErrorKind::of(&err);
-                if kind == ErrorKind::Skipped {
-                    tracing::debug!("Skipping request: {err:#}");
-                    shared.request_manager.mark_request_as_handled(&mut request).await?;
-                    shared.statistics.record_skipped();
-                    // Skipped by the context pipeline: redirected out of its enqueue strategy.
-                    if !handler_ran {
-                        shared.handle_skipped_request(request, SkipReason::Redirect).await;
-                    }
-                    return Ok(());
-                }
-                self.handle_request_error(&shared, &session, request, err, kind, started).await?;
-                if !kind.absolves_session() {
-                    session.mark_bad();
-                }
-                Ok(())
-            }
+            Err(err) => self.handle_request_failure(&shared, Some(&session), request, err, started).await,
         }
     }
 
-    /// Runs the context pipeline, then the request handler. Also returns whether the handler ran.
-    async fn run_pipeline_and_handler(&self, ctx: BasicContext) -> (anyhow::Result<()>, bool) {
+    /// The request handler timeout of a request: its route's, or the crawler's.
+    fn handler_timeout(&self, label: Option<&str>) -> Duration {
+        self.inner.handler.timeout_for(label).unwrap_or(self.inner.options.request_handler_timeout)
+    }
+
+    /// Runs the context pipeline, then the request handler with its timeout.
+    async fn run_pipeline_and_handler(&self, ctx: BasicContext) -> anyhow::Result<()> {
         let ctx = match AssertUnwindSafe(self.inner.pipeline.run(ctx)).catch_unwind().await {
-            Ok(Ok(ctx)) => ctx,
-            Ok(Err(err)) => return (Err(err), false),
-            Err(panic) => return (Err(panic_error(panic)), false),
+            Ok(result) => result?,
+            Err(panic) => return Err(panic_error(panic)),
         };
 
-        let timeout = self.inner.options.request_handler_timeout;
-        let result = match tokio::time::timeout(
-            timeout,
-            AssertUnwindSafe(self.inner.handler.handle(ctx)).catch_unwind(),
-        )
-        .await
-        {
+        let timeout = self.handler_timeout(ctx.basic().request().label());
+        match tokio::time::timeout(timeout, AssertUnwindSafe(self.inner.handler.handle(ctx)).catch_unwind()).await {
             Ok(Ok(result)) => result,
             Ok(Err(panic)) => Err(panic_error(panic)),
             Err(_) => Err(RequestHandlerTimeout { secs: timeout.as_secs_f64() }.into()),
-        };
-        (result, true)
+        }
     }
 
-    /// The retry logic of `requestFunctionErrorHandler` in Crawlee for JS.
-    async fn handle_request_error(
+    /// A request failed anywhere: in the pipeline, the handler, or while being marked as handled
+    /// (`handleRequestFailure`). A skip is settled as such; anything else goes to the error
+    /// handling.
+    async fn handle_request_failure(
         &self,
         shared: &Arc<CrawlerShared>,
-        session: &Arc<Session>,
+        session: Option<&Arc<Session>>,
+        request: Request,
+        err: anyhow::Error,
+        started: Instant,
+    ) -> anyhow::Result<()> {
+        let (request, err) = match skip_of(&err) {
+            Some((reason, message)) => {
+                match self.try_skip_request(shared, SkippedRequest { request, reason, message }).await {
+                    Ok(()) => return Ok(()),
+                    // A failing skip makes this an ordinary failure, retried.
+                    Err(failed) => *failed,
+                }
+            }
+            None => (request, err),
+        };
+        self.run_error_handler(shared, session, request, err, started).await
+    }
+
+    /// Settles a skipped request: reports it, then marks it as handled (`trySkipRequest`).
+    /// Returns the request and the error that prevented that.
+    async fn try_skip_request(
+        &self,
+        shared: &Arc<CrawlerShared>,
+        skipped: SkippedRequest,
+    ) -> Result<(), Box<(Request, anyhow::Error)>> {
+        let internal_timeout = self.internal_timeout();
+        let mut request = skipped.request.clone();
+        let description = format!("{} ({})", request.url, request.id.as_deref().unwrap_or_default());
+        if tokio::time::timeout(internal_timeout, shared.handle_skipped_request(skipped)).await.is_err() {
+            let message = format!(
+                "onSkippedRequest for {description} timed out after {} seconds.",
+                internal_timeout.as_secs_f64()
+            );
+            return Err(Box::new((request, anyhow::anyhow!(message))));
+        }
+        request.no_retry = true;
+        let manager = shared.request_manager.clone();
+        let marked = timeout_and_retry(
+            internal_timeout,
+            &format!(
+                "Marking request {description} as handled timed out after {} seconds.",
+                internal_timeout.as_secs_f64()
+            ),
+            || {
+                let (manager, mut request) = (manager.clone(), request.clone());
+                async move {
+                    manager.mark_request_as_handled(&mut request).await?;
+                    Ok(())
+                }
+            },
+        )
+        .await;
+        match marked {
+            Ok(()) => {
+                shared.statistics.record_skipped();
+                Ok(())
+            }
+            Err(err) => Err(Box::new((request, err))),
+        }
+    }
+
+    /// Runs the error handling with the internal timeout (`runErrorHandler`). An error handling
+    /// that times out retries the request; one that fails otherwise stops the crawl, after the
+    /// request is given back to the queue.
+    async fn run_error_handler(
+        &self,
+        shared: &Arc<CrawlerShared>,
+        session: Option<&Arc<Session>>,
         mut request: Request,
+        err: anyhow::Error,
+        started: Instant,
+    ) -> anyhow::Result<()> {
+        let internal_timeout = self.internal_timeout();
+        let kind = ErrorKind::of(&err);
+        let retry_count_before = request.retry_count;
+        let handled = tokio::time::timeout(
+            internal_timeout,
+            self.request_function_error_handler(shared, session, &mut request, err, kind, started),
+        )
+        .await;
+        let timed_out = handled.is_err();
+        let secondary = match handled {
+            Ok(Ok(())) => None,
+            Ok(Err(secondary)) => {
+                if ErrorKind::of(&secondary) != ErrorKind::Critical {
+                    tracing::error!(
+                        "An exception occurred during handling of failed request. This places the crawler and its \
+                         underlying storages into an unknown state and crawling will be terminated. {secondary:#}"
+                    );
+                }
+                Some(secondary)
+            }
+            Err(_) => {
+                // Not worth stopping the crawl for. The request is retried, and the retry counted, so that
+                // an error handling that always times out does not retry it forever.
+                tracing::warn!(
+                    "Handling request failure of {} ({}) timed out after {} seconds.",
+                    request.url,
+                    request.id.as_deref().unwrap_or_default(),
+                    internal_timeout.as_secs_f64()
+                );
+                if request.retry_count == retry_count_before {
+                    request.retry_count += 1;
+                }
+                None
+            }
+        };
+        if secondary.is_some() || timed_out {
+            // Neither marked as handled nor reclaimed (e.g. after a `CriticalError`): given back to
+            // the queue. Reclaiming a request that is no longer in progress does nothing.
+            let reclaim = shared.request_manager.reclaim_request(&request, false);
+            let _ = tokio::time::timeout(internal_timeout, reclaim).await;
+        }
+        if let Some(secondary) = secondary {
+            return Err(secondary);
+        }
+        // An error that retires the session (or is the domain's) does not count against it.
+        if !kind.absolves_session()
+            && let Some(session) = session
+        {
+            session.mark_bad();
+        }
+        Ok(())
+    }
+
+    /// The retry logic of `requestFunctionErrorHandler` in Crawlee for JS. Returns `Err` for an
+    /// error that stops the crawl: a `CriticalError`, or an error handler that failed.
+    async fn request_function_error_handler(
+        &self,
+        shared: &Arc<CrawlerShared>,
+        session: Option<&Arc<Session>>,
+        request: &mut Request,
         error: anyhow::Error,
         kind: ErrorKind,
         started: Instant,
@@ -1013,7 +1192,7 @@ where
         if kind == ErrorKind::Throttled {
             // Never really attempted: no retry is spent and the session is not blamed.
             tracing::debug!("Deferring request because its domain is rate-limiting us. {error:#}");
-            manager.reclaim_request(&request, true).await?;
+            manager.reclaim_request(request, true).await?;
             return Ok(());
         }
 
@@ -1026,35 +1205,62 @@ where
 
         let error = Arc::new(error);
 
-        if self.can_be_retried(&request, kind) {
+        if self.can_be_retried(request, kind) {
             shared.statistics.record_retry(&message);
-            if let Some(handler) = &self.inner.error_handler {
-                request = self.call_error_handler(handler, shared, session, request, error.clone()).await;
+            if let Some(handler) = &self.inner.error_handler
+                && let Err(handler_error) =
+                    self.call_error_handler(handler, shared, session, request, error.clone()).await
+            {
+                let Some((reason, skip_message)) = skip_of(&handler_error) else {
+                    return Err(handler_error);
+                };
+                let skipped = SkippedRequest { request: request.clone(), reason, message: skip_message };
+                match self.try_skip_request(shared, skipped).await {
+                    Ok(()) => return Ok(()),
+                    // Retried for the original error: routing this one through the error handler
+                    // again would loop forever with a handler that always skips.
+                    Err(failed) => {
+                        tracing::warn!("Skipping request {} failed, retrying it instead. {:#}", request.url, failed.1)
+                    }
+                }
             }
-            if kind == ErrorKind::Session {
+            if kind == ErrorKind::Session
+                && let Some(session) = session
+            {
                 session.retire();
             }
             if !request.no_retry {
                 request.retry_count += 1;
                 tracing::warn!(
                     retry_count = request.retry_count,
-                    "Reclaiming failed request back to the queue. {message}"
+                    "Reclaiming failed request back to the list or queue. {message}"
                 );
-                manager.reclaim_request(&request, false).await?;
+                manager.reclaim_request(request, false).await?;
                 return Ok(());
             }
         }
 
-        if kind == ErrorKind::Session {
+        if kind == ErrorKind::Session
+            && let Some(session) = session
+        {
             session.retire();
         }
         shared.statistics.record_error(&message);
-        manager.mark_request_as_handled(&mut request).await?;
+        manager.mark_request_as_handled(request).await?;
         shared.statistics.record_failure(started.elapsed(), request.retry_count);
         tracing::error!("Request failed and reached maximum retries. {message}");
 
-        if let Some(handler) = &self.inner.failed_request_handler {
-            self.call_error_handler(handler, shared, session, request, error).await;
+        if let Some(handler) = &self.inner.failed_request_handler
+            && let Err(handler_error) = self.call_error_handler(handler, shared, session, request, error).await
+        {
+            if skip_of(&handler_error).is_none() {
+                return Err(handler_error);
+            }
+            tracing::warn!(
+                "skipRequest() has no effect in failedRequestHandler, request {} ({}) has already failed.",
+                request.url,
+                request.id.as_deref().unwrap_or_default()
+            );
         }
         Ok(())
     }
@@ -1070,30 +1276,49 @@ where
     }
 
     /// Runs an error handler with a fresh context; its storage writes are committed if it
-    /// succeeds. Returns the (possibly modified) request.
+    /// succeeds. Changes it makes to the request are kept, whatever the outcome.
     async fn call_error_handler(
         &self,
         handler: &Arc<dyn ErrorHandler>,
         shared: &Arc<CrawlerShared>,
-        session: &Arc<Session>,
-        request: Request,
+        session: Option<&Arc<Session>>,
+        request: &mut Request,
         error: Arc<anyhow::Error>,
-    ) -> Request {
-        let scope = RequestScope::new(shared.clone(), Some(session.clone()));
-        let snapshot = request.clone();
-        let outcome =
-            AssertUnwindSafe(handler.handle(BasicContext::new(request, scope.clone()), error)).catch_unwind().await;
-        match outcome {
-            Ok(Ok(())) => {
-                if let Err(err) = scope.transaction.commit().await {
-                    tracing::error!("Committing the storage writes of an error handler failed: {err}");
-                }
-            }
-            Ok(Err(err)) => tracing::error!("Error handler failed: {err:#}"),
-            Err(panic) => tracing::error!("Error handler panicked: {:#}", panic_error(panic)),
+    ) -> anyhow::Result<()> {
+        let scope = RequestScope::new(shared.clone(), session.cloned());
+        let outcome = AssertUnwindSafe(handler.handle(BasicContext::new(request.clone(), scope.clone()), error))
+            .catch_unwind()
+            .await;
+        if let Some(returned) = scope.take_returned() {
+            *request = returned;
         }
-        scope.take_returned().unwrap_or(snapshot)
+        match outcome {
+            Ok(Ok(())) => Ok(scope.transaction.commit().await?),
+            Ok(Err(err)) => {
+                scope.transaction.rollback();
+                Err(err)
+            }
+            Err(panic) => {
+                scope.transaction.rollback();
+                Err(panic_error(panic))
+            }
+        }
     }
+}
+
+/// The reason and message of an error that skips a request: a skip by the handler, or one by
+/// the context pipeline (a redirect out of the enqueue strategy).
+fn skip_of(error: &anyhow::Error) -> Option<(SkipReason, Option<String>)> {
+    error.chain().find_map(|cause| {
+        if let Some(skip) = cause.downcast_ref::<SkipRequestError>() {
+            Some((SkipReason::Manual, skip.message.clone()))
+        } else if let Some(skip) = cause.downcast_ref::<RequestSkipped>() {
+            tracing::debug!("Skipping request: {}", skip.reason);
+            Some((SkipReason::Redirect, None))
+        } else {
+            None
+        }
+    })
 }
 
 /// Runs `operation` with `timeout`, and up to 3 more times when it fails or times out

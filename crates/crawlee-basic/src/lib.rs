@@ -20,10 +20,10 @@ pub use crate::autoscaling::{ConcurrencyOptions, ConcurrencySystem, LoadSignal, 
 pub use crate::context::{BasicContext, CrawlingContext};
 pub use crate::crawler::{BasicCrawler, BasicCrawlerBuilder, BuildError, CrawlerOptions};
 pub use crate::enqueue::{
-    CrawlerAddRequestsOptions, EnqueueLinksOptions, EnqueueLinksResult, SkipReason, SkippedRequestCallback,
-    skipped_request_callback,
+    CrawlerAddRequestsOptions, EnqueueLinksOptions, EnqueueLinksResult, SkipReason, SkippedRequest,
+    SkippedRequestCallback, skipped_request_callback,
 };
-pub use crate::errors::{ErrorKind, MissingRouteError, RequestSkipped};
+pub use crate::errors::{ErrorKind, MissingRouteError, MissingSessionError, RequestSkipped, SkipRequestError};
 pub use crate::handler::{ErrorHandler, FnMiddleware, Identity, Middleware, RequestHandler, Then};
 pub use crate::proxy::{ProxyConfiguration, ProxyInfo, ProxySource};
 pub use crate::robots::RobotsTxtFile;

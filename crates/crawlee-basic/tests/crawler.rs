@@ -773,12 +773,11 @@ async fn without_a_session_pool_the_proxy_of_an_attempt_is_released_after_it() {
 
 type Skipped = Arc<Mutex<Vec<(String, crawlee_basic::SkipReason)>>>;
 
-fn skip_log() -> (Skipped, impl Fn(Request, crawlee_basic::SkipReason) -> std::future::Ready<()> + Send + Sync + 'static)
-{
+fn skip_log() -> (Skipped, impl Fn(crawlee_basic::SkippedRequest) -> std::future::Ready<()> + Send + Sync + 'static) {
     let skipped: Skipped = Arc::default();
     let log = skipped.clone();
-    (skipped, move |request: Request, reason| {
-        log.lock().push((request.url, reason));
+    (skipped, move |skipped: crawlee_basic::SkippedRequest| {
+        log.lock().push((skipped.request.url, skipped.reason));
         std::future::ready(())
     })
 }
@@ -984,4 +983,274 @@ async fn a_paced_crawl_wakes_up_when_its_domain_is_ready() {
     let gap = starts[1] - starts[0];
     // Polling every 500 ms would start the second one about 1 s after the first.
     assert!(gap >= Duration::from_millis(690) && gap < Duration::from_millis(900), "{gap:?}");
+}
+
+#[tokio::test]
+async fn a_failing_error_handler_ends_the_run_with_its_error() {
+    for failed_request_handler in [false, true] {
+        let builder = BasicCrawler::builder()
+            .services(services())
+            .max_request_retries(1)
+            .request_handler(|_ctx: BasicContext| async move { anyhow::bail!("handler failed") });
+        let handler =
+            |_ctx: BasicContext, _error: Arc<anyhow::Error>| async move { anyhow::bail!("error handler failed") };
+        let builder = if failed_request_handler {
+            builder.failed_request_handler(handler)
+        } else {
+            builder.error_handler(handler)
+        };
+        let crawler = builder.build().unwrap();
+        let err = crawler.run(["https://a.dev/"]).await.unwrap_err();
+        assert_eq!(err.to_string(), "error handler failed");
+    }
+}
+
+#[tokio::test]
+async fn a_request_that_stopped_the_crawl_is_given_back_to_the_queue() {
+    let crawler = BasicCrawler::builder()
+        .services(services())
+        .request_handler(|_ctx: BasicContext| async move { Err(CriticalError::new("stop everything").into()) })
+        .build()
+        .unwrap();
+    crawler.run(["https://a.dev/"]).await.unwrap_err();
+    let manager = crawler.request_manager().await.unwrap();
+    let request = manager.fetch_next_request().await.unwrap().expect("reclaimed, not left in progress");
+    assert_eq!(request.url, "https://a.dev/");
+}
+
+#[tokio::test]
+async fn a_request_pinned_to_a_missing_session_fails() {
+    let sessions = Arc::new(Mutex::new(Vec::new()));
+    let log = sessions.clone();
+    let crawler = BasicCrawler::builder()
+        .services(services())
+        .max_request_retries(1)
+        .request_handler(|_ctx: BasicContext| async move { Ok(()) })
+        .failed_request_handler(move |ctx: BasicContext, _error: Arc<anyhow::Error>| {
+            let log = log.clone();
+            async move {
+                log.lock().push((ctx.session().is_some(), ctx.request().error_messages.clone()));
+                Ok(())
+            }
+        })
+        .build()
+        .unwrap();
+    let request = Request::builder("https://a.dev/").session_id("missing").build().unwrap();
+    let stats = crawler.run([request]).await.unwrap();
+    assert_eq!(stats.requests_failed, 1);
+    let sessions = sessions.lock();
+    let (has_session, messages) = &sessions[0];
+    assert!(!has_session);
+    assert_eq!(messages.len(), 2);
+    assert_eq!(
+        messages[0],
+        "The current SessionPool instance couldn't find a valid session for the following id: missing."
+    );
+}
+
+/// A request queue whose first marks of a request as handled fail.
+struct FlakyMarks(crawlee_core::RequestQueue, AtomicUsize);
+
+#[async_trait::async_trait]
+impl crawlee_core::RequestManager for FlakyMarks {
+    async fn add_requests(
+        &self,
+        requests: Vec<Request>,
+        forefront: bool,
+    ) -> crawlee_core::StorageResult<crawlee_core::storage::backend::BatchAddRequestsResult> {
+        self.0.add_requests(requests, forefront).await
+    }
+    async fn fetch_next_request(&self) -> crawlee_core::StorageResult<Option<Request>> {
+        self.0.fetch_next_request().await
+    }
+    async fn mark_request_as_handled(
+        &self,
+        request: &mut Request,
+    ) -> crawlee_core::StorageResult<Option<crawlee_core::storage::backend::QueueOperationInfo>> {
+        if self.1.fetch_add(1, Ordering::SeqCst) < 2 {
+            return Err(crawlee_core::StorageError::InvalidArgument("flaky".into()));
+        }
+        self.0.mark_request_as_handled(request).await
+    }
+    async fn reclaim_request(
+        &self,
+        request: &Request,
+        forefront: bool,
+    ) -> crawlee_core::StorageResult<Option<crawlee_core::storage::backend::QueueOperationInfo>> {
+        self.0.reclaim_request(request, forefront).await
+    }
+    async fn is_empty(&self) -> crawlee_core::StorageResult<bool> {
+        self.0.is_empty().await
+    }
+    async fn is_finished(&self) -> crawlee_core::StorageResult<bool> {
+        self.0.is_finished().await
+    }
+    async fn handled_count(&self) -> crawlee_core::StorageResult<u64> {
+        self.0.handled_count().await
+    }
+}
+
+#[tokio::test]
+async fn storage_operations_of_a_request_are_retried() {
+    let services = services();
+    let queue = services.open_request_queue(&crawlee_core::StorageIdentifier::Default).await.unwrap();
+    let crawler = BasicCrawler::builder()
+        .services(services)
+        .request_manager(Arc::new(FlakyMarks(queue, AtomicUsize::new(0))))
+        .request_handler(|_ctx: BasicContext| async move { Ok(()) })
+        .build()
+        .unwrap();
+    let stats = crawler.run(["https://a.dev/"]).await.unwrap();
+    assert_eq!((stats.requests_succeeded, stats.requests_failed, stats.requests_retries), (1, 0, 0));
+}
+
+#[tokio::test]
+async fn each_attempt_starts_without_a_loaded_url() {
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let crawler = BasicCrawler::builder()
+        .services(services())
+        .request_handler(move |mut ctx: BasicContext| {
+            let log = log.clone();
+            async move {
+                log.lock().push(ctx.request().loaded_url.clone());
+                ctx.request_mut().loaded_url = Some("https://a.dev/loaded".into());
+                if ctx.request().retry_count == 0 {
+                    anyhow::bail!("again");
+                }
+                Ok(())
+            }
+        })
+        .build()
+        .unwrap();
+    crawler.run(["https://a.dev/"]).await.unwrap();
+    assert_eq!(*seen.lock(), [None, None]);
+}
+
+#[tokio::test]
+async fn skipped_requests_are_reported_with_their_reason_and_message() {
+    let skipped = Arc::new(Mutex::new(Vec::new()));
+    let log = skipped.clone();
+    let crawler = BasicCrawler::builder()
+        .services(services())
+        .on_skipped_request(move |skipped: crawlee_basic::SkippedRequest| {
+            log.lock().push((skipped.request.url, skipped.reason, skipped.message));
+            std::future::ready(())
+        })
+        .request_handler(|ctx: BasicContext| async move {
+            if ctx.request().url.ends_with("/manual") {
+                return Err(ctx.skip_request(Some("not interesting")));
+            }
+            anyhow::bail!("fails, then skipped by the error handler")
+        })
+        .error_handler(|ctx: BasicContext, _error: Arc<anyhow::Error>| async move { Err(ctx.skip_request(None)) })
+        .build()
+        .unwrap();
+    let stats = crawler.run(["https://a.dev/manual", "https://a.dev/from-error-handler"]).await.unwrap();
+    assert_eq!((stats.requests_succeeded, stats.requests_failed, stats.requests_skipped), (0, 0, 2));
+    let mut skipped = skipped.lock().clone();
+    skipped.sort_by(|a, b| a.0.cmp(&b.0));
+    use crawlee_basic::SkipReason::Manual;
+    assert_eq!(
+        skipped,
+        [
+            ("https://a.dev/from-error-handler".to_owned(), Manual, None),
+            ("https://a.dev/manual".to_owned(), Manual, Some("not interesting".to_owned())),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_route_can_have_a_handler_timeout_of_its_own() {
+    let mut router = Router::<BasicContext>::new();
+    router.add_handler_with_timeout(
+        "SLOW",
+        |_ctx: BasicContext| async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok(())
+        },
+        Duration::from_millis(50),
+    );
+    router.add_default_handler(|_ctx: BasicContext| async move { Ok(()) });
+    let crawler = BasicCrawler::builder()
+        .services(services())
+        .max_request_retries(0)
+        .router(router)
+        .failed_request_handler(|ctx: BasicContext, _e: Arc<anyhow::Error>| async move {
+            ctx.push_data(&json!({ "error": ctx.request().error_messages[0] }))?;
+            Ok(())
+        })
+        .build()
+        .unwrap();
+    let slow = Request::builder("https://a.dev/slow").label("SLOW").build().unwrap();
+    let stats = crawler.run([slow, Request::new("https://a.dev/fast")]).await.unwrap();
+    assert_eq!((stats.requests_succeeded, stats.requests_failed), (1, 1));
+    assert_eq!(items(&crawler).await, [json!({ "error": "requestHandler timed out after 0.05 seconds." })]);
+}
+
+/// A request queue that records the processing time it is told to expect.
+struct ExpectedTime(crawlee_core::RequestQueue, Mutex<Vec<Duration>>);
+
+#[async_trait::async_trait]
+impl crawlee_core::RequestManager for ExpectedTime {
+    async fn add_requests(
+        &self,
+        requests: Vec<Request>,
+        forefront: bool,
+    ) -> crawlee_core::StorageResult<crawlee_core::storage::backend::BatchAddRequestsResult> {
+        self.0.add_requests(requests, forefront).await
+    }
+    async fn fetch_next_request(&self) -> crawlee_core::StorageResult<Option<Request>> {
+        self.0.fetch_next_request().await
+    }
+    async fn mark_request_as_handled(
+        &self,
+        request: &mut Request,
+    ) -> crawlee_core::StorageResult<Option<crawlee_core::storage::backend::QueueOperationInfo>> {
+        self.0.mark_request_as_handled(request).await
+    }
+    async fn reclaim_request(
+        &self,
+        request: &Request,
+        forefront: bool,
+    ) -> crawlee_core::StorageResult<Option<crawlee_core::storage::backend::QueueOperationInfo>> {
+        self.0.reclaim_request(request, forefront).await
+    }
+    async fn is_empty(&self) -> crawlee_core::StorageResult<bool> {
+        self.0.is_empty().await
+    }
+    async fn is_finished(&self) -> crawlee_core::StorageResult<bool> {
+        self.0.is_finished().await
+    }
+    async fn handled_count(&self) -> crawlee_core::StorageResult<u64> {
+        self.0.handled_count().await
+    }
+    async fn set_expected_request_processing_time(&self, duration: Duration) -> crawlee_core::StorageResult<()> {
+        self.1.lock().push(duration);
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn requests_are_locked_for_the_longest_handler_timeout_and_a_margin() {
+    for (handler_timeout, route_timeout, expected) in [(10, None, 60), (100, None, 105), (10, Some(120), 125)] {
+        let services = services();
+        let queue = services.open_request_queue(&crawlee_core::StorageIdentifier::Default).await.unwrap();
+        let manager = Arc::new(ExpectedTime(queue, Mutex::new(Vec::new())));
+        let mut router = Router::<BasicContext>::new();
+        let handler = |_ctx: BasicContext| async move { Ok(()) };
+        match route_timeout {
+            Some(secs) => router.add_handler_with_timeout("LABEL", handler, Duration::from_secs(secs)),
+            None => router.add_default_handler(handler),
+        };
+        let crawler = BasicCrawler::builder()
+            .services(services)
+            .request_manager(manager.clone())
+            .request_handler_timeout(Duration::from_secs(handler_timeout))
+            .router(router)
+            .build()
+            .unwrap();
+        crawler.add_requests(Vec::<Request>::new()).await.unwrap();
+        assert_eq!(*manager.1.lock(), [Duration::from_secs(expected)]);
+    }
 }

@@ -17,7 +17,7 @@ use crawlee_core::{
 use crawlee_http_client::{HttpClient, HttpClientError, HttpRequest, HttpResponse, SendOptions};
 
 use crate::enqueue::{CrawlerAddRequestsOptions, EnqueueError, SkipReason, SkippedRequestCallback};
-use crate::errors::RequestSkipped;
+use crate::errors::SkipRequestError;
 use crate::proxy::ProxyInfo;
 use crate::robots::RobotsCache;
 use crate::session::Session;
@@ -218,7 +218,7 @@ impl BasicContext {
             request.id.as_deref().unwrap_or_default(),
             message.map(|message| format!(": {message}")).unwrap_or_default()
         );
-        RequestSkipped { reason: message.unwrap_or("skipped by the request handler").to_owned() }.into()
+        SkipRequestError { message: message.map(str::to_owned) }.into()
     }
 
     pub fn request_mut(&mut self) -> &mut Request {
