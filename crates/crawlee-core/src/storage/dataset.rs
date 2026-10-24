@@ -9,6 +9,9 @@ use serde_json::value::RawValue;
 use super::backend::{DatasetBackend, DatasetInfo, DatasetItem, DatasetListOptions, StorageBackend, StorageIdentifier};
 use crate::errors::{StorageError, StorageResult};
 
+/// Page size of the dataset iterators and exports.
+pub const DATASET_ITERATORS_DEFAULT_LIMIT: usize = 10_000;
+
 /// Handle to a dataset. Cloning is cheap and clones share the storage.
 #[derive(Clone)]
 pub struct Dataset {
@@ -63,16 +66,20 @@ impl Dataset {
         Ok(DatasetPage { total: page.total, offset: page.offset, items })
     }
 
-    /// All items, fetched in pages of `page_size`.
+    /// All items, fetched in pages of [`DATASET_ITERATORS_DEFAULT_LIMIT`].
     pub async fn get_all<T: DeserializeOwned>(&self) -> StorageResult<Vec<T>> {
-        const PAGE_SIZE: usize = 1000;
         let mut out = Vec::new();
         loop {
-            let page: DatasetPage<T> =
-                self.get_data(DatasetListOptions { offset: out.len(), limit: Some(PAGE_SIZE), desc: false }).await?;
+            let page: DatasetPage<T> = self
+                .get_data(DatasetListOptions {
+                    offset: out.len(),
+                    limit: Some(DATASET_ITERATORS_DEFAULT_LIMIT),
+                    desc: false,
+                })
+                .await?;
             let received = page.items.len();
             out.extend(page.items);
-            if received == 0 || out.len() >= page.total {
+            if received < DATASET_ITERATORS_DEFAULT_LIMIT || out.len() >= page.total {
                 return Ok(out);
             }
         }
@@ -135,6 +142,53 @@ mod tests {
             dataset.get_data(DatasetListOptions { offset: 1, limit: Some(1), desc: true }).await.unwrap();
         assert_eq!(page.items, vec![Item { title: "b".into() }]);
         assert_eq!(page.total, 3);
+    }
+
+    /// Records the options of every `get_data` call.
+    struct RecordingDataset {
+        inner: Arc<dyn DatasetBackend>,
+        calls: parking_lot::Mutex<Vec<DatasetListOptions>>,
+    }
+
+    #[async_trait::async_trait]
+    impl DatasetBackend for RecordingDataset {
+        async fn get_metadata(&self) -> StorageResult<DatasetInfo> {
+            self.inner.get_metadata().await
+        }
+        async fn drop_storage(&self) -> StorageResult<()> {
+            self.inner.drop_storage().await
+        }
+        async fn purge(&self) -> StorageResult<()> {
+            self.inner.purge().await
+        }
+        async fn push_data(&self, items: Vec<DatasetItem>) -> StorageResult<()> {
+            self.inner.push_data(items).await
+        }
+        async fn get_data(
+            &self,
+            options: DatasetListOptions,
+        ) -> StorageResult<crate::storage::backend::PaginatedList<DatasetItem>> {
+            self.calls.lock().push(options);
+            self.inner.get_data(options).await
+        }
+    }
+
+    async fn recording(storage: &MemoryStorageBackend) -> (Dataset, Arc<RecordingDataset>) {
+        let inner = storage.create_dataset_backend(&StorageIdentifier::Default).await.unwrap();
+        let backend = Arc::new(RecordingDataset { inner, calls: parking_lot::Mutex::new(Vec::new()) });
+        (Dataset::from_backend(backend.clone()), backend)
+    }
+
+    #[tokio::test]
+    async fn get_all_reads_pages_of_ten_thousand_items() {
+        let storage = MemoryStorageBackend::new();
+        let (dataset, backend) = recording(&storage).await;
+        let items: Vec<_> = (0..10_001).map(|i| json!({ "i": i })).collect();
+        dataset.push_data(&items).await.unwrap();
+
+        assert_eq!(dataset.get_all::<serde_json::Value>().await.unwrap().len(), 10_001);
+        let limits: Vec<_> = backend.calls.lock().iter().map(|call| (call.offset, call.limit)).collect();
+        assert_eq!(limits, [(0, Some(10_000)), (10_000, Some(10_000))]);
     }
 
     #[test]
