@@ -1,7 +1,9 @@
 //! [`HttpCrawler`]: fetches each request over HTTP and hands the response to the handler.
 
 use std::collections::HashSet;
+use std::future::Future;
 use std::ops::{Deref, DerefMut};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,11 +26,43 @@ use crawlee_utils::{extract_charset_from_html_bytes, matches_enqueue_strategy};
 use crate::body::{Body, encoding_for_label};
 use crate::html::{Document, Element, Selection};
 
-/// Called before the request is sent; may change it (headers, method, body).
-pub type PreNavigationHook = Arc<dyn Fn(&BasicContext, &mut HttpRequest) -> anyhow::Result<()> + Send + Sync>;
-/// Called once the response headers arrived, before its body is read; may reject the response by
-/// returning an error. Responses of an unsupported content type are rejected before the hooks.
-pub type PostNavigationHook = Arc<dyn Fn(&BasicContext, &StreamingResponse) -> anyhow::Result<()> + Send + Sync>;
+type HookFuture<T> = Pin<Box<dyn Future<Output = anyhow::Result<T>> + Send>>;
+
+/// Called before the request is sent, with the crawling context (`preNavigationHooks`). It may
+/// change what is sent through `ctx.request_mut()` (URL, method, headers, payload) and hands the
+/// context on; an error fails the request.
+pub type PreNavigationHook = Arc<dyn Fn(BasicContext) -> HookFuture<BasicContext> + Send + Sync>;
+/// Called once the response headers arrived, before its body is read (`postNavigationHooks`). It
+/// may replace the response, or reject it by returning an error. Responses of an unsupported
+/// content type are rejected before the hooks.
+pub type PostNavigationHook = Arc<dyn Fn(PostNavigationContext) -> HookFuture<PostNavigationContext> + Send + Sync>;
+
+/// The context of a post-navigation hook (`CrawlingContextWithResponse`): the crawling context
+/// and the response, whose body is not read yet. A hook may replace `response`, as returning
+/// `{ response }` does in Crawlee for JS.
+pub struct PostNavigationContext {
+    context: BasicContext,
+    pub response: StreamingResponse,
+}
+
+impl std::fmt::Debug for PostNavigationContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PostNavigationContext").field("response", &self.response).finish_non_exhaustive()
+    }
+}
+
+impl Deref for PostNavigationContext {
+    type Target = BasicContext;
+    fn deref(&self) -> &BasicContext {
+        &self.context
+    }
+}
+
+impl DerefMut for PostNavigationContext {
+    fn deref_mut(&mut self) -> &mut BasicContext {
+        &mut self.context
+    }
+}
 
 /// Elements of pages that block crawlers (`RETRY_CSS_SELECTORS`), checked with
 /// [`HttpCrawlerOptions::retry_on_blocked`].
@@ -105,19 +139,41 @@ impl std::fmt::Debug for HttpCrawlerOptions {
 }
 
 impl HttpCrawlerOptions {
-    pub fn pre_navigation_hook(
-        mut self,
-        hook: impl Fn(&BasicContext, &mut HttpRequest) -> anyhow::Result<()> + Send + Sync + 'static,
-    ) -> Self {
-        self.pre_navigation_hooks.push(Arc::new(hook));
+    /// Adds a [`PreNavigationHook`]. Hooks run in order, within the navigation timeout.
+    ///
+    /// ```no_run
+    /// # use crawlee_http::HttpCrawlerOptions;
+    /// let options = HttpCrawlerOptions::default().pre_navigation_hook(|mut ctx| async move {
+    ///     ctx.request_mut().headers.insert("Custom-Header".into(), "value".into());
+    ///     Ok(ctx)
+    /// });
+    /// ```
+    pub fn pre_navigation_hook<F, Fut>(mut self, hook: F) -> Self
+    where
+        F: Fn(BasicContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = anyhow::Result<BasicContext>> + Send + 'static,
+    {
+        self.pre_navigation_hooks.push(Arc::new(move |ctx| Box::pin(hook(ctx))));
         self
     }
 
-    pub fn post_navigation_hook(
-        mut self,
-        hook: impl Fn(&BasicContext, &StreamingResponse) -> anyhow::Result<()> + Send + Sync + 'static,
-    ) -> Self {
-        self.post_navigation_hooks.push(Arc::new(hook));
+    /// Adds a [`PostNavigationHook`]. Hooks run in order, within the navigation timeout.
+    ///
+    /// ```no_run
+    /// # use crawlee_http::HttpCrawlerOptions;
+    /// let options = HttpCrawlerOptions::default().post_navigation_hook(|ctx| async move {
+    ///     if ctx.response.header("x-challenge").is_some() {
+    ///         anyhow::bail!("challenge page");
+    ///     }
+    ///     Ok(ctx)
+    /// });
+    /// ```
+    pub fn post_navigation_hook<F, Fut>(mut self, hook: F) -> Self
+    where
+        F: Fn(PostNavigationContext) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = anyhow::Result<PostNavigationContext>> + Send + 'static,
+    {
+        self.post_navigation_hooks.push(Arc::new(move |ctx| Box::pin(hook(ctx))));
         self
     }
 }
@@ -523,6 +579,29 @@ impl HttpPipeline {
         anyhow::anyhow!("{status} - Internal Server Error: {preview}")
     }
 
+    fn navigation_timed_out(&self) -> anyhow::Error {
+        anyhow::anyhow!("Navigation timed out after {} seconds.", self.options.navigation_timeout.as_secs_f64())
+    }
+
+    /// What is left of the navigation window (`remainingNavigationWindowMillis`).
+    fn remaining(&self, deadline: tokio::time::Instant) -> anyhow::Result<Duration> {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(self.navigation_timed_out());
+        }
+        Ok(remaining)
+    }
+
+    /// Runs a step of the navigation within what is left of its window (`windowGuard`).
+    async fn within_window<T>(
+        &self,
+        deadline: tokio::time::Instant,
+        step: impl Future<Output = anyhow::Result<T>>,
+    ) -> anyhow::Result<T> {
+        self.remaining(deadline)?;
+        tokio::time::timeout_at(deadline, step).await.map_err(|_| self.navigation_timed_out())?
+    }
+
     fn map_client_error(&self, err: HttpClientError) -> anyhow::Error {
         match err {
             HttpClientError::Proxy(message) => SessionError::new(message).into(),
@@ -584,10 +663,13 @@ impl Middleware<BasicContext> for HttpPipeline {
     type Out = HttpContext;
 
     async fn run(&self, mut ctx: BasicContext) -> anyhow::Result<HttpContext> {
-        let mut http_request = self.build_request(&ctx)?;
+        // One navigation window covers the pre-navigation hooks, the request, the post-navigation
+        // hooks and reading the body.
+        let deadline = tokio::time::Instant::now() + self.options.navigation_timeout;
         for hook in &self.options.pre_navigation_hooks {
-            hook(&ctx, &mut http_request)?;
+            ctx = self.within_window(deadline, hook(ctx)).await?;
         }
+        let http_request = self.build_request(&ctx)?;
 
         let cookie_jar = ctx.session().map(|session| {
             if self.options.save_response_cookies {
@@ -599,7 +681,7 @@ impl Middleware<BasicContext> for HttpPipeline {
         let send_options = SendOptions {
             proxy_url: ctx.proxy_info().map(|proxy| proxy.url.clone()),
             cookie_jar,
-            timeout: Some(self.options.navigation_timeout),
+            timeout: Some(self.remaining(deadline)?),
             // A man-in-the-middle proxy can only turn verification off.
             ignore_tls_errors: self.options.ignore_tls_errors
                 || ctx.proxy_info().is_some_and(|proxy| proxy.ignore_tls_errors),
@@ -612,15 +694,19 @@ impl Middleware<BasicContext> for HttpPipeline {
             .send_request_streaming(http_request, &send_options)
             .await
             .map_err(|err| self.map_client_error(err))?;
-        let status = response.status.as_u16();
         let request_url = ctx.request().url.clone();
 
         // `abortDownloadOfBody`, then the user's hooks: all before the body is read.
         let content_type = ContentType::from_response(&response.headers, &response.url);
-        self.check_content_type(&request_url, status, &content_type)?;
+        self.check_content_type(&request_url, response.status.as_u16(), &content_type)?;
+        let mut navigated = PostNavigationContext { context: ctx, response };
         for hook in &self.options.post_navigation_hooks {
-            hook(&ctx, &response)?;
+            navigated = self.within_window(deadline, hook(navigated)).await?;
         }
+        // A hook may have replaced the response.
+        let PostNavigationContext { context: mut ctx, response } = navigated;
+        let status = response.status.as_u16();
+        let content_type = ContentType::from_response(&response.headers, &response.url);
 
         // Before the status checks, which count 429 as blocked: when the request manager paces the
         // domain, the request is deferred without spending a retry or blaming the session. The

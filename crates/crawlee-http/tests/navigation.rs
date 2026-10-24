@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 
 use crawlee_basic::{BasicContext, ProxyInfo, ProxySource};
 use crawlee_core::Services;
-use crawlee_http::{HttpContext, HttpCrawler, HttpCrawlerOptions};
+use crawlee_http::{HttpContext, HttpCrawler, HttpCrawlerOptions, PostNavigationContext};
 use crawlee_http_client::{HttpClient, HttpClientError, HttpRequest, HttpResponse, SendOptions};
 
 /// A body that sends a first chunk and then never ends.
@@ -66,6 +66,13 @@ async fn serve(hits: Arc<AtomicUsize>) -> SocketAddr {
         )
         .route("/forbidden", route(|| (StatusCode::FORBIDDEN, Html("<p>no</p>")).into_response()))
         .route("/ok", route(|| Html("<title>ok</title>").into_response()))
+        .route(
+            "/echo",
+            get(|headers: axum::http::HeaderMap| async move {
+                let value = headers.get("x-hook").and_then(|v| v.to_str().ok()).unwrap_or("none").to_owned();
+                Html(format!("<title>{value}</title>"))
+            }),
+        )
         .route("/untyped/{name}", route(|| untyped("<title>untyped</title>")));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -136,12 +143,14 @@ async fn unsupported_content_types_fail_before_the_body_is_read() {
 async fn post_navigation_hooks_run_before_the_body_is_read() {
     let calls = Arc::new(AtomicUsize::new(0));
     let counter = calls.clone();
-    let options = options().post_navigation_hook(move |_ctx, response| {
+    let options = options().post_navigation_hook(move |ctx: PostNavigationContext| {
         counter.fetch_add(1, Ordering::SeqCst);
-        if response.header("x-reject").is_some() {
-            anyhow::bail!("rejected by the hook ({})", response.status);
+        async move {
+            if ctx.response.header("x-reject").is_some() {
+                anyhow::bail!("rejected by the hook ({})", ctx.response.status);
+            }
+            Ok(ctx)
         }
-        Ok(())
     });
     let started = Instant::now();
     let (failed, _) = crawl(options, 0, &["/endless.html", "/stream.bin"]).await;
@@ -270,4 +279,111 @@ async fn without_a_content_type_the_url_extension_decides() {
     assert_eq!(failed.len(), 1, "{failed:?}");
     assert_eq!(failed[0].0, "/untyped/blob.bin");
     assert!(failed[0].1[0].contains("served Content-Type application/octet-stream"), "{failed:?}");
+}
+
+/// Runs `options` over `paths` and returns the page titles the handler saw, by URL path, and the
+/// error messages of the failed requests.
+async fn titles(options: HttpCrawlerOptions, paths: &[&str]) -> (Vec<(String, String)>, Vec<String>) {
+    let addr = serve(Arc::new(AtomicUsize::new(0))).await;
+    let errors = Arc::new(parking_lot::Mutex::new(Vec::new()));
+    let log = errors.clone();
+    let crawler = HttpCrawler::builder_with_options(options)
+        .services(Services::in_memory())
+        .max_request_retries(0)
+        .request_handler(|ctx: HttpContext| async move {
+            let title = ctx.query_selector_one("title", |element| element.text()).await?;
+            ctx.push_data(&json!({ "path": ctx.url().path(), "title": title }))?;
+            Ok(())
+        })
+        .failed_request_handler(move |_ctx: BasicContext, err: Arc<anyhow::Error>| {
+            let log = log.clone();
+            async move {
+                log.lock().push(err.to_string());
+                Ok(())
+            }
+        })
+        .build()
+        .unwrap();
+    crawler.run(paths.iter().map(|path| format!("http://{addr}{path}"))).await.unwrap();
+    let items: Vec<Value> = crawler.dataset().await.unwrap().get_all().await.unwrap();
+    let titles = items
+        .iter()
+        .map(|item| (item["path"].as_str().unwrap().to_owned(), item["title"].as_str().unwrap().to_owned()))
+        .collect();
+    let errors = errors.lock().clone();
+    (titles, errors)
+}
+
+/// Pre-navigation hooks are async, get the crawling context and change the request through it,
+/// as `crawlingContext.request.headers` in JS.
+#[tokio::test]
+async fn pre_navigation_hooks_can_await_and_change_the_request() {
+    let options = options()
+        .pre_navigation_hook(|mut ctx: BasicContext| async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            ctx.request_mut().headers.insert("x-hook".into(), "first".into());
+            Ok(ctx)
+        })
+        .pre_navigation_hook(|mut ctx: BasicContext| async move {
+            let previous = ctx.request().headers["x-hook"].clone();
+            ctx.request_mut().headers.insert("x-hook".into(), format!("{previous}+second"));
+            Ok(ctx)
+        });
+    let (titles, errors) = titles(options, &["/echo"]).await;
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(titles, [("/echo".to_owned(), "first+second".to_owned())]);
+}
+
+/// A post-navigation hook can replace the response, as returning `{ response }` does in JS. The
+/// content type is then taken from the new response.
+#[tokio::test]
+async fn post_navigation_hooks_can_replace_the_response() {
+    let options = options().post_navigation_hook(|mut ctx: PostNavigationContext| async move {
+        let body = "<title>replaced</title>";
+        let mut headers = http::HeaderMap::new();
+        headers.insert(header::CONTENT_TYPE, "text/html".parse().unwrap());
+        let response = HttpResponse {
+            status: StatusCode::OK,
+            headers,
+            url: ctx.response.url.clone(),
+            body: Bytes::from_static(body.as_bytes()),
+            redirects: Vec::new(),
+        };
+        // Refetched "after solving a challenge".
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        ctx.response = response.into();
+        Ok(ctx)
+    });
+    let (titles, errors) = titles(options, &["/forbidden"]).await;
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(titles, [("/forbidden".to_owned(), "replaced".to_owned())]);
+}
+
+/// One navigation window covers the pre-navigation hooks, the request and the post-navigation
+/// hooks, as in JS.
+#[tokio::test]
+async fn hooks_share_the_navigation_window() {
+    let window = HttpCrawlerOptions { navigation_timeout: Duration::from_millis(500), ..Default::default() };
+    let slow = |delay: u64| {
+        move |ctx: BasicContext| async move {
+            tokio::time::sleep(Duration::from_millis(delay)).await;
+            Ok(ctx)
+        }
+    };
+    let started = Instant::now();
+    let (_, errors) = titles(window.clone().pre_navigation_hook(slow(5_000)), &["/ok"]).await;
+    assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+    assert_eq!(errors, ["Navigation timed out after 0.5 seconds."]);
+
+    let late =
+        window.clone().pre_navigation_hook(slow(300)).post_navigation_hook(|ctx: PostNavigationContext| async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            Ok(ctx)
+        });
+    let (_, errors) = titles(late, &["/ok"]).await;
+    assert_eq!(errors, ["Navigation timed out after 0.5 seconds."], "300 ms + 300 ms exceed the window");
+
+    let (titles, errors) = titles(window.pre_navigation_hook(slow(100)), &["/ok"]).await;
+    assert!(errors.is_empty(), "{errors:?}");
+    assert_eq!(titles.len(), 1);
 }
