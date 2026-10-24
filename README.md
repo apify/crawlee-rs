@@ -105,6 +105,9 @@ storage/
 - **One instance per storage.** `Services::open_dataset` (and the other `open_*`) returns the
   instance already open for the same id, name or alias, as `StorageInstanceManager` does in JS.
   `Dataset::open(backend, id)` and the like open a new handle without that cache.
+- **Remote URL lists.** `RequestQueue::add_requests_from_url(RequestsFromUrl::new(url), ..)` is the
+  `{ requestsFromUrl }` source of JS. It downloads with the queue's `UrlListFetcher`; crawlers set
+  one on the default queue that uses their HTTP client.
 
 ## Events and saved state
 

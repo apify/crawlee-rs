@@ -29,7 +29,9 @@ pub use crate::storage::memory::MemoryStorageBackend;
 pub use crate::storage::request_loader::{
     LoaderStatus, PacingScope, PacingSignal, RequestLoader, RequestManagerTandem,
 };
-pub use crate::storage::request_queue::{RequestManager, RequestQueue, RequestQueueStats};
+pub use crate::storage::request_queue::{
+    RequestManager, RequestQueue, RequestQueueStats, RequestsFromUrl, UrlListFetcher,
+};
 pub use crate::system_info::SystemInfo;
 pub use crate::transaction::StorageTransaction;
 

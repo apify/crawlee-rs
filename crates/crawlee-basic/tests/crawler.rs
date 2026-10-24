@@ -750,3 +750,16 @@ async fn without_a_session_pool_the_proxy_of_an_attempt_is_released_after_it() {
         }
     }
 }
+
+#[tokio::test]
+async fn the_default_queue_downloads_url_lists_with_the_crawler_http_client() {
+    let services = services();
+    let crawler = BasicCrawler::builder()
+        .services(services.clone())
+        .request_handler(|_ctx: BasicContext| async { Ok(()) })
+        .build()
+        .unwrap();
+    crawler.run(Vec::<Request>::new()).await.unwrap();
+    let queue = services.open_request_queue(&crawlee_core::StorageIdentifier::Default).await.unwrap();
+    assert!(queue.has_url_list_fetcher());
+}

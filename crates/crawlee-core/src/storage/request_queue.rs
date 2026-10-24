@@ -1,11 +1,12 @@
 //! [`RequestQueue`] and the [`RequestManager`] trait crawlers consume requests through.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
+use regex::{Regex, RegexBuilder};
 
 use super::backend::{
     BatchAddRequestsResult, ProcessedRequest, QueueOperationInfo, RequestQueueBackend, RequestQueueInfo,
@@ -14,8 +15,9 @@ use super::backend::{
 use super::batched_adds::{
     AddRequestsBatchedOptions, AddRequestsBatchedResult, InProgressBatches, drain_request_batches,
 };
-use crate::errors::StorageResult;
-use crate::request::{Request, unique_key_to_request_id};
+use crate::errors::{StorageError, StorageResult};
+use crate::recoverable_state::BoxError;
+use crate::request::{Request, RequestError, unique_key_to_request_id};
 use crate::services::CacheLink;
 
 /// Source and sink of requests for a crawler. [`RequestQueue`] is the default implementation;
@@ -51,6 +53,75 @@ pub trait RequestManager: Send + Sync {
     /// requests it covers; a plain queue does not, and returns `false`.
     fn record_pacing_signal(&self, _signal: &super::request_loader::PacingSignal) -> bool {
         false
+    }
+}
+
+/// Downloads a URL list for [`RequestQueue::add_requests_from_url`] (the `httpClient` of
+/// `downloadListOfUrls` in JS). Crawlers set one built on their HTTP client.
+#[async_trait]
+pub trait UrlListFetcher: Send + Sync {
+    /// The body of a `GET` of `url`.
+    async fn fetch(&self, url: &str, proxy_url: Option<&str>) -> Result<Vec<u8>, BoxError>;
+}
+
+/// The URLs [`RequestsFromUrl`] finds by default (`URL_NO_COMMAS_REGEX` of `@crawlee/utils`).
+pub static URL_NO_COMMAS_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+    RegexBuilder::new(
+        r"https?://(www\.)?([\p{L}0-9]|[\p{L}0-9][-\p{L}0-9@:%._+~#=]{0,254}[\p{L}0-9])\.[a-z]{2,63}(:[0-9]{1,5})?(/[-\p{L}0-9@:%_+.~#?&/=()'*]*)?",
+    )
+    .case_insensitive(true)
+    .size_limit(64 << 20)
+    .build()
+    .expect("a valid regex")
+});
+
+/// Every match of `regex` (default [`URL_NO_COMMAS_REGEX`]) in `text`, line by line
+/// (`extractUrls` in JS).
+pub fn extract_urls(text: &str, regex: Option<&Regex>) -> Vec<String> {
+    let regex = regex.unwrap_or(&URL_NO_COMMAS_REGEX);
+    text.split('\n').flat_map(|line| regex.find_iter(line).map(|found| found.as_str().to_owned())).collect()
+}
+
+type RequestTemplate = Arc<dyn Fn(&str) -> Result<Request, RequestError> + Send + Sync>;
+
+/// Requests read from a remote list of URLs, the `{ requestsFromUrl, regex, ...options }` source
+/// of Crawlee for JS.
+#[derive(Clone)]
+pub struct RequestsFromUrl {
+    pub requests_from_url: String,
+    /// What a URL looks like in the list; [`URL_NO_COMMAS_REGEX`] by default.
+    pub regex: Option<Regex>,
+    request: RequestTemplate,
+}
+
+impl std::fmt::Debug for RequestsFromUrl {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RequestsFromUrl")
+            .field("requests_from_url", &self.requests_from_url)
+            .field("regex", &self.regex)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RequestsFromUrl {
+    pub fn new(requests_from_url: impl Into<String>) -> Self {
+        RequestsFromUrl {
+            requests_from_url: requests_from_url.into(),
+            regex: None,
+            request: Arc::new(|url| Ok(Request::new(url))),
+        }
+    }
+
+    pub fn regex(mut self, regex: Regex) -> Self {
+        self.regex = Some(regex);
+        self
+    }
+
+    /// Makes the request of each URL found, for the request options the URLs share (a label,
+    /// user data, headers...). `Request::new` by default.
+    pub fn request(mut self, make: impl Fn(&str) -> Result<Request, RequestError> + Send + Sync + 'static) -> Self {
+        self.request = Arc::new(make);
+        self
     }
 }
 
@@ -133,6 +204,7 @@ pub struct RequestQueue {
     /// The highest expected processing time passed on to the backend.
     expected_processing_time: Arc<Mutex<Duration>>,
     counters: Arc<RequestQueueCounters>,
+    url_list_fetcher: Arc<Mutex<Option<Arc<dyn UrlListFetcher>>>>,
     in_progress_batches: InProgressBatches,
 }
 
@@ -157,6 +229,7 @@ impl RequestQueue {
             added: Arc::new(Mutex::new(DedupCache { slots: None })),
             expected_processing_time: Arc::default(),
             counters: Arc::default(),
+            url_list_fetcher: Arc::default(),
             in_progress_batches: InProgressBatches::default(),
         }
     }
@@ -197,6 +270,66 @@ impl RequestQueue {
         self.added.lock().clear();
         *self.expected_processing_time.lock() = Duration::ZERO;
         Ok(())
+    }
+
+    /// Sets how [`add_requests_from_url`](Self::add_requests_from_url) downloads its lists.
+    pub fn set_url_list_fetcher(&self, fetcher: Arc<dyn UrlListFetcher>) {
+        *self.url_list_fetcher.lock() = Some(fetcher);
+    }
+
+    /// Whether a [`UrlListFetcher`] was set.
+    pub fn has_url_list_fetcher(&self) -> bool {
+        self.url_list_fetcher.lock().is_some()
+    }
+
+    /// Downloads the list at `source.requests_from_url`, and adds a request for every URL in it
+    /// with [`add_requests_batched`](RequestManager::add_requests_batched): the first batch before
+    /// returning, the rest in the background (`addRequest({ requestsFromUrl })` in JS). Returns
+    /// the requests of the first batch.
+    pub async fn add_requests_from_url(
+        &self,
+        source: RequestsFromUrl,
+        forefront: bool,
+    ) -> StorageResult<Vec<ProcessedRequest>> {
+        let RequestsFromUrl { requests_from_url, regex, request } = source;
+        let fetcher = self.url_list_fetcher.lock().clone();
+        let cannot_fetch = |err: &dyn std::fmt::Display| {
+            StorageError::Backend(format!("Cannot fetch a request list from {requests_from_url}: {err}").into())
+        };
+        let fetcher = fetcher.ok_or_else(|| {
+            cannot_fetch(&"no URL list fetcher was set; set one with RequestQueue::set_url_list_fetcher")
+        })?;
+        // A Google Sheets sharing link is fetched as the CSV export of the sheet.
+        static GOOGLE_SHEETS: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r"^(https://docs\.google\.com/spreadsheets/d/[A-Za-z0-9_-]+)/?").unwrap());
+        let url = match GOOGLE_SHEETS.captures(&requests_from_url) {
+            Some(sheet) => format!("{}/gviz/tq?tqx=out:csv", &sheet[1]),
+            None => requests_from_url.clone(),
+        };
+        let body = fetcher.fetch(&url, None).await.map_err(|err| cannot_fetch(&err))?;
+        let urls = extract_urls(&String::from_utf8_lossy(&body), regex.as_ref());
+        if urls.is_empty() {
+            tracing::warn!(requests_from_url, regex = ?regex, "The fetched list contains no valid URLs.");
+            return Ok(Vec::new());
+        }
+        let requests = urls
+            .iter()
+            .map(|url| request(url))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|err| StorageError::InvalidArgument(err.to_string()))?;
+        let fetched_count = requests.len();
+        let options = AddRequestsBatchedOptions { forefront, ..Default::default() };
+        let added = self.add_requests_batched(requests, options).await?.added_requests;
+        tracing::info!(
+            requests_from_url,
+            regex = ?regex,
+            fetched_count,
+            imported_count = added.len(),
+            duplicate_count = fetched_count.saturating_sub(added.len()),
+            sample = ?&urls[..urls.len().min(5)],
+            "Fetched and loaded Requests from a remote resource."
+        );
+        Ok(added)
     }
 
     pub fn stats(&self) -> RequestQueueStats {
@@ -607,6 +740,72 @@ mod tests {
         request = queue.fetch_next_request().await.unwrap().unwrap();
         queue.mark_request_as_handled(&mut request).await.unwrap();
         assert_eq!(queue.stats(), RequestQueueStats { write_count: 3, head_item_read_count: 2 });
+    }
+
+    /// Serves fixed bodies and records the URLs it fetched.
+    #[derive(Default)]
+    struct FixedFetcher {
+        body: &'static str,
+        fetched: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl UrlListFetcher for FixedFetcher {
+        async fn fetch(&self, url: &str, _proxy_url: Option<&str>) -> Result<Vec<u8>, BoxError> {
+            self.fetched.lock().push(url.to_owned());
+            if self.body == "fail" {
+                return Err("connection refused".into());
+            }
+            Ok(self.body.as_bytes().to_vec())
+        }
+    }
+
+    #[test]
+    fn extracts_urls_line_by_line() {
+        let text = "https://a.com/x, https://b.com/y\nnot a url\nhttp://www.příklad.cz:8080/z?q=1";
+        assert_eq!(
+            extract_urls(text, None),
+            ["https://a.com/x", "https://b.com/y", "http://www.příklad.cz:8080/z?q=1"]
+        );
+        let only_b = regex::Regex::new("https://b[^,]+").unwrap();
+        assert_eq!(extract_urls(text, Some(&only_b)), ["https://b.com/y"]);
+    }
+
+    #[tokio::test]
+    async fn adds_the_requests_of_a_remote_list() {
+        let storage = MemoryStorageBackend::new();
+        let queue = RequestQueue::open(&storage, &StorageIdentifier::Default).await.unwrap();
+        let source = RequestsFromUrl::new("https://example.com/list.txt")
+            .request(|url| Request::builder(url).label("LIST").build());
+
+        let err = queue.add_requests_from_url(source.clone(), false).await.unwrap_err();
+        assert!(err.to_string().contains("set_url_list_fetcher"), "{err}");
+
+        let fetcher =
+            Arc::new(FixedFetcher { body: "https://a.com/1\nhttps://a.com/2 https://a.com/1", ..Default::default() });
+        queue.set_url_list_fetcher(fetcher.clone());
+        let added = queue.add_requests_from_url(source, false).await.unwrap();
+        assert_eq!(added.len(), 2);
+        let request = queue.fetch_next_request().await.unwrap().unwrap();
+        assert_eq!((request.url.as_str(), request.label()), ("https://a.com/1", Some("LIST")));
+
+        // A Google Sheets sharing link is read as CSV.
+        queue
+            .add_requests_from_url(
+                RequestsFromUrl::new("https://docs.google.com/spreadsheets/d/abc-1_x/edit#gid=0"),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fetcher.fetched.lock().last().map(String::as_str),
+            Some("https://docs.google.com/spreadsheets/d/abc-1_x/gviz/tq?tqx=out:csv")
+        );
+
+        let failing = RequestQueue::open(&storage, &StorageIdentifier::alias("other")).await.unwrap();
+        failing.set_url_list_fetcher(Arc::new(FixedFetcher { body: "fail", ..Default::default() }));
+        let err = failing.add_requests_from_url(RequestsFromUrl::new("https://x.com/l"), false).await.unwrap_err();
+        assert!(err.to_string().ends_with("Cannot fetch a request list from https://x.com/l: connection refused"));
     }
 
     #[test]

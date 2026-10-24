@@ -403,7 +403,14 @@ where
                 inner.services.purge_on_start().await?;
                 let mut request_manager: Arc<dyn RequestManager> = match &inner.request_manager {
                     Some(manager) => manager.clone(),
-                    None => Arc::new(inner.services.open_request_queue(&StorageIdentifier::Default).await?),
+                    None => {
+                        let queue = inner.services.open_request_queue(&StorageIdentifier::Default).await?;
+                        // So that `add_requests_from_url` downloads with the crawler's HTTP client.
+                        if !queue.has_url_list_fetcher() {
+                            queue.set_url_list_fetcher(Arc::new(HttpUrlListFetcher(inner.http_client.clone())));
+                        }
+                        Arc::new(queue)
+                    }
                 };
                 let delay = inner.options.same_domain_delay;
                 if !delay.is_zero() {
@@ -1029,5 +1036,25 @@ struct ConcurrencySlot(Arc<ConcurrencySystem>);
 impl Drop for ConcurrencySlot {
     fn drop(&mut self) {
         self.0.register_task_end();
+    }
+}
+
+/// Downloads the URL lists of `RequestQueue::add_requests_from_url` with an [`HttpClient`]
+/// (`downloadListOfUrls` in JS, which reads the body whatever the status).
+struct HttpUrlListFetcher(Arc<dyn HttpClient>);
+
+#[async_trait::async_trait]
+impl crawlee_core::UrlListFetcher for HttpUrlListFetcher {
+    async fn fetch(
+        &self,
+        url: &str,
+        proxy_url: Option<&str>,
+    ) -> Result<Vec<u8>, crawlee_core::recoverable_state::BoxError> {
+        let options = crawlee_http_client::SendOptions {
+            proxy_url: proxy_url.map(url::Url::parse).transpose()?,
+            ..Default::default()
+        };
+        let request = crawlee_http_client::HttpRequest::get(url::Url::parse(url)?);
+        Ok(self.0.send_request(request, &options).await?.body.to_vec())
     }
 }
