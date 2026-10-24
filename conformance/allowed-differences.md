@@ -29,6 +29,7 @@ _None._ All 755 checks match.
 | Add dedup cache | Stores keys | Stores 64-bit fingerprints of keys (8 MiB per million) | Memory |
 | Default HTTP client | `impit` (browser impersonation) | reqwest (rustls, h2); impit through `integrations/crawlee-impit` | impit needs patched dependencies, which cannot be forced on every user |
 | Throttling | `checkReadiness()` can report a domain as `stalled` after `maxDomainStallSecs` of 429s | Not ported: a domain that rate-limits forever is retried forever | The task loop has no readiness states yet |
+| `createSessionFunction` | Also recreates the sessions restored from the saved pool, from their record | Makes new sessions only; restored sessions are rebuilt from their record (their proxy through `ProxySource::restored_proxy_info`) | A Rust `Session` is not built from an options bag holding its whole saved state |
 | Error groups in saved statistics | `errors` / `retryErrors` hold the nested `ErrorTracker` tree | A flat `{ group: count }` map | Follows from the error grouping above; JS rebuilds its trackers from scratch on restore anyway |
 
 ## Behavior differences not yet covered by golden cases

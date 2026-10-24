@@ -8,6 +8,7 @@
 //! Bodies are [`Bytes`] from the socket to the crawler, so they are never copied.
 
 pub mod cookies;
+pub mod fingerprint;
 #[cfg(feature = "reqwest")]
 pub mod reqwest_transport;
 
@@ -21,6 +22,7 @@ use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use url::Url;
 
 pub use crate::cookies::CookieJar;
+pub use crate::fingerprint::{FingerprintBrowser, FingerprintDevice, FingerprintPlatform, SessionFingerprint};
 #[cfg(feature = "reqwest")]
 pub use crate::reqwest_transport::ReqwestTransport;
 

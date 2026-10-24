@@ -18,7 +18,10 @@ use serde_json::{Map, Value, json};
 use url::Url;
 
 use crawlee_core::recoverable_state::{BoxError, PersistedState};
-use crawlee_http_client::CookieJar;
+use crawlee_http_client::{
+    CookieJar, FingerprintBrowser as Browser, FingerprintDevice as Device, FingerprintPlatform as Platform,
+    SessionFingerprint,
+};
 
 use crate::proxy::{ProxyInfo, ProxySource};
 
@@ -33,6 +36,9 @@ pub struct SessionOptions {
     pub error_score_decrement: f64,
     /// Uses after which the session is retired.
     pub max_usage_count: u32,
+    /// The fingerprint of every session. `None`: the pool gives each new session a random one
+    /// ([`create_default_session_fingerprint`]).
+    pub fingerprint: Option<SessionFingerprint>,
 }
 
 impl Default for SessionOptions {
@@ -42,8 +48,34 @@ impl Default for SessionOptions {
             max_error_score: 3.0,
             error_score_decrement: 0.5,
             max_usage_count: 50,
+            fingerprint: None,
         }
     }
+}
+
+const fn profile(browser: Browser, platform: Platform, device: Device) -> SessionFingerprint {
+    SessionFingerprint { browser: Some(browser), platform: Some(platform), device: Some(device) }
+}
+
+/// The (browser, platform, device) combinations people actually run (`fingerprint.ts`).
+pub(crate) const PROFILES: [SessionFingerprint; 12] = [
+    profile(Browser::Chrome, Platform::Windows, Device::Desktop),
+    profile(Browser::Firefox, Platform::Windows, Device::Desktop),
+    profile(Browser::Edge, Platform::Windows, Device::Desktop),
+    profile(Browser::Chrome, Platform::Macos, Device::Desktop),
+    profile(Browser::Firefox, Platform::Macos, Device::Desktop),
+    profile(Browser::Safari, Platform::Macos, Device::Desktop),
+    profile(Browser::Edge, Platform::Macos, Device::Desktop),
+    profile(Browser::Chrome, Platform::Linux, Device::Desktop),
+    profile(Browser::Firefox, Platform::Linux, Device::Desktop),
+    profile(Browser::Chrome, Platform::Android, Device::Mobile),
+    profile(Browser::Firefox, Platform::Android, Device::Mobile),
+    profile(Browser::Safari, Platform::Ios, Device::Mobile),
+];
+
+/// A random realistic fingerprint: the default of new sessions (`createDefaultSessionFingerprint`).
+pub fn create_default_session_fingerprint() -> SessionFingerprint {
+    PROFILES[rand::rng().random_range(0..PROFILES.len())]
 }
 
 #[derive(Debug)]
@@ -59,6 +91,7 @@ pub struct Session {
     id: String,
     cookie_jar: Arc<CookieJar>,
     proxy_info: Option<ProxyInfo>,
+    fingerprint: Option<Arc<SessionFingerprint>>,
     created_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
     options: SessionOptions,
@@ -88,6 +121,7 @@ impl Session {
             id,
             cookie_jar: Arc::new(CookieJar::new()),
             proxy_info,
+            fingerprint: options.fingerprint.map(Arc::new),
             created_at,
             expires_at,
             options,
@@ -99,12 +133,11 @@ impl Session {
     /// The session as Crawlee for JS saves it (`Session.getState()`).
     pub fn to_state(&self) -> Value {
         let state = self.state.lock();
-        json!({
+        let mut record = json!({
             "id": self.id,
             "cookieJar": self.cookie_jar.to_json(),
             "proxyInfo": self.proxy_info.as_ref().map(proxy_info_json),
             "userData": *self.user_data.lock(),
-            "fingerprint": null,
             "maxErrorScore": self.options.max_error_score,
             "errorScoreDecrement": self.options.error_score_decrement,
             "expiresAt": iso(self.expires_at),
@@ -113,11 +146,16 @@ impl Session {
             "maxUsageCount": self.options.max_usage_count,
             "errorScore": state.error_score,
             "retired": state.retired,
-        })
+        });
+        // Left out without one, as `JSON.stringify` leaves out `undefined`.
+        if let Some(fingerprint) = &self.fingerprint {
+            record["fingerprint"] = fingerprint.to_json();
+        }
+        record
     }
 
     /// A session from [`to_state`](Self::to_state) (or a session saved by Crawlee for JS).
-    /// Limits missing from the record come from `options`.
+    /// Limits missing from the record, and the fingerprint, come from `options`.
     pub fn from_state(record: &Value, options: &SessionOptions) -> Result<Self, BoxError> {
         let time = |field: &str| -> Result<DateTime<Utc>, BoxError> {
             let text = record[field].as_str().ok_or_else(|| format!("the session has no `{field}`"))?;
@@ -143,6 +181,7 @@ impl Session {
             id,
             cookie_jar: Arc::new(CookieJar::from_json(&record["cookieJar"])),
             proxy_info,
+            fingerprint: SessionFingerprint::from_json(&record["fingerprint"]).or(options.fingerprint).map(Arc::new),
             created_at,
             expires_at,
             options,
@@ -172,6 +211,17 @@ impl Session {
         self.proxy_info.as_ref()
     }
 
+    /// The browser-like profile the session impersonates.
+    pub fn fingerprint(&self) -> Option<&SessionFingerprint> {
+        self.fingerprint.as_deref()
+    }
+
+    /// The fingerprint as HTTP clients receive it: clients that derive state from it (such as the
+    /// impit browser version) keep that state per fingerprint, so per session.
+    pub fn fingerprint_handle(&self) -> Option<&Arc<SessionFingerprint>> {
+        self.fingerprint.as_ref()
+    }
+
     pub fn error_score(&self) -> f64 {
         self.state.lock().error_score
     }
@@ -198,45 +248,113 @@ impl Session {
 
     /// Whether the pool may hand this session out.
     pub fn is_usable(&self) -> bool {
-        let state = self.state.lock();
+        self.usable(&self.state.lock())
+    }
+
+    fn usable(&self, state: &SessionState) -> bool {
         !state.retired
             && state.error_score < self.options.max_error_score
             && state.usage_count < self.options.max_usage_count
             && Utc::now() < self.expires_at
     }
 
-    /// The request succeeded: count the use and lower the error score.
+    /// The request succeeded: count the use and lower the error score. Retires the session when
+    /// it is no longer usable (used up or expired).
     pub fn mark_good(&self) {
         let mut state = self.state.lock();
         state.usage_count += 1;
-        state.error_score = (state.error_score - self.options.error_score_decrement).max(0.0);
+        if state.error_score > 0.0 {
+            state.error_score -= self.options.error_score_decrement;
+        }
+        self.maybe_self_retire(&mut state);
     }
 
-    /// The request failed: count the use and raise the error score.
+    /// The request failed: count the use and raise the error score. Retires the session when it
+    /// is no longer usable.
     pub fn mark_bad(&self) {
         let mut state = self.state.lock();
-        state.usage_count += 1;
         state.error_score += 1.0;
+        state.usage_count += 1;
+        self.maybe_self_retire(&mut state);
     }
 
-    /// Takes the session out of rotation for good.
+    /// Takes the session out of rotation for good: adds the maximum error score and counts a use.
+    /// Retiring a retired session does nothing.
     pub fn retire(&self) {
-        let mut state = self.state.lock();
-        state.retired = true;
+        self.retire_locked(&mut self.state.lock());
+    }
+
+    fn retire_locked(&self, state: &mut SessionState) {
+        if state.retired {
+            return;
+        }
+        state.error_score += self.options.max_error_score;
         state.usage_count += 1;
+        state.retired = true;
+    }
+
+    fn maybe_self_retire(&self, state: &mut SessionState) {
+        if !self.usable(state) {
+            self.retire_locked(state);
+        }
     }
 }
 
-/// Pool options, with the defaults of Crawlee for JS.
+/// How the pool picks the session for the next request (`sessionReuseStrategy`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SessionReuseStrategy {
+    /// Fills the pool up to its maximum size, then picks a random usable session.
+    #[default]
+    Random,
+    /// Fills the pool up to its maximum size, then cycles through the sessions in order.
+    RoundRobin,
+    /// Reuses the first usable session until it is retired, then moves on to the next one.
+    UseUntilFailure,
+}
+
+/// What a [`CreateSessionFunction`] makes a session from (`{ sessionOptions }` in JS).
 #[derive(Clone, Debug)]
+pub struct CreateSessionOptions {
+    /// A new id, `session_` and 10 random characters.
+    pub id: String,
+    /// The proxy the pool's proxy source gave for the id.
+    pub proxy_info: Option<ProxyInfo>,
+    /// The pool's session options, with the fingerprint for this session set.
+    pub session_options: SessionOptions,
+}
+
+/// Makes the pool's new sessions instead of [`Session::new`] (`createSessionFunction`). Sessions
+/// restored from the saved state of the pool are recreated from their record instead.
+pub type CreateSessionFunction = Arc<dyn Fn(CreateSessionOptions) -> Session + Send + Sync>;
+
+/// Pool options, with the defaults of Crawlee for JS.
+#[derive(Clone)]
 pub struct SessionPoolOptions {
     pub max_pool_size: usize,
     pub session_options: SessionOptions,
+    pub session_reuse_strategy: SessionReuseStrategy,
+    pub create_session_function: Option<CreateSessionFunction>,
 }
 
 impl Default for SessionPoolOptions {
     fn default() -> Self {
-        SessionPoolOptions { max_pool_size: 1000, session_options: SessionOptions::default() }
+        SessionPoolOptions {
+            max_pool_size: 1000,
+            session_options: SessionOptions::default(),
+            session_reuse_strategy: SessionReuseStrategy::default(),
+            create_session_function: None,
+        }
+    }
+}
+
+impl std::fmt::Debug for SessionPoolOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SessionPoolOptions")
+            .field("max_pool_size", &self.max_pool_size)
+            .field("session_options", &self.session_options)
+            .field("session_reuse_strategy", &self.session_reuse_strategy)
+            .field("create_session_function", &self.create_session_function.is_some())
+            .finish()
     }
 }
 
@@ -246,13 +364,31 @@ pub enum SessionPoolError {
     AlreadyExists(String),
 }
 
-/// Hands out sessions: new ones until the pool is full, then random usable ones, replacing
-/// sessions that are no longer usable (the `random` strategy of Crawlee for JS).
+#[derive(Default)]
+struct PoolState {
+    sessions: Vec<Arc<Session>>,
+    round_robin_index: usize,
+}
+
+impl PoolState {
+    fn remove_retired_sessions(&mut self) {
+        self.sessions.retain(|session| {
+            let usable = session.is_usable();
+            if !usable {
+                tracing::debug!("Removed Session - {}", session.id());
+            }
+            usable
+        });
+    }
+}
+
+/// Hands out sessions: new ones until the pool is full, then usable ones picked by the
+/// [`SessionReuseStrategy`], replacing sessions that are no longer usable.
 pub struct SessionPool {
     id: String,
     options: SessionPoolOptions,
     proxies: Option<Arc<dyn ProxySource>>,
-    sessions: Mutex<Vec<Arc<Session>>>,
+    state: Mutex<PoolState>,
 }
 
 impl std::fmt::Debug for SessionPool {
@@ -269,7 +405,7 @@ impl SessionPool {
     }
 
     pub fn with_id(id: impl Into<String>, options: SessionPoolOptions, proxies: Option<Arc<dyn ProxySource>>) -> Self {
-        SessionPool { id: id.into(), options, proxies, sessions: Mutex::new(Vec::new()) }
+        SessionPool { id: id.into(), options, proxies, state: Mutex::default() }
     }
 
     pub fn id(&self) -> &str {
@@ -281,10 +417,23 @@ impl SessionPool {
         format!("CRAWLEE_SESSION_POOL_STATE_{}", self.id)
     }
 
+    /// The pool's session options with a fingerprint: the pool-wide one, else a random default.
+    fn session_options(&self) -> SessionOptions {
+        let mut options = self.options.session_options.clone();
+        options.fingerprint = options.fingerprint.or_else(|| Some(create_default_session_fingerprint()));
+        options
+    }
+
     fn create_session(&self) -> Arc<Session> {
         let id = format!("session_{}", crawlee_core::request::crypto_random_object_id(10));
-        let proxy = self.proxies.as_ref().and_then(|proxies| proxies.new_proxy_info(&id));
-        Arc::new(Session::new(id, proxy, self.options.session_options.clone()))
+        let proxy_info = self.proxies.as_ref().and_then(|proxies| proxies.new_proxy_info(&id));
+        let session_options = self.session_options();
+        let session = match &self.options.create_session_function {
+            Some(create) => create(CreateSessionOptions { id, proxy_info, session_options }),
+            None => Session::new(id, proxy_info, session_options),
+        };
+        tracing::debug!("Created new Session - {}", session.id());
+        Arc::new(session)
     }
 
     /// A new session, with a new proxy, that the pool does not keep: for crawlers without a
@@ -293,61 +442,81 @@ impl SessionPool {
         self.create_session()
     }
 
+    fn has_space_for_session(&self, state: &PoolState) -> bool {
+        state.sessions.len() < self.options.max_pool_size.max(1)
+    }
+
+    /// The session the strategy reuses, or `None` when a new one should be created.
+    fn pick_session(&self, state: &mut PoolState) -> Option<Arc<Session>> {
+        let strategy = self.options.session_reuse_strategy;
+        if strategy == SessionReuseStrategy::UseUntilFailure {
+            return state.sessions.iter().find(|session| session.is_usable()).cloned();
+        }
+        if self.has_space_for_session(state) {
+            return None;
+        }
+        let index = match strategy {
+            SessionReuseStrategy::RoundRobin => {
+                let index = state.round_robin_index % state.sessions.len();
+                state.round_robin_index = index + 1;
+                index
+            }
+            _ => rand::rng().random_range(0..state.sessions.len()),
+        };
+        let picked = &state.sessions[index];
+        picked.is_usable().then(|| picked.clone())
+    }
+
     /// A session for the next request.
     pub fn get_session(&self) -> Arc<Session> {
-        let mut sessions = self.sessions.lock();
-        if sessions.len() < self.options.max_pool_size.max(1) {
-            let session = self.create_session();
-            sessions.push(session.clone());
+        let mut state = self.state.lock();
+        if let Some(session) = self.pick_session(&mut state) {
             return session;
         }
-
-        let index = rand::rng().random_range(0..sessions.len());
-        if sessions[index].is_usable() {
-            return sessions[index].clone();
+        if !self.has_space_for_session(&state) {
+            state.remove_retired_sessions();
         }
-
-        sessions.retain(|session| session.is_usable());
         let session = self.create_session();
-        sessions.push(session.clone());
+        state.sessions.push(session.clone());
         session
     }
 
-    /// Adds a session to the pool, also beyond the maximum pool size.
-    ///
-    /// A session with the same id is replaced when it is no longer usable (retired, expired or used
-    /// up), otherwise [`SessionPoolError::AlreadyExists`] is returned.
+    /// Adds a session to the pool, also beyond the maximum pool size. A full pool first drops its
+    /// sessions that are no longer usable. A session with the same id, usable or not, makes it
+    /// fail with [`SessionPoolError::AlreadyExists`].
     pub fn add_session(&self, session: Session) -> Result<Arc<Session>, SessionPoolError> {
-        let mut sessions = self.sessions.lock();
-        if let Some(index) = sessions.iter().position(|existing| existing.id() == session.id()) {
-            if sessions[index].is_usable() {
-                return Err(SessionPoolError::AlreadyExists(session.id));
-            }
-            let removed = sessions.remove(index);
-            tracing::debug!("Removed Session - {}", removed.id());
+        let mut state = self.state.lock();
+        if state.sessions.iter().any(|existing| existing.id() == session.id()) {
+            return Err(SessionPoolError::AlreadyExists(session.id));
         }
+        if !self.has_space_for_session(&state) {
+            state.remove_retired_sessions();
+        }
+        tracing::debug!("Adding new Session - {}", session.id());
         let session = Arc::new(session);
-        sessions.push(session.clone());
+        state.sessions.push(session.clone());
         Ok(session)
     }
 
-    /// The usable session with this id, if any.
+    /// The usable session with this id, if any (`getSession(sessionId)` in JS). The crawler fails
+    /// a request bound to a session that is missing here with `MissingSessionError`.
     pub fn get_session_by_id(&self, id: &str) -> Option<Arc<Session>> {
-        self.sessions.lock().iter().find(|session| session.id() == id && session.is_usable()).cloned()
+        self.state.lock().sessions.iter().find(|session| session.id() == id && session.is_usable()).cloned()
     }
 
     pub fn usable_count(&self) -> usize {
-        self.sessions.lock().iter().filter(|session| session.is_usable()).count()
+        self.state.lock().sessions.iter().filter(|session| session.is_usable()).count()
     }
 
     pub fn retired_count(&self) -> usize {
-        self.sessions.lock().iter().filter(|session| !session.is_usable()).count()
+        self.state.lock().sessions.iter().filter(|session| !session.is_usable()).count()
     }
 }
 
 impl PersistedState for SessionPool {
     fn to_record(&self) -> Value {
-        let sessions = self.sessions.lock();
+        let state = self.state.lock();
+        let sessions = &state.sessions;
         let usable = sessions.iter().filter(|session| session.is_usable()).count();
         json!({
             "usableSessionsCount": usable,
@@ -359,9 +528,10 @@ impl PersistedState for SessionPool {
     /// Recreates the saved sessions, keeping only the usable ones.
     fn restore(&self, record: Value) -> Result<(), BoxError> {
         let saved = record["sessions"].as_array().ok_or("the record has no `sessions`")?;
+        // A session saved without a fingerprint gets the default one, as a new session would.
         let mut sessions = saved
             .iter()
-            .map(|state| Session::from_state(state, &self.options.session_options))
+            .map(|state| Session::from_state(state, &self.session_options()))
             .collect::<Result<Vec<_>, _>>()?;
         if let Some(proxies) = &self.proxies {
             // As `createSessionFunction` does in JS: the proxy source decides what a restored proxy becomes.
@@ -375,12 +545,14 @@ impl PersistedState for SessionPool {
         let usable: Vec<Arc<Session>> =
             sessions.into_iter().filter(|session| session.is_usable()).map(Arc::new).collect();
         tracing::debug!("{} active sessions loaded from the key-value store", usable.len());
-        *self.sessions.lock() = usable;
+        let mut state = self.state.lock();
+        state.sessions = usable;
+        state.round_robin_index = 0;
         Ok(())
     }
 
     fn reset(&self) {
-        self.sessions.lock().clear();
+        *self.state.lock() = PoolState::default();
     }
 }
 
@@ -425,17 +597,136 @@ mod tests {
     }
 
     #[test]
-    fn add_session_replaces_an_unusable_session_with_the_same_id() {
+    fn add_session_rejects_any_duplicate_id() {
         let pool = SessionPool::new(SessionPoolOptions { max_pool_size: 1, ..Default::default() }, None);
         let pinned = pool.add_session(Session::new("pinned".into(), None, SessionOptions::default())).unwrap();
         let duplicate = Session::new("pinned".into(), None, SessionOptions::default());
         assert!(matches!(pool.add_session(duplicate), Err(SessionPoolError::AlreadyExists(id)) if id == "pinned"));
 
+        // Even a retired session keeps its id taken, as in JS.
         pinned.retire();
-        let replacement = pool.add_session(Session::new("pinned".into(), None, SessionOptions::default())).unwrap();
-        assert!(!Arc::ptr_eq(&pinned, &replacement));
-        assert!(Arc::ptr_eq(&pool.get_session_by_id("pinned").unwrap(), &replacement));
-        assert_eq!(pool.retired_count(), 0, "the retired session is gone");
+        let again = Session::new("pinned".into(), None, SessionOptions::default());
+        assert!(matches!(pool.add_session(again), Err(SessionPoolError::AlreadyExists(_))));
+    }
+
+    /// A full pool makes room by dropping its retired sessions first (`removeRetiredSessions`).
+    #[test]
+    fn add_session_to_a_full_pool_removes_retired_sessions() {
+        let pool = SessionPool::new(SessionPoolOptions { max_pool_size: 2, ..Default::default() }, None);
+        pool.get_session().retire();
+        let kept = pool.get_session();
+        pool.add_session(Session::new("added".into(), None, SessionOptions::default())).unwrap();
+        assert_eq!(pool.retired_count(), 0);
+        assert_eq!(pool.usable_count(), 2);
+        assert!(pool.get_session_by_id(kept.id()).is_some());
+    }
+
+    #[test]
+    fn retire_is_idempotent_and_adds_the_max_error_score() {
+        let session = Session::new("s".into(), None, SessionOptions::default());
+        session.mark_bad();
+        session.retire();
+        assert_eq!((session.error_score(), session.usage_count()), (4.0, 2));
+        session.retire();
+        assert_eq!((session.error_score(), session.usage_count()), (4.0, 2), "a second retire does nothing");
+    }
+
+    #[test]
+    fn marking_retires_a_session_that_is_no_longer_usable() {
+        let blocked = Session::new("b".into(), None, SessionOptions::default());
+        for _ in 0..3 {
+            blocked.mark_bad();
+        }
+        assert!(blocked.is_retired());
+        assert_eq!((blocked.error_score(), blocked.usage_count()), (6.0, 4));
+
+        let used_up =
+            Session::new("u".into(), None, SessionOptions { max_usage_count: 1, ..SessionOptions::default() });
+        used_up.mark_good();
+        assert!(used_up.is_retired());
+
+        // The decrement applies whenever the score is positive, without a floor at 0 (session.ts).
+        let record = Session::new("d".into(), None, SessionOptions::default()).to_state();
+        let mut record = record;
+        record["errorScore"] = json!(0.2);
+        let healed = Session::from_state(&record, &SessionOptions::default()).unwrap();
+        healed.mark_good();
+        assert!((healed.error_score() - -0.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn round_robin_cycles_through_the_full_pool_in_order() {
+        let pool = SessionPool::new(
+            SessionPoolOptions {
+                max_pool_size: 3,
+                session_reuse_strategy: SessionReuseStrategy::RoundRobin,
+                ..Default::default()
+            },
+            None,
+        );
+        let created: Vec<String> = (0..3).map(|_| pool.get_session().id().to_owned()).collect();
+        let reused: Vec<String> = (0..6).map(|_| pool.get_session().id().to_owned()).collect();
+        assert_eq!(reused, [created.clone(), created].concat());
+    }
+
+    #[test]
+    fn use_until_failure_keeps_one_session_until_it_is_retired() {
+        let pool = SessionPool::new(
+            SessionPoolOptions { session_reuse_strategy: SessionReuseStrategy::UseUntilFailure, ..Default::default() },
+            None,
+        );
+        let first = pool.get_session();
+        for _ in 0..5 {
+            assert!(Arc::ptr_eq(&pool.get_session(), &first));
+        }
+        first.retire();
+        let second = pool.get_session();
+        assert_ne!(second.id(), first.id());
+        assert!(Arc::ptr_eq(&pool.get_session(), &second));
+    }
+
+    #[test]
+    fn sessions_get_a_default_fingerprint_that_is_saved() {
+        let pool = SessionPool::with_id("0", SessionPoolOptions::default(), None);
+        let session = pool.get_session();
+        let fingerprint = *session.fingerprint().expect("the pool gives every session a fingerprint");
+        assert!(PROFILES.contains(&fingerprint));
+
+        let restored = SessionPool::with_id("0", SessionPoolOptions::default(), None);
+        restored.restore(pool.to_record()).unwrap();
+        assert_eq!(restored.get_session_by_id(session.id()).unwrap().fingerprint(), Some(&fingerprint));
+
+        // A pool-wide fingerprint replaces the random default.
+        let fixed = SessionFingerprint { browser: Some(Browser::Firefox), ..Default::default() };
+        let pool = SessionPool::new(
+            SessionPoolOptions {
+                session_options: SessionOptions { fingerprint: Some(fixed), ..Default::default() },
+                ..Default::default()
+            },
+            None,
+        );
+        assert_eq!(pool.get_session().fingerprint(), Some(&fixed));
+        assert!(Session::new("plain".into(), None, SessionOptions::default()).to_state().get("fingerprint").is_none());
+    }
+
+    #[test]
+    fn create_session_function_makes_the_sessions() {
+        let pool = SessionPool::new(
+            SessionPoolOptions {
+                create_session_function: Some(Arc::new(|options: CreateSessionOptions| {
+                    let session =
+                        Session::new(format!("custom_{}", options.id), options.proxy_info, options.session_options);
+                    session.user_data().insert("custom".into(), json!(true));
+                    session
+                })),
+                ..Default::default()
+            },
+            None,
+        );
+        let session = pool.get_session();
+        assert!(session.id().starts_with("custom_session_"));
+        assert_eq!(session.user_data()["custom"], true);
+        assert!(session.fingerprint().is_some(), "the options carry the default fingerprint");
     }
 
     #[test]
