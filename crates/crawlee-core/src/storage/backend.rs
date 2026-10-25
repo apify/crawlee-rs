@@ -18,6 +18,7 @@ use serde_json::value::RawValue;
 
 use crate::errors::StorageResult;
 use crate::request::Request;
+use crate::storage::dataset_buffer::FlushCounters;
 
 /// Identifies a storage. The default storage is run-scoped (emptied on start), as are aliased
 /// storages; named storages persist across runs.
@@ -131,6 +132,23 @@ pub trait DatasetBackend: Send + Sync {
     /// Appends items. Every item is a serialized JSON object.
     async fn push_data(&self, items: Vec<DatasetItem>) -> StorageResult<()>;
     async fn get_data(&self, options: DatasetListOptions) -> StorageResult<PaginatedList<DatasetItem>>;
+
+    /// Called by a buffered dataset (see [`dataset_buffer`](super::dataset_buffer)) when it takes
+    /// `items` into its buffer, in the task that pushes them. A backend that accounts for what it
+    /// stores (the Apify SDK's, which charges for items) may keep only some of them, the first
+    /// ones, and return counts that come back, summed over the pushes of the flush, in
+    /// [`push_buffered`](Self::push_buffered). By default, every item is kept and nothing counted.
+    fn admit_buffered(&self, items: &mut Vec<DatasetItem>) -> FlushCounters {
+        let _ = items;
+        FlushCounters::default()
+    }
+
+    /// Stores the items of a flush of a buffered dataset, which [`admit_buffered`](Self::admit_buffered)
+    /// admitted with `counters`. By default, [`push_data`](Self::push_data).
+    async fn push_buffered(&self, items: Vec<DatasetItem>, counters: FlushCounters) -> StorageResult<()> {
+        let _ = counters;
+        self.push_data(items).await
+    }
 }
 
 /// A key-value store record as the backend stores it: raw bytes plus a content type.

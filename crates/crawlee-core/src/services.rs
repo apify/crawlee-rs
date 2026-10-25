@@ -158,6 +158,27 @@ impl Services {
         }
     }
 
+    /// Stores the buffered items of every dataset opened so far (see
+    /// [`Configuration::dataset_buffer`]). Returns the first error, after trying them all.
+    pub async fn flush_datasets(&self) -> StorageResult<()> {
+        let mut datasets: Vec<Dataset> = Vec::new();
+        for storage in self.storages.instances.lock().entries.values() {
+            if let CachedStorage::Dataset(dataset) = storage
+                && dataset.buffer_options().is_some()
+                && !datasets.iter().any(|known| known.same_storage(dataset))
+            {
+                datasets.push(dataset.clone());
+            }
+        }
+        let mut result = Ok(());
+        for dataset in datasets {
+            if let Err(err) = dataset.flush().await {
+                result = result.and(Err(err));
+            }
+        }
+        result
+    }
+
     async fn open_storage(&self, kind: StorageKind, identifier: &StorageIdentifier) -> StorageResult<CachedStorage> {
         self.purge_on_start().await?;
         // The same logical storage opened through another backend is another instance.
@@ -185,7 +206,11 @@ impl Services {
             StorageKind::Dataset => {
                 let backend = self.storage.create_dataset_backend(identifier).await?;
                 let info = backend.get_metadata().await?;
-                (CachedStorage::Dataset(Dataset::from_backend(backend).with_cache_link(link)), (info.id, info.name))
+                let mut dataset = Dataset::from_backend(backend).with_cache_link(link);
+                if let Some(options) = &self.configuration.dataset_buffer {
+                    dataset = dataset.with_buffer(options.clone(), Some(&self.events));
+                }
+                (CachedStorage::Dataset(dataset), (info.id, info.name))
             }
             StorageKind::KeyValueStore => {
                 let backend = self.storage.create_key_value_store_backend(identifier).await?;
@@ -368,6 +393,34 @@ mod tests {
         assert_eq!(backend.opened.load(Ordering::SeqCst), 4);
         assert!(again.add_request("https://example.com", false).await.unwrap().was_already_present);
         assert!(again.is_finished().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn datasets_are_buffered_when_configured() {
+        use crate::storage::dataset_buffer::{BufferStage, DatasetBufferOptions};
+
+        let (services, _) = counting();
+        let dataset = services.open_dataset(&StorageIdentifier::Default).await.unwrap();
+        assert!(dataset.buffer_options().is_none(), "off by default");
+
+        let backend = Arc::new(MemoryStorageBackend::new());
+        let options =
+            DatasetBufferOptions::new().with_stages([BufferStage::new(0, std::time::Duration::from_secs(3600))]);
+        let configuration = Configuration { dataset_buffer: Some(options.clone()), ..Configuration::default() };
+        let services = Services::with_configuration(configuration, backend.clone());
+        let dataset = services.open_dataset(&StorageIdentifier::Default).await.unwrap();
+        let named = services.open_dataset(&StorageIdentifier::name("other")).await.unwrap();
+        assert_eq!(dataset.buffer_options(), Some(&options));
+        dataset.push_data(&serde_json::json!({ "a": 1 })).await.unwrap();
+        named.push_data(&serde_json::json!({ "b": 1 })).await.unwrap();
+        // Another handle of the storage is not buffered and does not see the buffered item.
+        let unbuffered = Dataset::open(backend.as_ref(), &StorageIdentifier::Default).await.unwrap();
+        assert_eq!(unbuffered.get_info().await.unwrap().item_count, 0);
+
+        services.flush_datasets().await.unwrap();
+        assert_eq!(unbuffered.get_info().await.unwrap().item_count, 1);
+        let named_unbuffered = Dataset::open(backend.as_ref(), &StorageIdentifier::name("other")).await.unwrap();
+        assert_eq!(named_unbuffered.get_info().await.unwrap().item_count, 1);
     }
 
     #[tokio::test]

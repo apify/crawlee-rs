@@ -12,7 +12,9 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use super::backend::{DatasetBackend, DatasetInfo, DatasetItem, DatasetListOptions, StorageBackend, StorageIdentifier};
+use super::dataset_buffer::{DatasetBuffer, DatasetBufferOptions};
 use crate::errors::{StorageError, StorageResult};
+use crate::events::EventManager;
 use crate::services::CacheLink;
 use crate::storage::key_value_store::KeyValueStore;
 
@@ -25,6 +27,8 @@ pub struct Dataset {
     backend: Arc<dyn DatasetBackend>,
     cache_link: CacheLink,
     counters: Arc<DatasetCounters>,
+    /// Set for buffered writes (see [`with_buffer`](Self::with_buffer)).
+    buffer: Option<Arc<DatasetBuffer>>,
 }
 
 /// The operations a dataset handle (and its clones) issued to the backend, counted per backend
@@ -38,9 +42,9 @@ pub struct DatasetStats {
 }
 
 #[derive(Default)]
-struct DatasetCounters {
+pub(crate) struct DatasetCounters {
     read: AtomicU64,
-    write: AtomicU64,
+    pub(crate) write: AtomicU64,
 }
 
 impl std::fmt::Debug for Dataset {
@@ -66,7 +70,32 @@ impl Dataset {
     }
 
     pub fn from_backend(backend: Arc<dyn DatasetBackend>) -> Self {
-        Dataset { backend, cache_link: CacheLink::default(), counters: Arc::default() }
+        Dataset { backend, cache_link: CacheLink::default(), counters: Arc::default(), buffer: None }
+    }
+
+    /// This handle (and its clones) with buffered writes, an extra of crawlee-rs (see
+    /// [`dataset_buffer`](super::dataset_buffer)): pushes are collected and stored together, as
+    /// `options` says. With `events`, the buffer is also flushed on their `PersistState`,
+    /// `Migrating`, `Aborting` and `Exit` events. Other handles of the same storage are not
+    /// buffered. [`Services`](crate::Services) buffers the datasets it opens when
+    /// [`Configuration::dataset_buffer`](crate::Configuration::dataset_buffer) is set.
+    pub fn with_buffer(mut self, options: DatasetBufferOptions, events: Option<&EventManager>) -> Self {
+        self.buffer = Some(DatasetBuffer::new(self.backend.clone(), options, self.counters.clone(), events));
+        self
+    }
+
+    /// The settings of the buffered writes of this handle, if they are buffered.
+    pub fn buffer_options(&self) -> Option<&DatasetBufferOptions> {
+        self.buffer.as_ref().map(|buffer| buffer.options())
+    }
+
+    /// Stores the items buffered so far (see [`with_buffer`](Self::with_buffer)). Does nothing
+    /// for a dataset that is not buffered.
+    pub async fn flush(&self) -> StorageResult<()> {
+        match &self.buffer {
+            Some(buffer) => buffer.flush().await,
+            None => Ok(()),
+        }
     }
 
     pub(crate) fn with_cache_link(mut self, link: CacheLink) -> Self {
@@ -95,13 +124,19 @@ impl Dataset {
         self.push_items(serialize_items(data)?).await
     }
 
-    /// Appends already-serialized items.
+    /// Appends already-serialized items. A buffered dataset (see [`with_buffer`](Self::with_buffer))
+    /// may return before they are stored.
     pub async fn push_items(&self, items: Vec<DatasetItem>) -> StorageResult<()> {
+        if let Some(buffer) = &self.buffer {
+            return buffer.push(items).await;
+        }
         self.counters.write.fetch_add(1, Ordering::Relaxed);
         self.backend.push_data(items).await
     }
 
+    /// Reads a page. A buffered dataset stores its buffered items first.
     pub async fn get_data<T: DeserializeOwned>(&self, options: DatasetListOptions) -> StorageResult<DatasetPage<T>> {
+        self.flush().await?;
         self.counters.read.fetch_add(1, Ordering::Relaxed);
         let page = self.backend.get_data(options).await?;
         let items = page.items.iter().map(|item| serde_json::from_str(item.get())).collect::<Result<Vec<T>, _>>()?;
@@ -262,14 +297,19 @@ impl Dataset {
 
     /// Removes every item, keeping the dataset.
     pub async fn purge(&self) -> StorageResult<()> {
+        // Buffered items are stored first, so that a purge removes them as it would unbuffered.
+        self.flush().await?;
         self.backend.purge().await
     }
 
     pub async fn get_info(&self) -> StorageResult<DatasetInfo> {
+        self.flush().await?;
         self.backend.get_metadata().await
     }
 
     pub async fn drop_storage(self) -> StorageResult<()> {
+        // Settles the buffered pushes, which requests may wait for.
+        let _ = self.flush().await;
         self.backend.drop_storage().await?;
         self.cache_link.evict(Arc::as_ptr(&self.backend) as *const ());
         Ok(())

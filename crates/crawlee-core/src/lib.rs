@@ -22,6 +22,7 @@ pub use crate::request::{Request, RequestBuilder};
 pub use crate::services::Services;
 pub use crate::storage::backend::{StorageBackend, StorageIdentifier};
 pub use crate::storage::dataset::{Dataset, DatasetExportOptions, DatasetStats};
+pub use crate::storage::dataset_buffer::{BufferStage, DatasetBufferOptions, PendingWrites};
 #[cfg(feature = "fs-storage")]
 pub use crate::storage::file_system::FileSystemStorageBackend;
 pub use crate::storage::key_value_store::{KeyValueStore, KeyValueStoreStats, RecordValue};

@@ -41,8 +41,8 @@ pub use crawlee_core::errors::{
     CriticalError, NonRetryableError, RequestThrottledError, RetryRequestError, SessionError,
 };
 pub use crawlee_core::{
-    Configuration, Dataset, EnqueueStrategy, KeyValueStore, Request, RequestManager, RequestQueue, Services,
-    StorageIdentifier,
+    BufferStage, Configuration, Dataset, DatasetBufferOptions, EnqueueStrategy, KeyValueStore, Request, RequestManager,
+    RequestQueue, Services, StorageIdentifier,
 };
 pub use crawlee_http::{Document, HtmlContext, HtmlCrawler, HttpContext, HttpCrawler, HttpCrawlerOptions};
 

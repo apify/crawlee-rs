@@ -8,6 +8,8 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
+use crate::storage::dataset_buffer::DatasetBufferOptions;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Configuration {
     /// `CRAWLEE_STORAGE_DIR`, default `./storage`.
@@ -33,6 +35,16 @@ pub struct Configuration {
     /// (`internalTimeoutMillis`). When unset, crawlers use twice their request handler timeout,
     /// but at least 5 minutes.
     pub internal_timeout: Option<Duration>,
+    /// Buffered dataset writes, an extra of crawlee-rs: `None` (the default) pushes every item
+    /// right away, as Crawlee for JS does. Datasets opened through [`Services`](crate::Services)
+    /// collect pushes and store them together, as the options say (see
+    /// [`dataset_buffer`](crate::storage::dataset_buffer)).
+    ///
+    /// `CRAWLEE_DATASET_BUFFER` (`1`/`true` enables, `0`/`false` disables) turns it on with the
+    /// defaults, which `CRAWLEE_DATASET_BUFFER_STAGES` (`FROM_ITEM:LINGER,...`, such as
+    /// `10:1s,100:2s`) and `CRAWLEE_DATASET_BUFFER_MAX_BYTES` change; in `crawlee.json`,
+    /// `datasetBuffer`, `datasetBufferStages` and `datasetBufferMaxBytes`.
+    pub dataset_buffer: Option<DatasetBufferOptions>,
 }
 
 impl Default for Configuration {
@@ -48,6 +60,7 @@ impl Default for Configuration {
             max_used_cpu_ratio: 0.95,
             containerized: None,
             internal_timeout: None,
+            dataset_buffer: None,
         }
     }
 }
@@ -66,6 +79,9 @@ struct FileConfiguration {
     max_used_cpu_ratio: Option<f64>,
     containerized: Option<bool>,
     internal_timeout_millis: Option<u64>,
+    dataset_buffer: Option<bool>,
+    dataset_buffer_stages: Option<String>,
+    dataset_buffer_max_bytes: Option<usize>,
 }
 
 /// `'0'` and `'false'` (any case) are false; any other non-empty value is true, as in JS.
@@ -84,6 +100,10 @@ impl Configuration {
     /// them in `env`.
     pub fn from_sources(env: impl Fn(&str) -> Option<String>, file: Option<String>) -> Self {
         let mut config = Configuration::default();
+        // The settings of buffered dataset writes, applied once it is known whether they are on.
+        let mut buffer_enabled = None;
+        let mut buffer_stages = None;
+        let mut buffer_max_bytes = None;
 
         if let Some(file) = file.and_then(|text| serde_json::from_str::<FileConfiguration>(&text).ok()) {
             if let Some(v) = file.storage_dir {
@@ -112,6 +132,9 @@ impl Configuration {
             if let Some(v) = file.internal_timeout_millis {
                 config.internal_timeout = Some(Duration::from_millis(v));
             }
+            buffer_enabled = file.dataset_buffer;
+            buffer_stages = file.dataset_buffer_stages;
+            buffer_max_bytes = file.dataset_buffer_max_bytes;
         }
 
         // Empty environment variables count as unset.
@@ -141,6 +164,25 @@ impl Configuration {
         if let Some(v) = var("CRAWLEE_INTERNAL_TIMEOUT").and_then(|v| v.trim().parse().ok()) {
             config.internal_timeout = Some(Duration::from_millis(v));
         }
+        if let Some(v) = var("CRAWLEE_DATASET_BUFFER") {
+            buffer_enabled = Some(parse_bool(&v));
+        }
+        buffer_stages = var("CRAWLEE_DATASET_BUFFER_STAGES").or(buffer_stages);
+        if let Some(v) = var("CRAWLEE_DATASET_BUFFER_MAX_BYTES").and_then(|v| v.trim().parse().ok()) {
+            buffer_max_bytes = Some(v);
+        }
+        if buffer_enabled == Some(true) {
+            let mut options = DatasetBufferOptions::default();
+            match buffer_stages.as_deref().map(DatasetBufferOptions::parse_stages) {
+                Some(Ok(stages)) => options = options.with_stages(stages),
+                Some(Err(err)) => tracing::warn!("{err}; the default stages are used"),
+                None => {}
+            }
+            if let Some(max_bytes) = buffer_max_bytes {
+                options = options.with_max_bytes(max_bytes);
+            }
+            config.dataset_buffer = Some(options);
+        }
         config
     }
 }
@@ -165,6 +207,54 @@ mod tests {
         assert_eq!(config.memory_mbytes, Some(512), "empty env var is ignored");
         assert_eq!(config.available_memory_ratio, 0.25);
         assert_eq!(config.internal_timeout, None);
+        assert_eq!(config.dataset_buffer, None, "buffered dataset writes are off by default");
+    }
+
+    #[test]
+    fn dataset_buffer_from_the_environment_and_crawlee_json() {
+        use crate::storage::dataset_buffer::BufferStage;
+
+        let env = |vars: &'static [(&'static str, &'static str)]| {
+            move |name: &str| vars.iter().find(|(n, _)| *n == name).map(|(_, v)| (*v).to_owned())
+        };
+        let config = Configuration::from_sources(env(&[("CRAWLEE_DATASET_BUFFER", "1")]), None);
+        assert_eq!(config.dataset_buffer, Some(DatasetBufferOptions::default()));
+
+        let config = Configuration::from_sources(
+            env(&[
+                ("CRAWLEE_DATASET_BUFFER", "true"),
+                ("CRAWLEE_DATASET_BUFFER_STAGES", "20:500ms,200:3s,1000:5"),
+                ("CRAWLEE_DATASET_BUFFER_MAX_BYTES", "2000000"),
+            ]),
+            None,
+        );
+        let options = config.dataset_buffer.unwrap();
+        assert_eq!(
+            options.stages,
+            [
+                BufferStage::new(20, Duration::from_millis(500)),
+                BufferStage::new(200, Duration::from_secs(3)),
+                BufferStage::new(1000, Duration::from_secs(5)),
+            ]
+        );
+        assert_eq!(options.max_bytes, 2_000_000);
+
+        // Tuning alone does not turn it on, and an invalid list keeps the default stages.
+        let config = Configuration::from_sources(env(&[("CRAWLEE_DATASET_BUFFER_STAGES", "1:1s")]), None);
+        assert_eq!(config.dataset_buffer, None);
+        let config = Configuration::from_sources(
+            env(&[("CRAWLEE_DATASET_BUFFER", "1"), ("CRAWLEE_DATASET_BUFFER_STAGES", "soon")]),
+            None,
+        );
+        assert_eq!(config.dataset_buffer, Some(DatasetBufferOptions::default()));
+
+        let file = r#"{ "datasetBuffer": true, "datasetBufferStages": "5:2s", "datasetBufferMaxBytes": 1000 }"#;
+        let config = Configuration::from_sources(|_| None, Some(file.to_owned()));
+        let options = config.dataset_buffer.unwrap();
+        assert_eq!((options.stages, options.max_bytes), (vec![BufferStage::new(5, Duration::from_secs(2))], 1000));
+        // The environment wins over the file.
+        let config = Configuration::from_sources(env(&[("CRAWLEE_DATASET_BUFFER", "0")]), Some(file.to_owned()));
+        assert_eq!(config.dataset_buffer, None);
     }
 
     #[test]

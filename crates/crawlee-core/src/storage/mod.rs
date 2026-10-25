@@ -3,6 +3,7 @@
 pub mod backend;
 pub mod batched_adds;
 pub mod dataset;
+pub mod dataset_buffer;
 #[cfg(feature = "fs-storage")]
 pub mod file_system;
 pub mod key_value_store;
