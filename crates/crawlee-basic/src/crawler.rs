@@ -11,6 +11,7 @@ use tokio::task::JoinSet;
 use tracing::Instrument as _;
 
 use crawlee_core::storage::batched_adds::AddRequestsBatchedResult;
+use crawlee_core::storage::dataset_buffer::PendingWrites;
 use crawlee_core::{
     CriticalError, Dataset, Event, EventKind, KeyValueStore, PacingScope, PacingSignal, RecoverableState, Request,
     RequestLoader, RequestManager, RequestManagerTandem, RequestSourceStatus, SerdeState, Services, StatusLevel,
@@ -643,7 +644,10 @@ where
                 // (`applyRequestManagerTimeouts`).
                 let handler_timeout =
                     inner.options.request_handler_timeout.max(inner.handler.max_timeout().unwrap_or_default());
-                let lock_time = (handler_timeout + Duration::from_secs(5)).max(Duration::from_secs(60));
+                // With buffered dataset writes, a request is marked as handled only once its items
+                // are stored, up to the longest linger later.
+                let linger = dataset.buffer_options().map(|options| options.max_linger()).unwrap_or_default();
+                let lock_time = (handler_timeout + Duration::from_secs(5)).max(Duration::from_secs(60)) + linger;
                 request_manager.set_expected_request_processing_time(lock_time).await?;
                 Ok::<_, anyhow::Error>(Arc::new(CrawlerShared {
                     services: inner.services.clone(),
@@ -666,6 +670,8 @@ where
                     resumed: Notify::new(),
                     in_flight: AtomicUsize::new(0),
                     drained: Notify::new(),
+                    awaiting_flush: AtomicUsize::new(0),
+                    slot_freed: Notify::new(),
                     robots: inner.options.respect_robots_txt.clone().map(|user_agent| {
                         RobotsCache::new(user_agent)
                             .with_sessions(inner.session_pool.clone(), inner.options.use_session_pool)
@@ -1100,6 +1106,11 @@ where
             );
         }
 
+        // Buffered dataset items pushed outside of requests (or by an aborted run) are stored now.
+        if let Err(err) = inner.services.flush_datasets().await {
+            tracing::warn!("Failed to store the buffered dataset items: {err}");
+            result = result.and(Err(err.into()));
+        }
         if let Err(err) = inner.services.storage.teardown().await {
             tracing::warn!("Failed to tear down the storage: {err}");
             result = result.and(Err(err.into()));
@@ -1159,9 +1170,8 @@ where
                     let slot = ConcurrencySlot(concurrency.clone());
                     let in_flight = InFlight::new(shared.clone());
                     tasks.spawn(async move {
-                        let _slot = slot;
                         let _in_flight = in_flight;
-                        crawler.run_task(shared).await
+                        crawler.run_task(shared, slot).await
                     });
                     // Try the next one right away, to build up concurrency.
                     continue;
@@ -1170,9 +1180,16 @@ where
                 if !ready && tasks.is_empty() && self.is_finished(shared, run).await? {
                     return Ok(());
                 }
+                // Nothing to start, and every running request only waits for its buffered dataset
+                // items: they are stored now rather than after their linger.
+                if !ready && !tasks.is_empty() && shared.awaiting_flush.load(Ordering::Acquire) >= tasks.len() {
+                    // A failure reaches the requests waiting for the items.
+                    let _ = shared.services.flush_datasets().await;
+                }
             }
 
             let added = shared.requests_added.notified();
+            let slot_freed = shared.slot_freed.notified();
             let resumed = shared.resumed.notified();
             let nudged = run.nudge.notified();
             let wake = async {
@@ -1184,6 +1201,7 @@ where
             tokio::select! {
                 Some(joined) = tasks.join_next(), if !tasks.is_empty() => Self::check_task(joined, &mut tasks)?,
                 () = added => {}
+                () = slot_freed => {}
                 () = resumed => {}
                 () = nudged => {}
                 () = wake => wake_at = None,
@@ -1281,8 +1299,9 @@ where
         Ok(finished)
     }
 
-    /// One task: fetches a request and processes it (`runTaskFunction`).
-    async fn run_task(&self, shared: Arc<CrawlerShared>) -> anyhow::Result<()> {
+    /// One task: fetches a request and processes it (`runTaskFunction`). The task holds `slot`
+    /// of the concurrency until the request is processed, or only waits for its dataset items.
+    async fn run_task(&self, shared: Arc<CrawlerShared>, slot: ConcurrencySlot) -> anyhow::Result<()> {
         let internal_timeout = self.internal_timeout();
         let manager = shared.request_manager.clone();
         let fetched = timeout_and_retry(
@@ -1295,7 +1314,7 @@ where
         // An old one must not be carried over to a retry.
         request.loaded_url = None;
         let span = tracing::info_span!("request", url = %request.url);
-        self.process_request(shared, request).instrument(span).await
+        self.process_request(shared, request, slot).instrument(span).await
     }
 
     /// The timeout of the crawler's own operations: storage calls, error handling, and the
@@ -1351,7 +1370,12 @@ where
     }
 
     /// Processes one request. Returns `Err` only for errors that must stop the crawl.
-    async fn process_request(&self, shared: Arc<CrawlerShared>, request: Request) -> anyhow::Result<()> {
+    async fn process_request(
+        &self,
+        shared: Arc<CrawlerShared>,
+        request: Request,
+        slot: ConcurrencySlot,
+    ) -> anyhow::Result<()> {
         let started = Instant::now();
         let internal_timeout = self.internal_timeout();
 
@@ -1394,12 +1418,14 @@ where
         let phases = self.inner.pipeline.navigation_timeout() + self.handler_timeout(request.label());
         let request_timeout = internal_timeout.max(phases);
         let request_id = request.id.clone().unwrap_or_default();
+        // Pushes to buffered datasets made in this task, through the context or not.
+        let writes = PendingWrites::new();
         let attempt = async {
             self.run_pipeline_and_handler(BasicContext::new(request, scope.clone())).await?;
             // Committed before the request is marked as handled, so that a failed commit fails it.
             Ok::<_, anyhow::Error>(scope.transaction.commit().await?)
         };
-        let mut result = match scope.timeouts.window(request_timeout).run(attempt).await {
+        let mut result = match scope.timeouts.window(request_timeout).run(writes.scope(attempt)).await {
             Some(result) => result,
             None => Err(anyhow::anyhow!(
                 "Request timed out after {} seconds ({request_id}).",
@@ -1410,6 +1436,16 @@ where
             scope.transaction.rollback();
         }
         let mut request = scope.take_returned().unwrap_or(snapshot);
+        // How long the request took, without the wait for its dataset items.
+        let mut duration = started.elapsed();
+
+        if result.is_ok()
+            && !writes.is_empty()
+            && let Err(err) = self.wait_for_writes(&shared, &request, &writes, slot).await
+        {
+            result = Err(err);
+            duration = started.elapsed();
+        }
 
         if result.is_ok() {
             let manager = shared.request_manager.clone();
@@ -1439,10 +1475,38 @@ where
         match result {
             Ok(()) => {
                 session.mark_good();
-                shared.statistics.record_success(started.elapsed(), request.retry_count);
+                shared.statistics.record_success(duration, request.retry_count);
                 Ok(())
             }
             Err(err) => self.handle_request_failure(&shared, Some(&session), request, err, started).await,
+        }
+    }
+
+    /// Waits until the items a request pushed to buffered datasets are stored, so that it is
+    /// marked as handled only then. Meanwhile, the request frees its concurrency slot. `Err` when
+    /// they could not be stored: the request then fails, and is retried.
+    async fn wait_for_writes(
+        &self,
+        shared: &Arc<CrawlerShared>,
+        request: &Request,
+        writes: &PendingWrites,
+        slot: ConcurrencySlot,
+    ) -> anyhow::Result<()> {
+        if let Some(settled) = writes.settled() {
+            return Ok(settled?);
+        }
+        drop(slot);
+        shared.slot_freed.notify_one();
+        let _awaiting = AwaitingFlush::new(shared);
+        let timeout = self.internal_timeout();
+        match tokio::time::timeout(timeout, writes.wait()).await {
+            Ok(stored) => Ok(stored?),
+            Err(_) => Err(anyhow::anyhow!(
+                "Storing the dataset items of request {} ({}) timed out after {} seconds.",
+                request.url,
+                request.id.as_deref().unwrap_or_default(),
+                timeout.as_secs_f64()
+            )),
         }
     }
 
@@ -1900,6 +1964,24 @@ fn panic_error(panic: Box<dyn std::any::Any + Send>) -> anyhow::Error {
 
 /// A running task as counted by the concurrency system; the end is registered on drop, so a
 /// panicking or aborted task frees its slot too.
+/// Counts a request among those waiting for their dataset items while alive.
+struct AwaitingFlush<'a>(&'a CrawlerShared);
+
+impl<'a> AwaitingFlush<'a> {
+    fn new(shared: &'a CrawlerShared) -> Self {
+        shared.awaiting_flush.fetch_add(1, Ordering::AcqRel);
+        // The task loop may now see every running request waiting, and flush.
+        shared.slot_freed.notify_one();
+        AwaitingFlush(shared)
+    }
+}
+
+impl Drop for AwaitingFlush<'_> {
+    fn drop(&mut self) {
+        self.0.awaiting_flush.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
 struct ConcurrencySlot(Arc<ConcurrencySystem>);
 
 impl Drop for ConcurrencySlot {

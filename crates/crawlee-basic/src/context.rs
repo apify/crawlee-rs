@@ -52,6 +52,11 @@ pub struct CrawlerShared {
     pub(crate) in_flight: AtomicUsize,
     /// Woken when `in_flight` drops to zero.
     pub(crate) drained: Notify,
+    /// Requests that were handled and wait for their buffered dataset items to be stored before
+    /// they are marked as handled (see `crawlee_core::storage::dataset_buffer`).
+    pub(crate) awaiting_flush: AtomicUsize,
+    /// Woken when a request frees its concurrency slot before its task ends.
+    pub(crate) slot_freed: Notify,
     /// robots.txt files, when the crawler respects them.
     pub(crate) robots: Option<RobotsCache>,
     /// Domains already warned about (unpaced 429s and crawl delays), and messages logged once.
