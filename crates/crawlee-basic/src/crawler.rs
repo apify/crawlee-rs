@@ -1107,8 +1107,8 @@ where
         }
 
         // Buffered dataset items pushed outside of requests (or by an aborted run) are stored now.
-        if let Err(err) = inner.services.flush_datasets().await {
-            tracing::warn!("Failed to store the buffered dataset items: {err}");
+        if let Err(err) = inner.services.flush_datasets_with_retries(3).await {
+            tracing::error!("Failed to store the buffered dataset items: {err}");
             result = result.and(Err(err.into()));
         }
         if let Err(err) = inner.services.storage.teardown().await {
@@ -1453,15 +1453,14 @@ where
             scope.transaction.rollback();
         }
         let mut request = scope.take_returned().unwrap_or(snapshot);
-        // How long the request took, without the wait for its dataset items.
-        let mut duration = started.elapsed();
-
-        if result.is_ok()
-            && !writes.is_empty()
-            && let Err(err) = self.wait_for_writes(&shared, &request, &writes, slot).await
-        {
-            result = Err(err);
-            duration = started.elapsed();
+        // The wait for the request's buffered dataset items, which its duration leaves out.
+        let mut waited = Duration::ZERO;
+        if result.is_ok() && !writes.is_empty() {
+            let waiting = Instant::now();
+            if let Err(err) = self.wait_for_writes(&shared, &request, &writes, slot).await {
+                result = Err(err);
+            }
+            waited = waiting.elapsed();
         }
 
         if result.is_ok() {
@@ -1492,7 +1491,7 @@ where
         match result {
             Ok(()) => {
                 session.mark_good();
-                shared.statistics.record_success(duration, request.retry_count);
+                shared.statistics.record_success(started.elapsed().saturating_sub(waited), request.retry_count);
                 Ok(())
             }
             Err(err) => self.handle_request_failure(&shared, Some(&session), request, err, started).await,
@@ -1516,15 +1515,23 @@ where
         shared.slot_freed.notify_one();
         let _awaiting = AwaitingFlush::new(shared);
         let timeout = self.internal_timeout();
-        match tokio::time::timeout(timeout, writes.wait()).await {
-            Ok(stored) => Ok(stored?),
-            Err(_) => Err(anyhow::anyhow!(
-                "Storing the dataset items of request {} ({}) timed out after {} seconds.",
-                request.url,
-                request.id.as_deref().unwrap_or_default(),
-                timeout.as_secs_f64()
-            )),
+        if let Ok(stored) = tokio::time::timeout(timeout, writes.wait()).await {
+            return Ok(stored?);
         }
+        // The items still waiting in a buffer are taken out of it, so that the retry does not
+        // store them twice. Items a flush is storing right now are waited for: the request is
+        // retried only once they can no longer be stored.
+        let withdrawn = writes.withdraw();
+        let stored = writes.wait().await;
+        if withdrawn == 0 {
+            return Ok(stored?);
+        }
+        Err(anyhow::anyhow!(
+            "Storing the dataset items of request {} ({}) timed out after {} seconds.",
+            request.url,
+            request.id.as_deref().unwrap_or_default(),
+            timeout.as_secs_f64()
+        ))
     }
 
     /// The request handler timeout of a request: its route's, or the crawler's.
@@ -1789,14 +1796,16 @@ where
         error: Arc<anyhow::Error>,
     ) -> anyhow::Result<()> {
         let scope = RequestScope::new(shared.clone(), session.cloned());
-        let outcome = AssertUnwindSafe(handler.handle(BasicContext::new(request.clone(), scope.clone()), error))
-            .catch_unwind()
-            .await;
+        // The request is marked as handled (or retried) whatever becomes of the handler's pushes,
+        // so they are stored before they return, and fail when they cannot be, as unbuffered.
+        let writes = PendingWrites::immediate();
+        let handled = AssertUnwindSafe(handler.handle(BasicContext::new(request.clone(), scope.clone()), error));
+        let outcome = writes.scope(handled.catch_unwind()).await;
         if let Some(returned) = scope.take_returned() {
             *request = returned;
         }
         match outcome {
-            Ok(Ok(())) => Ok(scope.transaction.commit().await?),
+            Ok(Ok(())) => Ok(writes.scope(scope.transaction.commit()).await?),
             Ok(Err(err)) => {
                 scope.transaction.rollback();
                 Err(err)

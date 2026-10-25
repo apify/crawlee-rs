@@ -113,6 +113,8 @@ struct LoggingManager {
     lock_times: Mutex<Vec<Duration>>,
     pace: Option<Duration>,
     next_at: Mutex<Option<Instant>>,
+    /// How long marking a request as handled takes.
+    mark_delay: Mutex<Duration>,
 }
 
 impl LoggingManager {
@@ -143,6 +145,8 @@ impl RequestManager for LoggingManager {
         }
     }
     async fn mark_request_as_handled(&self, request: &mut Request) -> StorageResult<Option<QueueOperationInfo>> {
+        let delay = *self.mark_delay.lock();
+        tokio::time::sleep(delay).await;
         self.log.push(format!("marked {}", request.url));
         self.queue.mark_request_as_handled(request).await
     }
@@ -177,6 +181,10 @@ async fn setup(buffer: Option<DatasetBufferOptions>) -> Setup {
 }
 
 async fn setup_paced(buffer: Option<DatasetBufferOptions>, pace: Option<Duration>) -> Setup {
+    setup_with(Configuration { dataset_buffer: buffer, ..Configuration::default() }, pace).await
+}
+
+async fn setup_with(configuration: Configuration, pace: Option<Duration>) -> Setup {
     let log = Log::default();
     let failing_pushes = Arc::new(AtomicUsize::new(0));
     let storage = Arc::new(LoggingStorage {
@@ -184,7 +192,6 @@ async fn setup_paced(buffer: Option<DatasetBufferOptions>, pace: Option<Duration
         log: log.clone(),
         failing_pushes: failing_pushes.clone(),
     });
-    let configuration = Configuration { dataset_buffer: buffer, ..Configuration::default() };
     let services = Services::with_configuration(configuration, storage);
     let queue = services.open_request_queue(&StorageIdentifier::Default).await.unwrap();
     let manager = Arc::new(LoggingManager {
@@ -193,6 +200,7 @@ async fn setup_paced(buffer: Option<DatasetBufferOptions>, pace: Option<Duration
         lock_times: Mutex::default(),
         pace,
         next_at: Mutex::default(),
+        mark_delay: Mutex::default(),
     });
     Setup { services, manager, log, failing_pushes }
 }
@@ -389,4 +397,76 @@ async fn without_buffering_every_push_is_stored_at_once() {
         .unwrap();
     crawler.run(urls(3)).await.unwrap();
     assert_eq!(log.count("push of 1"), 6);
+}
+
+#[tokio::test]
+async fn pushes_of_a_failed_request_handler_are_stored_before_they_return() {
+    let Setup { services, manager, log, failing_pushes } = setup(Some(lingering(Duration::from_secs(3600)))).await;
+    let seen = Arc::new(Mutex::new(None));
+    let (handler_log, handler_seen) = (log.clone(), seen.clone());
+    let crawler = BasicCrawler::builder()
+        .services(services)
+        .request_manager(manager)
+        .max_request_retries(0)
+        .request_handler(|_ctx: BasicContext| async move { anyhow::bail!("failed") })
+        .failed_request_handler(move |ctx: BasicContext, _error: Arc<anyhow::Error>| {
+            let (log, seen, failing_pushes) = (handler_log.clone(), handler_seen.clone(), failing_pushes.clone());
+            async move {
+                let dataset = ctx.services().open_dataset(&StorageIdentifier::Default).await?;
+                let url = ctx.request().url.clone();
+                failing_pushes.store(1, Ordering::SeqCst);
+                // As without buffering: the push fails when the item cannot be stored, ...
+                let failed = dataset.push_data(&json!({ "url": url, "via": "failed" })).await.is_err();
+                dataset.push_data(&json!({ "url": url, "via": "handler" })).await?;
+                // ... and returns once it is stored.
+                *seen.lock() = Some((failed, log.count("stored handler ")));
+                Ok(())
+            }
+        })
+        .build()
+        .unwrap();
+    let stats = crawler.run(["https://a.dev/0"]).await.unwrap();
+    assert_eq!(stats.requests_failed, 1);
+    assert_eq!(*seen.lock(), Some((true, 1)));
+}
+
+#[tokio::test]
+async fn without_buffering_the_duration_of_a_request_includes_marking_it() {
+    let Setup { services, manager, .. } = setup(None).await;
+    *manager.mark_delay.lock() = Duration::from_millis(200);
+    let crawler = BasicCrawler::builder()
+        .services(services)
+        .request_manager(manager)
+        .request_handler(|_ctx: BasicContext| async move { Ok(()) })
+        .build()
+        .unwrap();
+    let stats = crawler.run(["https://a.dev/0"]).await.unwrap();
+    assert!(stats.request_avg_succeeded_duration_millis >= 200, "{}", stats.request_avg_succeeded_duration_millis);
+}
+
+#[tokio::test]
+async fn a_request_whose_items_wait_too_long_withdraws_them_before_it_fails() {
+    // The second request is handed out 600 ms after the first, so the first one's items keep
+    // waiting for their linger (1 h) until its wait times out (the internal timeout, 300 ms).
+    let configuration = Configuration {
+        dataset_buffer: Some(lingering(Duration::from_secs(3600))),
+        internal_timeout: Some(Duration::from_millis(300)),
+        ..Configuration::default()
+    };
+    let Setup { services, manager, log, .. } = setup_with(configuration, Some(Duration::from_millis(600))).await;
+    let events = services.events.clone();
+    let crawler = BasicCrawler::builder()
+        .services(services)
+        .request_manager(manager)
+        .max_request_retries(0)
+        .request_handler(|ctx: BasicContext| async move { push_both_ways(&ctx).await })
+        .build()
+        .unwrap();
+    start_events(&events).await;
+    let stats = crawler.run(urls(2)).await.unwrap();
+    assert_eq!((stats.requests_succeeded, stats.requests_failed), (1, 1));
+    // The failed request's items were taken out of the buffer: they are not stored after all.
+    assert_eq!(log.count("stored "), 2, "{:?}", log.entries());
+    assert_eq!(log.count("stored context https://a.dev/1"), 1);
+    events.close().await;
 }
