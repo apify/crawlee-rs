@@ -16,9 +16,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
 
-use crate::errors::StorageResult;
+use crate::errors::{StorageError, StorageResult};
 use crate::request::Request;
-use crate::storage::dataset_buffer::FlushCounters;
+use crate::storage::dataset_buffer::Accounting;
 
 /// Identifies a storage. The default storage is run-scoped (emptied on start), as are aliased
 /// storages; named storages persist across runs.
@@ -133,20 +133,33 @@ pub trait DatasetBackend: Send + Sync {
     async fn push_data(&self, items: Vec<DatasetItem>) -> StorageResult<()>;
     async fn get_data(&self, options: DatasetListOptions) -> StorageResult<PaginatedList<DatasetItem>>;
 
-    /// Called by a buffered dataset (see [`dataset_buffer`](super::dataset_buffer)) when it takes
-    /// `items` into its buffer, in the task that pushes them. A backend that accounts for what it
-    /// stores (the Apify SDK's, which charges for items) may keep only some of them, the first
-    /// ones, and return counts that come back, summed over the pushes of the flush, in
-    /// [`push_buffered`](Self::push_buffered). By default, every item is kept and nothing counted.
-    fn admit_buffered(&self, items: &mut Vec<DatasetItem>) -> FlushCounters {
+    /// Checks items before a buffered dataset (see [`dataset_buffer`](super::dataset_buffer))
+    /// takes them, so that items this backend would reject fail their push right away, as they
+    /// would without buffering, instead of failing a flush shared with other pushes.
+    fn validate_items(&self, items: &[DatasetItem]) -> StorageResult<()> {
         let _ = items;
-        FlushCounters::default()
+        Ok(())
+    }
+
+    /// Whether `error`, returned by a push, means that this backend rejects the items (and would
+    /// reject them again), rather than that it failed. A buffered dataset splits a rejected flush
+    /// push by push. By default, [`StorageError::InvalidArgument`].
+    fn rejects_items(&self, error: &StorageError) -> bool {
+        matches!(error, StorageError::InvalidArgument(_))
+    }
+
+    /// Called by a buffered dataset when it takes `items` into its buffer, in the task that pushes
+    /// them. A backend that accounts for what it stores (the Apify SDK's, which charges for items)
+    /// may keep only some of them, the first ones, and return counters with the sink that settles
+    /// them once the items are stored or given up. By default, every item is kept.
+    fn admit_buffered(&self, items: &mut Vec<DatasetItem>) -> Option<Accounting> {
+        let _ = items;
+        None
     }
 
     /// Stores the items of a flush of a buffered dataset, which [`admit_buffered`](Self::admit_buffered)
-    /// admitted with `counters`. By default, [`push_data`](Self::push_data).
-    async fn push_buffered(&self, items: Vec<DatasetItem>, counters: FlushCounters) -> StorageResult<()> {
-        let _ = counters;
+    /// admitted. By default, [`push_data`](Self::push_data).
+    async fn push_buffered(&self, items: Vec<DatasetItem>) -> StorageResult<()> {
         self.push_data(items).await
     }
 }

@@ -89,8 +89,11 @@ impl Dataset {
         self.buffer.as_ref().map(|buffer| buffer.options())
     }
 
-    /// Stores the items buffered so far (see [`with_buffer`](Self::with_buffer)). Does nothing
-    /// for a dataset that is not buffered.
+    /// Stores the items buffered so far (see [`with_buffer`](Self::with_buffer)), and waits for
+    /// that even if the returned future is dropped first. Does nothing for a dataset that is not
+    /// buffered. `Err` when items nobody waits for (pushed outside a crawler's request) could not
+    /// be stored: they stay buffered and are retried with a backoff, unless the storage rejected
+    /// them. Pushes someone waits for learn of their failure themselves.
     pub async fn flush(&self) -> StorageResult<()> {
         match &self.buffer {
             Some(buffer) => buffer.flush().await,
@@ -136,7 +139,8 @@ impl Dataset {
 
     /// Reads a page. A buffered dataset stores its buffered items first.
     pub async fn get_data<T: DeserializeOwned>(&self, options: DatasetListOptions) -> StorageResult<DatasetPage<T>> {
-        self.flush().await?;
+        // A failure is logged, and the items are retried.
+        let _ = self.flush().await;
         self.counters.read.fetch_add(1, Ordering::Relaxed);
         let page = self.backend.get_data(options).await?;
         let items = page.items.iter().map(|item| serde_json::from_str(item.get())).collect::<Result<Vec<T>, _>>()?;
@@ -298,12 +302,12 @@ impl Dataset {
     /// Removes every item, keeping the dataset.
     pub async fn purge(&self) -> StorageResult<()> {
         // Buffered items are stored first, so that a purge removes them as it would unbuffered.
-        self.flush().await?;
+        let _ = self.flush().await;
         self.backend.purge().await
     }
 
     pub async fn get_info(&self) -> StorageResult<DatasetInfo> {
-        self.flush().await?;
+        let _ = self.flush().await;
         self.backend.get_metadata().await
     }
 

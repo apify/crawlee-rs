@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, Weak};
+use std::time::Duration;
 
 use parking_lot::Mutex;
 
@@ -177,6 +178,24 @@ impl Services {
             }
         }
         result
+    }
+
+    /// [`flush_datasets`](Self::flush_datasets), tried up to `attempts` times, 1 s and then twice
+    /// as long apart, while items could not be stored: what a run does before it ends.
+    pub async fn flush_datasets_with_retries(&self, attempts: u32) -> StorageResult<()> {
+        let mut backoff = Duration::from_secs(1);
+        let mut attempt = 1;
+        loop {
+            match self.flush_datasets().await {
+                Err(err) if attempt < attempts => {
+                    tracing::warn!("Storing the buffered dataset items failed ({err}); retrying.");
+                    tokio::time::sleep(backoff).await;
+                    backoff *= 2;
+                    attempt += 1;
+                }
+                result => return result,
+            }
+        }
     }
 
     async fn open_storage(&self, kind: StorageKind, identifier: &StorageIdentifier) -> StorageResult<CachedStorage> {
