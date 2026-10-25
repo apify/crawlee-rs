@@ -222,7 +222,9 @@ Actors, a charge call. Buffered writes collect the items of several pushes and s
     (`PendingWrites`). That covers `ctx.push_data` (stored when the handler succeeds) and pushes
     made directly to a dataset opened through `Services`, such as `Actor::push_data` of the Apify
     SDK. Pushes from tasks the handler spawns, and pushes outside any request, are flushed as
-    usual but not attributed.
+    usual but not attributed. Pushes in an error handler or a failed-request handler are stored
+    before they return (and fail when they cannot be), as without buffering, since the request is
+    settled whatever becomes of them.
   - While its items wait, the request frees its concurrency slot, so the next request starts. It
     is marked as handled after the flush that stores its items succeeded. The crawler does not
     finish while such requests wait, and they count towards `max_requests_per_crawl`.
@@ -230,7 +232,21 @@ Actors, a charge call. Buffered writes collect the items of several pushes and s
     normal retry path, and its items are pushed again by the retry. A crash or a migration
     between a push and its flush therefore never leaves a request marked as handled without its
     items; at worst, the request is crawled again.
+  - If the items wait longer than the internal timeout, the ones still in the buffer are taken
+    out of it before the request is retried, so that they are not stored twice. Items a flush is
+    storing at that moment are waited for instead.
   - The request lock (`set_expected_request_processing_time`) includes the longest linger.
+  - The request's duration in the statistics leaves out the wait for its items.
+- **Failures.**
+  - Items the storage would reject (`DatasetBackend::validate_items`, such as an item over the
+    Apify API's size limit) fail their push right away, as without buffering. A flush the
+    storage rejects as a whole is split push by push, so that one bad push fails alone.
+  - When a flush fails, a push someone waits for (a request's, or one stored right away) fails
+    for its owner to handle. A push nobody waits for (outside any request) is put back at the
+    head of the buffer and retried with a backoff of 1 s, doubled up to 30 s; `dataset.flush()`
+    returns the error meanwhile. When a crawler finishes, it tries three times and returns the
+    error if the items still cannot be stored.
+  - A flush runs to its end even when whoever started it stops waiting (a timeout, an abort).
 - **Configuration.** In code, `Configuration { dataset_buffer: Some(DatasetBufferOptions::new()
   .with_stages([BufferStage::new(10, 1s), BufferStage::new(100, 2s)]).with_max_bytes(1 << 20)), .. }`.
   From the environment (or the same keys in camelCase in `crawlee.json`: `datasetBuffer`,
@@ -244,9 +260,11 @@ Actors, a charge call. Buffered writes collect the items of several pushes and s
 
   The settings apply to the datasets opened through `Services`. `Dataset::with_buffer(options,
   events)` buffers a handle of your own.
-- **Backends.** `DatasetBackend::admit_buffered` and `push_buffered` (both with defaults) let a
-  backend account for buffered items: the Apify SDK reserves pay-per-event charges when items
-  are pushed, and charges them once per flush.
+- **Backends.** `DatasetBackend::validate_items`, `rejects_items`, `admit_buffered` and
+  `push_buffered` (all with defaults) let a backend check and account for buffered items. Counts
+  attached to items (`with_accounting`, or by `admit_buffered`) are settled by a `FlushSink`: once
+  per flush, summed, when the items are stored, or given back when they are given up. The Apify
+  SDK reserves pay-per-event charges when items are pushed, and charges them that way.
 
 ## Conformance with Crawlee for JS
 
