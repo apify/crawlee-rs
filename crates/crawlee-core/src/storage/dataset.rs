@@ -10,7 +10,6 @@ use indexmap::IndexSet;
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
-use serde_json::value::RawValue;
 
 use super::backend::{DatasetBackend, DatasetInfo, DatasetItem, DatasetListOptions, StorageBackend, StorageIdentifier};
 use crate::errors::{StorageError, StorageResult};
@@ -372,20 +371,183 @@ fn to_csv(items: &[Value], collect_all_keys: bool) -> String {
     out
 }
 
-/// Serializes one object or an array of objects into dataset items, rejecting anything else.
+/// Serializes one object or an array of objects into dataset items, rejecting anything else. Each
+/// element of a sequence is serialized on its own, so that items are never serialized as one
+/// array and parsed again to split them.
 pub fn serialize_items<T: Serialize + ?Sized>(data: &T) -> StorageResult<Vec<DatasetItem>> {
-    let raw = serde_json::value::to_raw_value(data)?;
-    let text = raw.get();
-    match text.as_bytes().first() {
-        Some(b'{') => Ok(vec![raw]),
-        Some(b'[') => {
-            let items: Vec<Box<RawValue>> = serde_json::from_str(text)?;
-            if let Some(bad) = items.iter().find(|item| !item.get().starts_with('{')) {
-                return Err(not_an_object(bad.get()));
-            }
-            Ok(items)
+    let items = match data.serialize(SequenceItems) {
+        Ok(items) => items,
+        Err(SequenceError::NotASequence) => vec![serde_json::value::to_raw_value(data)?],
+        Err(SequenceError::Json(err)) => return Err(err.into()),
+    };
+    if let Some(bad) = items.iter().find(|item| !item.get().starts_with('{')) {
+        return Err(not_an_object(bad.get()));
+    }
+    Ok(items)
+}
+
+/// Serializes the elements of a sequence (a slice, a `Vec`, a tuple, `Value::Array`...) into one
+/// dataset item each. Anything else is [`SequenceError::NotASequence`], to be serialized whole.
+struct SequenceItems;
+
+#[derive(Debug)]
+enum SequenceError {
+    NotASequence,
+    Json(serde_json::Error),
+}
+
+impl std::fmt::Display for SequenceError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SequenceError::NotASequence => f.write_str("not a sequence"),
+            SequenceError::Json(err) => err.fmt(f),
         }
-        _ => Err(not_an_object(text)),
+    }
+}
+
+impl std::error::Error for SequenceError {}
+
+impl serde::ser::Error for SequenceError {
+    fn custom<T: std::fmt::Display>(msg: T) -> Self {
+        SequenceError::Json(serde_json::Error::custom(msg))
+    }
+}
+
+/// The items of a sequence, serialized one by one.
+struct SequenceCollector(Vec<DatasetItem>);
+
+impl SequenceCollector {
+    fn push<T: Serialize + ?Sized>(&mut self, element: &T) -> Result<(), SequenceError> {
+        self.0.push(serde_json::value::to_raw_value(element).map_err(SequenceError::Json)?);
+        Ok(())
+    }
+}
+
+impl serde::ser::SerializeSeq for SequenceCollector {
+    type Ok = Vec<DatasetItem>;
+    type Error = SequenceError;
+    fn serialize_element<T: Serialize + ?Sized>(&mut self, element: &T) -> Result<(), SequenceError> {
+        self.push(element)
+    }
+    fn end(self) -> Result<Vec<DatasetItem>, SequenceError> {
+        Ok(self.0)
+    }
+}
+
+impl serde::ser::SerializeTuple for SequenceCollector {
+    type Ok = Vec<DatasetItem>;
+    type Error = SequenceError;
+    fn serialize_element<T: Serialize + ?Sized>(&mut self, element: &T) -> Result<(), SequenceError> {
+        self.push(element)
+    }
+    fn end(self) -> Result<Vec<DatasetItem>, SequenceError> {
+        Ok(self.0)
+    }
+}
+
+/// Every value that is not a sequence, nor a wrapper around one.
+macro_rules! not_a_sequence {
+    ($($method:ident($($ty:ty),*)),* $(,)?) => {
+        $(fn $method(self, $(_: $ty),*) -> Result<Vec<DatasetItem>, SequenceError> {
+            Err(SequenceError::NotASequence)
+        })*
+    };
+}
+
+impl serde::Serializer for SequenceItems {
+    type Ok = Vec<DatasetItem>;
+    type Error = SequenceError;
+    type SerializeSeq = SequenceCollector;
+    type SerializeTuple = SequenceCollector;
+    type SerializeTupleStruct = serde::ser::Impossible<Vec<DatasetItem>, SequenceError>;
+    type SerializeTupleVariant = serde::ser::Impossible<Vec<DatasetItem>, SequenceError>;
+    type SerializeMap = serde::ser::Impossible<Vec<DatasetItem>, SequenceError>;
+    type SerializeStruct = serde::ser::Impossible<Vec<DatasetItem>, SequenceError>;
+    type SerializeStructVariant = serde::ser::Impossible<Vec<DatasetItem>, SequenceError>;
+
+    fn serialize_seq(self, len: Option<usize>) -> Result<SequenceCollector, SequenceError> {
+        Ok(SequenceCollector(Vec::with_capacity(len.unwrap_or(0))))
+    }
+
+    fn serialize_tuple(self, len: usize) -> Result<SequenceCollector, SequenceError> {
+        Ok(SequenceCollector(Vec::with_capacity(len)))
+    }
+
+    fn serialize_some<T: Serialize + ?Sized>(self, value: &T) -> Result<Vec<DatasetItem>, SequenceError> {
+        value.serialize(self)
+    }
+
+    fn serialize_newtype_struct<T: Serialize + ?Sized>(
+        self,
+        _name: &'static str,
+        value: &T,
+    ) -> Result<Vec<DatasetItem>, SequenceError> {
+        value.serialize(self)
+    }
+
+    not_a_sequence!(
+        serialize_bool(bool),
+        serialize_i8(i8),
+        serialize_i16(i16),
+        serialize_i32(i32),
+        serialize_i64(i64),
+        serialize_i128(i128),
+        serialize_u8(u8),
+        serialize_u16(u16),
+        serialize_u32(u32),
+        serialize_u64(u64),
+        serialize_u128(u128),
+        serialize_f32(f32),
+        serialize_f64(f64),
+        serialize_char(char),
+        serialize_str(&str),
+        serialize_bytes(&[u8]),
+        serialize_none(),
+        serialize_unit(),
+        serialize_unit_struct(&'static str),
+        serialize_unit_variant(&'static str, u32, &'static str),
+    );
+
+    fn serialize_newtype_variant<T: Serialize + ?Sized>(
+        self,
+        _: &'static str,
+        _: u32,
+        _: &'static str,
+        _: &T,
+    ) -> Result<Vec<DatasetItem>, SequenceError> {
+        Err(SequenceError::NotASequence)
+    }
+
+    fn serialize_tuple_struct(self, _: &'static str, _: usize) -> Result<Self::SerializeTupleStruct, SequenceError> {
+        Err(SequenceError::NotASequence)
+    }
+
+    fn serialize_tuple_variant(
+        self,
+        _: &'static str,
+        _: u32,
+        _: &'static str,
+        _: usize,
+    ) -> Result<Self::SerializeTupleVariant, SequenceError> {
+        Err(SequenceError::NotASequence)
+    }
+
+    fn serialize_map(self, _: Option<usize>) -> Result<Self::SerializeMap, SequenceError> {
+        Err(SequenceError::NotASequence)
+    }
+
+    fn serialize_struct(self, _: &'static str, _: usize) -> Result<Self::SerializeStruct, SequenceError> {
+        Err(SequenceError::NotASequence)
+    }
+
+    fn serialize_struct_variant(
+        self,
+        _: &'static str,
+        _: u32,
+        _: &'static str,
+        _: usize,
+    ) -> Result<Self::SerializeStructVariant, SequenceError> {
+        Err(SequenceError::NotASequence)
     }
 }
 
@@ -588,6 +750,28 @@ mod tests {
 
         let err = dataset.export_to("X", &store, DatasetExportOptions::default(), "text/html").await.unwrap_err();
         assert_eq!(err.to_string(), "Unsupported content type: text/html");
+    }
+
+    #[test]
+    fn splits_sequences_into_their_items() {
+        #[derive(Serialize)]
+        struct Item {
+            a: u32,
+        }
+        #[derive(Serialize)]
+        struct Wrapper(Vec<Item>);
+        let texts = |items: Vec<DatasetItem>| items.iter().map(|item| item.get().to_owned()).collect::<Vec<_>>();
+
+        assert_eq!(texts(serialize_items(&json!({ "a": 1 })).unwrap()), [r#"{"a":1}"#]);
+        assert_eq!(texts(serialize_items(&Item { a: 1 }).unwrap()), [r#"{"a":1}"#]);
+        let values = [json!({ "a": 1 }), json!({ "b": [1, 2] })];
+        assert_eq!(texts(serialize_items(&values[..]).unwrap()), [r#"{"a":1}"#, r#"{"b":[1,2]}"#]);
+        assert_eq!(texts(serialize_items(&json!([{ "a": 1 }, { "b": 2 }])).unwrap()), [r#"{"a":1}"#, r#"{"b":2}"#]);
+        assert_eq!(texts(serialize_items(&vec![Item { a: 1 }, Item { a: 2 }]).unwrap()), [r#"{"a":1}"#, r#"{"a":2}"#]);
+        assert_eq!(texts(serialize_items(&(Item { a: 1 }, json!({ "b": 2 }))).unwrap()), [r#"{"a":1}"#, r#"{"b":2}"#]);
+        assert_eq!(texts(serialize_items(&Some(vec![Item { a: 1 }])).unwrap()), [r#"{"a":1}"#]);
+        assert_eq!(texts(serialize_items(&Wrapper(vec![Item { a: 3 }])).unwrap()), [r#"{"a":3}"#]);
+        assert!(serialize_items(&Vec::<Item>::new()).unwrap().is_empty());
     }
 
     #[test]
