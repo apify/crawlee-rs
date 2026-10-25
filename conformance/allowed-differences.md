@@ -41,6 +41,15 @@ _None._ All 755 checks match.
 | `skipNavigation` | The response members of the context are getters that throw `NavigationSkippedError` | Infallible response members (`status()`, `text()`, …) panic with that error's message, which the crawler turns back into the error; fallible ones (`json()`, `with_html()`, `enqueue_links()`, …) return it. Either way the request fails without retries | Rust has no throwing getters, and making every response member fallible would change every handler |
 | Error groups in saved statistics | `errors` / `retryErrors` hold the nested `ErrorTracker` tree | A flat `{ group: count }` map | Follows from the error grouping above; JS rebuilds its trackers from scratch on restore anyway |
 
+## Opt-in extras
+
+Features that Crawlee for JS does not have. They are off by default, so that the default
+behaviour matches JS.
+
+| Area | Crawlee for JS | crawlee-rs | Why |
+|---|---|---|---|
+| Buffered dataset writes | Every `pushData` is one write | Off by default, as in JS. With `CRAWLEE_DATASET_BUFFER=1` (or `Configuration::dataset_buffer`), pushes are collected and stored together, after the first few, with a linger that grows by stage; a request is marked as handled only after its items are stored, and retried if they cannot be (see the README) | Fewer API calls and charge calls on the Apify platform |
+
 ## Behavior differences not yet covered by golden cases
 
 - **Parsing malformed HTML (DOM queries).**

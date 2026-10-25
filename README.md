@@ -195,6 +195,59 @@ The goal was to keep Crawlee v4's architecture and change it only where Rust nee
   - `fixed_concurrency(n)` pins it, and `max_requests_per_minute` caps the rate.
 - **`#![forbid(unsafe_code)]`** holds in every crate. The lint is set at the workspace level.
 
+## Extra features (not in Crawlee for JS)
+
+These are opt-in and off by default, so that crawlee-rs behaves as Crawlee for JS unless asked
+otherwise.
+
+### Buffered dataset writes
+
+By default every `push_data` is one write to the storage, as in JS. Against a storage behind an
+HTTP API (the Apify platform) each write costs a request, its compression and, for pay-per-event
+Actors, a charge call. Buffered writes collect the items of several pushes and store them together.
+
+- **How it batches.** The first items are stored right away, so that the first results show at
+  once. Later items wait in a buffer for at most the *linger* of the current stage, which grows as
+  the run goes on. The defaults: the first 10 items right away, then at most 1 s, and from the
+  100th item on at most 2 s. The stages are a list, so more steps can be added.
+- **When it flushes.** When the linger is up; when the buffered items reach `max_bytes` (1 MiB by
+  default, at most 8 MiB, below the 9 MB payload limit of the Apify API); on the `PersistState`,
+  `Migrating`, `Aborting` and `Exit` events; when every running request only waits for its items
+  and nothing else can start; when a crawler finishes; before a read of the dataset; and on
+  `dataset.flush()` or `services.flush_datasets()`.
+- **Order.** Items are stored in the order they were pushed.
+- **Data safety.** A request is marked as handled only once the items pushed while handling it
+  are stored:
+  - Pushes are attributed to the request whose task makes them, through a task-local scope
+    (`PendingWrites`). That covers `ctx.push_data` (stored when the handler succeeds) and pushes
+    made directly to a dataset opened through `Services`, such as `Actor::push_data` of the Apify
+    SDK. Pushes from tasks the handler spawns, and pushes outside any request, are flushed as
+    usual but not attributed.
+  - While its items wait, the request frees its concurrency slot, so the next request starts. It
+    is marked as handled after the flush that stores its items succeeded. The crawler does not
+    finish while such requests wait, and they count towards `max_requests_per_crawl`.
+  - If that flush fails, the request is not marked as handled. It fails and goes through the
+    normal retry path, and its items are pushed again by the retry. A crash or a migration
+    between a push and its flush therefore never leaves a request marked as handled without its
+    items; at worst, the request is crawled again.
+  - The request lock (`set_expected_request_processing_time`) includes the longest linger.
+- **Configuration.** In code, `Configuration { dataset_buffer: Some(DatasetBufferOptions::new()
+  .with_stages([BufferStage::new(10, 1s), BufferStage::new(100, 2s)]).with_max_bytes(1 << 20)), .. }`.
+  From the environment (or the same keys in camelCase in `crawlee.json`: `datasetBuffer`,
+  `datasetBufferStages`, `datasetBufferMaxBytes`):
+
+  | Variable | Meaning | Default |
+  |---|---|---|
+  | `CRAWLEE_DATASET_BUFFER` | `1`/`true` turns buffered writes on | off |
+  | `CRAWLEE_DATASET_BUFFER_STAGES` | `FROM_ITEM:LINGER` pairs, such as `10:1s,100:2s`; a linger is in seconds (`2`, `1.5s`) or milliseconds (`500ms`); items before the first stage are stored right away | `10:1s,100:2s` |
+  | `CRAWLEE_DATASET_BUFFER_MAX_BYTES` | Flush once the buffered items take this many bytes | `1048576` |
+
+  The settings apply to the datasets opened through `Services`. `Dataset::with_buffer(options,
+  events)` buffers a handle of your own.
+- **Backends.** `DatasetBackend::admit_buffered` and `push_buffered` (both with defaults) let a
+  backend account for buffered items: the Apify SDK reserves pay-per-event charges when items
+  are pushed, and charges them once per flush.
+
 ## Conformance with Crawlee for JS
 
 `conformance/oracle` runs Crawlee for JS **from its sources** as an oracle and writes golden files
