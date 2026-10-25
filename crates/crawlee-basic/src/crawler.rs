@@ -1162,8 +1162,14 @@ where
 
             // `maybeRunTask`; a paused crawler starts nothing and does not finish.
             if !shared.paused.load(Ordering::Acquire) {
-                let ready =
-                    concurrency.can_start_task() && self.is_task_ready(shared, run, tasks.len(), &mut wake_at).await?;
+                // Without capacity (all slots taken, or the rate cap reached), a request may start
+                // later.
+                let readiness = if concurrency.can_start_task() {
+                    self.is_task_ready(shared, run, tasks.len(), &mut wake_at).await?
+                } else {
+                    TaskReadiness::Later
+                };
+                let ready = readiness == TaskReadiness::Ready;
                 if ready && concurrency.try_register_task_start() {
                     let crawler = self.clone();
                     let shared = shared.clone();
@@ -1180,9 +1186,14 @@ where
                 if !ready && tasks.is_empty() && self.is_finished(shared, run).await? {
                     return Ok(());
                 }
-                // Nothing to start, and every running request only waits for its buffered dataset
-                // items: they are stored now rather than after their linger.
-                if !ready && !tasks.is_empty() && shared.awaiting_flush.load(Ordering::Acquire) >= tasks.len() {
+                // No request can start before the running ones end, and every running request only
+                // waits for its buffered dataset items: they are stored now rather than after their
+                // linger. Not when a request can start later (a paced domain, the rate cap): the
+                // items keep waiting for it, to be stored together.
+                if readiness == TaskReadiness::Exhausted
+                    && !tasks.is_empty()
+                    && shared.awaiting_flush.load(Ordering::Acquire) >= tasks.len()
+                {
                     // A failure reaches the requests waiting for the items.
                     let _ = shared.services.flush_datasets().await;
                 }
@@ -1218,7 +1229,7 @@ where
         run: &RunState,
         in_flight: usize,
         wake_at: &mut Option<tokio::time::Instant>,
-    ) -> anyhow::Result<bool> {
+    ) -> anyhow::Result<TaskReadiness> {
         // In-flight requests count too, so that the limit is never exceeded.
         if let Some(max) = self.inner.options.max_requests_per_crawl
             && self.inner.statistics.requests_finished() + in_flight as u64 >= max
@@ -1229,7 +1240,7 @@ where
                      Requests that are in progress will be allowed to finish."
                 )
             });
-            return Ok(false);
+            return Ok(TaskReadiness::Exhausted);
         }
         if run.stop_requested.load(Ordering::Acquire) {
             run.log_once("shuttingDown", || {
@@ -1237,22 +1248,28 @@ where
                  allowed to complete."
                     .to_owned()
             });
-            return Ok(false);
+            return Ok(TaskReadiness::Exhausted);
         }
         if let Some(is_task_ready) = &self.inner.task_loop.is_task_ready {
-            return is_task_ready().await;
+            // A custom predicate does not tell whether a request may start later.
+            return Ok(if is_task_ready().await? { TaskReadiness::Ready } else { TaskReadiness::Later });
         }
         match shared.request_manager.check_readiness().await? {
-            RequestSourceStatus::Ready => Ok(true),
+            RequestSourceStatus::Ready => Ok(TaskReadiness::Ready),
             RequestSourceStatus::Waiting { ready_at: Some(at) } => {
                 let at = tokio::time::Instant::from_std(at);
                 // A single wake-up, which only an earlier one replaces (`scheduleWake`).
                 if wake_at.is_none_or(|current| at < current) {
                     *wake_at = Some(at);
                 }
-                Ok(false)
+                Ok(TaskReadiness::Later)
             }
-            _ => Ok(false),
+            // Nothing to fetch now, and no known time when there will be: what is left is in progress
+            // (or, for a moment, still being added in the background).
+            RequestSourceStatus::Waiting { ready_at: None } | RequestSourceStatus::Finished => {
+                Ok(TaskReadiness::Exhausted)
+            }
+            _ => Ok(TaskReadiness::Later),
         }
     }
 
@@ -1831,6 +1848,18 @@ where
             Err(err) => return Err(err),
         }
     }
+}
+
+/// Whether the task loop can start a request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TaskReadiness {
+    Ready,
+    /// Not now, but possibly before the running requests end: a paced domain, the rate cap, no
+    /// free slot.
+    Later,
+    /// Not before the running requests end: the request manager has nothing to hand out (what is
+    /// left is in progress), or a limit or `stop()` ends the crawl.
+    Exhausted,
 }
 
 /// What one `run()` keeps (`CrawlerRun`).

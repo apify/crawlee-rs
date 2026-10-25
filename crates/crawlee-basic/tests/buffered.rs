@@ -16,8 +16,8 @@ use crawlee_core::storage::backend::{
 };
 use crawlee_core::storage::dataset_buffer::{BufferStage, DatasetBufferOptions};
 use crawlee_core::{
-    Configuration, MemoryStorageBackend, Request, RequestManager, RequestQueue, Services, StorageBackend,
-    StorageIdentifier, StorageResult,
+    Configuration, MemoryStorageBackend, Request, RequestManager, RequestQueue, RequestSourceStatus, Services,
+    StorageBackend, StorageIdentifier, StorageResult,
 };
 
 /// What reached the storages, in order.
@@ -105,10 +105,20 @@ impl StorageBackend for LoggingStorage {
 }
 
 /// The crawler's queue, logging the requests it marks as handled and the lock time it is told.
+/// With `pace`, a request is handed out only `pace` after the previous one, as a manager that
+/// paces a domain does.
 struct LoggingManager {
     queue: RequestQueue,
     log: Log,
     lock_times: Mutex<Vec<Duration>>,
+    pace: Option<Duration>,
+    next_at: Mutex<Option<Instant>>,
+}
+
+impl LoggingManager {
+    fn held_until(&self) -> Option<Instant> {
+        self.next_at.lock().filter(|at| *at > Instant::now())
+    }
 }
 
 #[async_trait::async_trait]
@@ -117,7 +127,20 @@ impl RequestManager for LoggingManager {
         self.queue.add_requests(requests, forefront).await
     }
     async fn fetch_next_request(&self) -> StorageResult<Option<Request>> {
-        self.queue.fetch_next_request().await
+        if self.held_until().is_some() {
+            return Ok(None);
+        }
+        let request = self.queue.fetch_next_request().await?;
+        if let (Some(pace), Some(_)) = (self.pace, &request) {
+            *self.next_at.lock() = Some(Instant::now() + pace);
+        }
+        Ok(request)
+    }
+    async fn check_readiness(&self) -> StorageResult<RequestSourceStatus> {
+        match self.held_until() {
+            Some(at) if !self.queue.is_empty().await? => Ok(RequestSourceStatus::Waiting { ready_at: Some(at) }),
+            _ => self.queue.check_readiness().await,
+        }
     }
     async fn mark_request_as_handled(&self, request: &mut Request) -> StorageResult<Option<QueueOperationInfo>> {
         self.log.push(format!("marked {}", request.url));
@@ -150,6 +173,10 @@ struct Setup {
 }
 
 async fn setup(buffer: Option<DatasetBufferOptions>) -> Setup {
+    setup_paced(buffer, None).await
+}
+
+async fn setup_paced(buffer: Option<DatasetBufferOptions>, pace: Option<Duration>) -> Setup {
     let log = Log::default();
     let failing_pushes = Arc::new(AtomicUsize::new(0));
     let storage = Arc::new(LoggingStorage {
@@ -160,8 +187,29 @@ async fn setup(buffer: Option<DatasetBufferOptions>) -> Setup {
     let configuration = Configuration { dataset_buffer: buffer, ..Configuration::default() };
     let services = Services::with_configuration(configuration, storage);
     let queue = services.open_request_queue(&StorageIdentifier::Default).await.unwrap();
-    let manager = Arc::new(LoggingManager { queue, log: log.clone(), lock_times: Mutex::default() });
+    let manager = Arc::new(LoggingManager {
+        queue,
+        log: log.clone(),
+        lock_times: Mutex::default(),
+        pace,
+        next_at: Mutex::default(),
+    });
     Setup { services, manager, log, failing_pushes }
+}
+
+/// Starts the events before the crawler does, and lets their first `PersistState` (emitted right
+/// away) flush, so that no flush lands in the middle of a crawl by chance.
+async fn start_events(events: &crawlee_core::EventManager) {
+    let persisted = Arc::new(tokio::sync::Notify::new());
+    let notify = persisted.clone();
+    let listener = events.on(crawlee_core::EventKind::PersistState, move |_| {
+        notify.notify_one();
+        async {}
+    });
+    events.init().await;
+    persisted.notified().await;
+    events.off(listener);
+    events.wait_for_all_listeners_to_complete().await;
 }
 
 fn lingering(linger: Duration) -> DatasetBufferOptions {
@@ -185,6 +233,7 @@ fn urls(count: usize) -> Vec<String> {
 #[tokio::test]
 async fn requests_are_marked_as_handled_only_after_their_items_are_stored() {
     let Setup { services, manager, log, .. } = setup(Some(lingering(Duration::from_millis(200)))).await;
+    let events = services.events.clone();
     let crawler = BasicCrawler::builder()
         .services(services)
         .request_manager(manager)
@@ -193,6 +242,7 @@ async fn requests_are_marked_as_handled_only_after_their_items_are_stored() {
         .build()
         .unwrap();
 
+    start_events(&events).await;
     let stats = crawler.run(urls(12)).await.unwrap();
     assert_eq!(stats.requests_succeeded, 12);
     for url in urls(12) {
@@ -207,6 +257,7 @@ async fn requests_are_marked_as_handled_only_after_their_items_are_stored() {
 #[tokio::test]
 async fn a_request_frees_its_slot_while_its_items_wait_and_the_crawler_flushes_when_it_runs_out_of_work() {
     let Setup { services, manager, log, .. } = setup(Some(lingering(Duration::from_secs(3600)))).await;
+    let events = services.events.clone();
     let handler_log = log.clone();
     let crawler = BasicCrawler::builder()
         .services(services)
@@ -221,23 +272,50 @@ async fn a_request_frees_its_slot_while_its_items_wait_and_the_crawler_flushes_w
         })
         .build()
         .unwrap();
-    // Pushed outside any request.
+    // Pushed outside any request, and stored by the first `PersistState`.
     crawler.dataset().await.unwrap().push_data(&json!({ "url": "startup", "via": "direct" })).await.unwrap();
+    start_events(&events).await;
+    assert_eq!(log.entries(), ["push of 1", "stored direct startup"]);
 
     let started = Instant::now();
     let stats = crawler.run(urls(5)).await.unwrap();
     assert_eq!(stats.requests_succeeded, 5);
     assert!(started.elapsed() < Duration::from_secs(10), "the crawler flushed instead of waiting an hour");
     // With one slot, every request was handled before the first one was marked: the requests
-    // waiting for their items freed it.
+    // waiting for their items freed it. Their items were stored together once the queue had
+    // nothing left to start.
     assert!(log.position("handled https://a.dev/4") < log.position("marked https://a.dev/0"), "{:?}", log.entries());
-    assert_eq!(log.count("stored "), 11, "{:?}", log.entries());
-    assert!(log.count("push of ") <= 2, "{:?}", log.entries());
+    assert_eq!(log.count("push of "), 2, "{:?}", log.entries());
+    assert!(log.position("push of 10") < log.position("marked https://a.dev/0"), "{:?}", log.entries());
+    events.close().await;
+}
+
+#[tokio::test]
+async fn a_request_held_back_for_a_moment_does_not_flush_the_items_waiting() {
+    // The second request is handed out 300 ms after the first: the crawler has nothing to start
+    // meanwhile, but will have, so the first request's items keep waiting for their linger (1 h).
+    let pace = Some(Duration::from_millis(300));
+    let Setup { services, manager, log, .. } = setup_paced(Some(lingering(Duration::from_secs(3600))), pace).await;
+    let events = services.events.clone();
+    let crawler = BasicCrawler::builder()
+        .services(services)
+        .request_manager(manager)
+        .request_handler(|ctx: BasicContext| async move { push_both_ways(&ctx).await })
+        .build()
+        .unwrap();
+    start_events(&events).await;
+
+    let stats = crawler.run(urls(2)).await.unwrap();
+    assert_eq!(stats.requests_succeeded, 2);
+    assert_eq!(log.count("push of "), 1, "stored together once the queue had nothing left: {:?}", log.entries());
+    assert_eq!(log.count("stored "), 4);
+    events.close().await;
 }
 
 #[tokio::test]
 async fn a_failed_flush_retries_the_request_instead_of_marking_it() {
     let Setup { services, manager, log, failing_pushes } = setup(Some(lingering(Duration::from_millis(100)))).await;
+    let events = services.events.clone();
     failing_pushes.store(1, Ordering::SeqCst);
     let crawler = BasicCrawler::builder()
         .services(services)
@@ -246,6 +324,7 @@ async fn a_failed_flush_retries_the_request_instead_of_marking_it() {
         .build()
         .unwrap();
 
+    start_events(&events).await;
     let stats = crawler.run(["https://a.dev/0"]).await.unwrap();
     assert_eq!((stats.requests_succeeded, stats.requests_failed, stats.requests_retries), (1, 0, 1));
     assert_eq!(
@@ -265,6 +344,7 @@ async fn a_failed_flush_retries_the_request_instead_of_marking_it() {
 #[tokio::test]
 async fn a_request_whose_items_cannot_be_stored_fails_after_its_retries() {
     let Setup { services, manager, log, failing_pushes } = setup(Some(lingering(Duration::from_millis(50)))).await;
+    let events = services.events.clone();
     failing_pushes.store(usize::MAX, Ordering::SeqCst);
     let crawler = BasicCrawler::builder()
         .services(services)
@@ -274,6 +354,7 @@ async fn a_request_whose_items_cannot_be_stored_fails_after_its_retries() {
         .build()
         .unwrap();
 
+    start_events(&events).await;
     let stats = crawler.run(["https://a.dev/0"]).await.unwrap();
     assert_eq!((stats.requests_succeeded, stats.requests_failed, stats.requests_retries), (0, 1, 1));
     // Marked only as failed, after its retries, as any failed request is.
