@@ -714,6 +714,18 @@ mod tests {
         assert_eq!(desc.first(), Some(&json!({ "i": 4 })));
     }
 
+    /// A descending page that reaches past the oldest item holds only what remains, and an offset
+    /// past the end gives an empty page (crawlee#4301).
+    #[tokio::test]
+    async fn descending_pages_do_not_repeat_newer_items() {
+        let (dataset, _) = numbers(5).await;
+        let page = |offset, limit| DatasetListOptions { offset, limit: Some(limit), desc: true, ..Default::default() };
+        let last: Vec<serde_json::Value> = dataset.values(page(3, 3)).await.unwrap();
+        assert_eq!(last, [json!({ "i": 1 }), json!({ "i": 0 })]);
+        let beyond: Vec<serde_json::Value> = dataset.values(page(7, 3)).await.unwrap();
+        assert!(beyond.is_empty());
+    }
+
     #[tokio::test]
     async fn exports_to_a_key_value_store_as_json_and_csv() {
         let storage = MemoryStorageBackend::new();
