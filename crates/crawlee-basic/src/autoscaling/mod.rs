@@ -519,19 +519,98 @@ mod tests {
         }
     }
 
+    /// A [`Switch`] that only steers scaling.
+    #[derive(Default)]
+    struct ScalingOnly(Switch);
+
+    impl LoadSignal for ScalingOnly {
+        fn name(&self) -> &str {
+            "scalingOnly"
+        }
+        fn overloaded_ratio(&self) -> f64 {
+            self.0.overloaded_ratio()
+        }
+        fn start(&self, _: &Services, _: Duration) {}
+        fn stop(&self) {}
+        fn sample(&self, duration: Option<Duration>) -> Vec<LoadSnapshot> {
+            self.0.sample(duration)
+        }
+        fn gates_task_start(&self) -> bool {
+            false
+        }
+    }
+
     fn system(options: ConcurrencyOptions, switch: &Arc<Switch>) -> ConcurrencySystem {
         let custom: Arc<dyn LoadSignal> = switch.clone();
+        system_with(options, vec![custom])
+    }
+
+    fn system_with(options: ConcurrencyOptions, custom: Vec<Arc<dyn LoadSignal>>) -> ConcurrencySystem {
         ConcurrencySystem::new(ConcurrencyOptions {
-            load_signals: LoadSignalsOptions {
-                memory: None,
-                event_loop: None,
-                cpu: None,
-                storage: None,
-                custom: vec![custom],
-            },
+            load_signals: LoadSignalsOptions { memory: None, event_loop: None, cpu: None, storage: None, custom },
             ..options
         })
         .unwrap()
+    }
+
+    /// A gating switch and a scaling-only one, both idle, in a system at its minimum
+    /// concurrency, where the load decides whether a task may start.
+    fn gating_and_scaling_only() -> (ConcurrencySystem, Arc<Switch>, Arc<ScalingOnly>) {
+        let (gating, scaling_only) = (Arc::new(Switch::default()), Arc::new(ScalingOnly::default()));
+        let system = system_with(
+            ConcurrencyOptions { desired_concurrency: Some(10), ..Default::default() },
+            vec![gating.clone(), scaling_only.clone()],
+        );
+        system.register_task_start();
+        assert!(system.has_capacity_for_task());
+        (system, gating, scaling_only)
+    }
+
+    #[test]
+    fn an_overloaded_scaling_only_signal_scales_down_without_holding_back_tasks() {
+        let (system, _, scaling_only) = gating_and_scaling_only();
+        scaling_only.0.overloaded.store(true, Ordering::SeqCst);
+
+        assert!(system.has_capacity_for_task());
+        let current = system.current_status();
+        assert!(current.is_system_idle);
+        let info = current.signal("scalingOnly").unwrap();
+        assert!(info.is_overloaded, "reported although it does not count");
+        assert!(!info.gates_task_start);
+        assert!(current.signal("switch").unwrap().gates_task_start);
+
+        let historical = system.historical_status();
+        assert!(!historical.is_system_idle);
+        assert!(!historical.signal("scalingOnly").unwrap().gates_task_start);
+        system.autoscale();
+        assert_eq!(system.desired_concurrency(), 9);
+    }
+
+    #[test]
+    fn an_overloaded_gating_signal_holds_back_tasks_and_scales_down() {
+        let (system, gating, _) = gating_and_scaling_only();
+        gating.overloaded.store(true, Ordering::SeqCst);
+
+        assert!(!system.has_capacity_for_task());
+        assert!(!system.current_status().is_system_idle);
+        assert!(!system.historical_status().is_system_idle);
+        system.autoscale();
+        assert_eq!(system.desired_concurrency(), 9);
+    }
+
+    #[test]
+    fn signals_gate_task_starts_by_default() {
+        let switch = Switch::default();
+        assert!(switch.gates_task_start(), "the default of the trait");
+        assert!(LoadSignalInfo::default().gates_task_start);
+        assert!(evaluate_sample(&switch.sample(None), 0.5).gates_task_start);
+
+        let system = ConcurrencySystem::new(ConcurrencyOptions::default()).unwrap();
+        for status in [system.current_status(), system.historical_status()] {
+            let names: Vec<&str> = status.signals.iter().map(|(name, _)| name.as_str()).collect();
+            assert_eq!(names, ["memInfo", "eventLoopInfo", "cpuInfo", "storageBackendInfo"]);
+            assert!(status.signals.iter().all(|(_, info)| info.gates_task_start));
+        }
     }
 
     /// A contradictory pair (min above max) resolves in favour of the maximum, as in JS.
