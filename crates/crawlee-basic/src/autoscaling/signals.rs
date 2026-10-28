@@ -20,13 +20,23 @@ pub struct LoadSnapshot {
 }
 
 /// How loaded a resource was over a time window.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct LoadSignalInfo {
     pub is_overloaded: bool,
     /// The share of overloaded time above which the resource counts as overloaded.
     pub limit_ratio: f64,
     /// The share of overloaded time in the window, rounded to 3 decimals.
     pub actual_ratio: f64,
+    /// [`LoadSignal::gates_task_start`] of the signal. When `false`, the signal only steers
+    /// scaling: its overload does not count in the
+    /// [current status](super::ConcurrencySystem::current_status). [`evaluate_sample`] sets `true`.
+    pub gates_task_start: bool,
+}
+
+impl Default for LoadSignalInfo {
+    fn default() -> Self {
+        LoadSignalInfo { is_overloaded: false, limit_ratio: 0.0, actual_ratio: 0.0, gates_task_start: true }
+    }
 }
 
 /// A source of [`LoadSnapshot`]s. The built-in ones measure memory, CPU, runtime responsiveness
@@ -43,6 +53,22 @@ pub trait LoadSignal: Send + Sync + 'static {
     fn stop(&self);
     /// Snapshots of the last `duration` before the newest one (all of them for `None`), oldest first.
     fn sample(&self, duration: Option<Duration>) -> Vec<LoadSnapshot>;
+    /// Whether this signal can hold back the start of a request. Defaults to `true`, as every
+    /// signal in Crawlee for JS.
+    ///
+    /// - `true`: the signal counts in both decisions. A request starts only if the signal was
+    ///   idle over the current window (`current_history`, 5 s), and autoscaling scales down when
+    ///   it was overloaded over the historical window (`snapshot_history`, 30 s).
+    /// - `false`: the signal only steers scaling. It counts in the historical status, but not in
+    ///   the current one, so its overload never stops a request from starting. Use it for
+    ///   signals that are only meaningful over the longer window, such as one that flags
+    ///   overload when added concurrency stops adding throughput; gating starts on such a signal
+    ///   makes the crawl stop and go.
+    ///
+    /// Not in Crawlee for JS, where every signal gates request starts.
+    fn gates_task_start(&self) -> bool {
+        true
+    }
 }
 
 /// Snapshots of one signal, pruned to the longest sample window.
@@ -94,7 +120,7 @@ impl SnapshotStore {
 /// as the time since the one before it; the first only anchors the timeline.
 pub fn evaluate_sample(sample: &[LoadSnapshot], overloaded_ratio: f64) -> LoadSignalInfo {
     let ratio = match sample {
-        [] => return LoadSignalInfo { is_overloaded: false, limit_ratio: overloaded_ratio, actual_ratio: 0.0 },
+        [] => return LoadSignalInfo { limit_ratio: overloaded_ratio, ..LoadSignalInfo::default() },
         [only] => f64::from(u8::from(only.is_overloaded)),
         _ => {
             let (mut weighted, mut total) = (0.0, 0.0);
@@ -112,6 +138,7 @@ pub fn evaluate_sample(sample: &[LoadSnapshot], overloaded_ratio: f64) -> LoadSi
         is_overloaded: ratio > overloaded_ratio,
         limit_ratio: overloaded_ratio,
         actual_ratio: (ratio * 1000.0).round() / 1000.0,
+        gates_task_start: true,
     }
 }
 
@@ -490,7 +517,7 @@ mod tests {
     fn evaluation_is_time_weighted() {
         assert_eq!(
             evaluate_sample(&[], 0.2),
-            LoadSignalInfo { is_overloaded: false, limit_ratio: 0.2, actual_ratio: 0.0 }
+            LoadSignalInfo { is_overloaded: false, limit_ratio: 0.2, actual_ratio: 0.0, gates_task_start: true }
         );
         assert!(evaluate_sample(&[at(0, true)], 0.2).is_overloaded);
         // The first snapshot only anchors: 1 s overloaded out of 4 s.
