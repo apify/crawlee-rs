@@ -193,6 +193,9 @@ The goal was to keep Crawlee v4's architecture and change it only where Rust nee
   - Runtime responsiveness stands in for the event loop signal of Node. It measures how late a
     timer task fires on the tokio runtime.
   - `fixed_concurrency(n)` pins it, and `max_requests_per_minute` caps the rate.
+  - Custom load signals can be added. Not in Crawlee for JS: a signal whose `gates_task_start()`
+    returns `false` only steers scaling and never holds back a request start.
+    `ConcurrencySystem::historical_status()` shows the load that scaling is based on.
 - **`#![forbid(unsafe_code)]`** holds in every crate. The lint is set at the workspace level.
 
 ## Conformance with Crawlee for JS
