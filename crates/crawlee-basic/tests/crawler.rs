@@ -1611,3 +1611,140 @@ async fn keep_alive_outlives_a_domain_that_never_stops_rate_limiting() {
     crawler.stop(None);
     running.await.unwrap().unwrap();
 }
+
+/// In-memory storage whose key-value stores take `delay` to save the statistics, and count it.
+struct SlowStatisticsWrites {
+    inner: crawlee_core::MemoryStorageBackend,
+    delay: Duration,
+    writes: Arc<AtomicUsize>,
+}
+
+struct SlowStatisticsStore {
+    inner: Arc<dyn crawlee_core::storage::backend::KeyValueStoreBackend>,
+    delay: Duration,
+    writes: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl crawlee_core::storage::backend::KeyValueStoreBackend for SlowStatisticsStore {
+    async fn get_metadata(&self) -> crawlee_core::StorageResult<crawlee_core::storage::backend::KeyValueStoreInfo> {
+        self.inner.get_metadata().await
+    }
+    async fn drop_storage(&self) -> crawlee_core::StorageResult<()> {
+        self.inner.drop_storage().await
+    }
+    async fn purge(&self) -> crawlee_core::StorageResult<()> {
+        self.inner.purge().await
+    }
+    async fn get_value(
+        &self,
+        key: &str,
+    ) -> crawlee_core::StorageResult<Option<crawlee_core::storage::backend::KeyValueStoreRecord>> {
+        self.inner.get_value(key).await
+    }
+    async fn set_value(
+        &self,
+        record: crawlee_core::storage::backend::KeyValueStoreRecord,
+    ) -> crawlee_core::StorageResult<()> {
+        if record.key.contains("CRAWLER_STATISTICS") {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(self.delay).await;
+        }
+        self.inner.set_value(record).await
+    }
+    async fn delete_value(&self, key: &str) -> crawlee_core::StorageResult<()> {
+        self.inner.delete_value(key).await
+    }
+    async fn list_keys(
+        &self,
+        options: crawlee_core::storage::backend::KeyValueStoreListKeysOptions,
+    ) -> crawlee_core::StorageResult<crawlee_core::storage::backend::KeyValueStoreListKeysResult> {
+        self.inner.list_keys(options).await
+    }
+    async fn record_exists(&self, key: &str) -> crawlee_core::StorageResult<bool> {
+        self.inner.record_exists(key).await
+    }
+}
+
+#[async_trait::async_trait]
+impl crawlee_core::StorageBackend for SlowStatisticsWrites {
+    async fn create_dataset_backend(
+        &self,
+        id: &crawlee_core::StorageIdentifier,
+    ) -> crawlee_core::StorageResult<Arc<dyn crawlee_core::storage::backend::DatasetBackend>> {
+        self.inner.create_dataset_backend(id).await
+    }
+    async fn create_key_value_store_backend(
+        &self,
+        id: &crawlee_core::StorageIdentifier,
+    ) -> crawlee_core::StorageResult<Arc<dyn crawlee_core::storage::backend::KeyValueStoreBackend>> {
+        let inner = self.inner.create_key_value_store_backend(id).await?;
+        Ok(Arc::new(SlowStatisticsStore { inner, delay: self.delay, writes: self.writes.clone() }))
+    }
+    async fn create_request_queue_backend(
+        &self,
+        id: &crawlee_core::StorageIdentifier,
+    ) -> crawlee_core::StorageResult<Arc<dyn crawlee_core::storage::backend::RequestQueueBackend>> {
+        self.inner.create_request_queue_backend(id).await
+    }
+}
+
+/// The final saves at the end of a run go out together: the statistics, the sessions and
+/// everything else that saves on `PersistState`. Crawlee for JS makes them one after the other.
+#[tokio::test]
+async fn the_final_saves_go_out_together() {
+    use crawlee_core::EventKind;
+
+    let delay = Duration::from_millis(300);
+    let writes = Arc::new(AtomicUsize::new(0));
+    let backend =
+        SlowStatisticsWrites { inner: crawlee_core::MemoryStorageBackend::new(), delay, writes: writes.clone() };
+    let services = Services::new(Arc::new(backend));
+    services.events.on(EventKind::PersistState, move |_| tokio::time::sleep(delay));
+    let crawler = BasicCrawler::builder()
+        .services(services)
+        .request_handler(|_ctx: BasicContext| async move { Ok(()) })
+        .build()
+        .unwrap();
+    let started = std::time::Instant::now();
+    crawler.run(["https://a.dev/1"]).await.unwrap();
+    let elapsed = started.elapsed();
+    assert!(elapsed >= delay, "{elapsed:?}");
+    assert!(elapsed < delay * 2 - Duration::from_millis(50), "the saves went out one after the other: {elapsed:?}");
+    assert_eq!(writes.load(Ordering::SeqCst), 1, "the statistics are saved once");
+}
+
+/// Not in Crawlee for JS: the statistics can be saved under another key, such as the
+/// `SDK_CRAWLER_STATISTICS_{id}` of Crawlee for JS 3, and a resumed crawl picks them up there.
+#[tokio::test]
+async fn statistics_can_be_saved_under_another_key() {
+    use crawlee_basic::Statistics;
+
+    let dir = tempfile::tempdir().unwrap();
+    let crawl = |purge_on_start: bool, url: &'static str| {
+        let configuration =
+            Configuration { storage_dir: dir.path().to_owned(), purge_on_start, ..Configuration::default() };
+        async move {
+            let statistics =
+                Arc::new(Statistics::with_id("keyed").with_persist_state_key("SDK_CRAWLER_STATISTICS_keyed"));
+            let crawler = BasicCrawler::builder()
+                .services(Services::from_configuration(configuration))
+                .statistics(statistics.clone())
+                .request_handler(|_ctx: BasicContext| async move { Ok(()) })
+                .build()
+                .unwrap();
+            crawler.run([url]).await.unwrap();
+            statistics
+        }
+    };
+    let store = dir.path().join("key_value_stores/default");
+
+    crawl(true, "https://a.dev/1").await;
+    let saved: Value =
+        serde_json::from_str(&std::fs::read_to_string(store.join("SDK_CRAWLER_STATISTICS_keyed")).unwrap()).unwrap();
+    assert_eq!(saved["requestsSucceeded"], 1);
+    assert!(!store.join("CRAWLEE_CRAWLER_STATISTICS_keyed").exists());
+
+    let resumed = crawl(false, "https://a.dev/2").await;
+    assert_eq!(resumed.requests_succeeded(), 2, "picked up from the other key");
+}

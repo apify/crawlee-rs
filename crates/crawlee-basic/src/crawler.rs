@@ -1047,18 +1047,24 @@ where
             events.off(id);
         }
 
-        // Save the final state: the statistics and the sessions, then everything else that
-        // listens to `PersistState` (such as `use_state`).
-        inner.statistics_state.teardown().await;
-        if inner.options.use_session_pool {
-            inner.session_pool_state.teardown().await;
-        }
-        if owns_event_manager {
-            events.close().await;
-        } else {
-            events.emit(Event::PersistState { is_migrating: false });
-            events.wait_for_all_listeners_to_complete().await;
-        }
+        // Save the final state: the statistics, the sessions and everything else that listens to
+        // `PersistState` (such as `use_state`), all at once; JS saves them one after the other.
+        // Polled in order (`biased`): each teardown stops listening before its first `await`, so
+        // `PersistState`, emitted last, does not save the statistics or the sessions a second time.
+        let sessions = async {
+            if inner.options.use_session_pool {
+                inner.session_pool_state.teardown().await;
+            }
+        };
+        let others = async {
+            if owns_event_manager {
+                events.close().await;
+            } else {
+                events.emit(Event::PersistState { is_migrating: false });
+                events.wait_for_all_listeners_to_complete().await;
+            }
+        };
+        tokio::join!(biased; inner.statistics_state.teardown(), sessions, others);
 
         let stats = inner.statistics.snapshot();
         tracing::info!(
