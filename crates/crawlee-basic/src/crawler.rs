@@ -1047,6 +1047,19 @@ where
             events.off(id);
         }
 
+        // The final status message, from the final statistics, goes out with the final saves; JS
+        // sets it after them. No periodic status message comes after it.
+        status_logger.abort();
+        let stats = inner.statistics.snapshot();
+        self.set_status_message(
+            format!(
+                "Finished! Total {} requests: {} succeeded, {} failed.",
+                stats.requests_total, stats.requests_succeeded, stats.requests_failed
+            ),
+            StatusLevel::Info,
+            true,
+        );
+
         // Save the final state: the statistics, the sessions and everything else that listens to
         // `PersistState` (such as `use_state`), all at once; JS saves them one after the other.
         // Polled in order (`biased`): each teardown stops listening before its first `await`, so
@@ -1066,7 +1079,6 @@ where
         };
         tokio::join!(biased; inner.statistics_state.teardown(), sessions, others);
 
-        let stats = inner.statistics.snapshot();
         tracing::info!(
             requests_succeeded = stats.requests_succeeded,
             requests_failed = stats.requests_failed,
@@ -1111,15 +1123,6 @@ where
             result = result.and(Err(err.into()));
         }
 
-        status_logger.abort();
-        self.set_status_message(
-            format!(
-                "Finished! Total {} requests: {} succeeded, {} failed.",
-                stats.requests_total, stats.requests_succeeded, stats.requests_failed
-            ),
-            StatusLevel::Info,
-            true,
-        );
         if owns_concurrency {
             concurrency.stop();
         }

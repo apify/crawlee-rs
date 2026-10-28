@@ -1690,10 +1690,11 @@ impl crawlee_core::StorageBackend for SlowStatisticsWrites {
 }
 
 /// The final saves at the end of a run go out together: the statistics, the sessions and
-/// everything else that saves on `PersistState`. Crawlee for JS makes them one after the other.
+/// everything else that saves on `PersistState`, and the final status message with them. Crawlee
+/// for JS makes them one after the other.
 #[tokio::test]
 async fn the_final_saves_go_out_together() {
-    use crawlee_core::EventKind;
+    use crawlee_core::{Event, EventKind};
 
     let delay = Duration::from_millis(300);
     let writes = Arc::new(AtomicUsize::new(0));
@@ -1701,6 +1702,16 @@ async fn the_final_saves_go_out_together() {
         SlowStatisticsWrites { inner: crawlee_core::MemoryStorageBackend::new(), delay, writes: writes.clone() };
     let services = Services::new(Arc::new(backend));
     services.events.on(EventKind::PersistState, move |_| tokio::time::sleep(delay));
+    let finished_at = Arc::new(Mutex::new(None));
+    let set = finished_at.clone();
+    services.events.on(EventKind::StatusMessage, move |event| {
+        if let Event::StatusMessage(message) = event
+            && message.is_terminal
+        {
+            *set.lock() = Some(std::time::Instant::now());
+        }
+        async {}
+    });
     let crawler = BasicCrawler::builder()
         .services(services)
         .request_handler(|_ctx: BasicContext| async move { Ok(()) })
@@ -1709,6 +1720,12 @@ async fn the_final_saves_go_out_together() {
     let started = std::time::Instant::now();
     crawler.run(["https://a.dev/1"]).await.unwrap();
     let elapsed = started.elapsed();
+    let finished_at = finished_at.lock().expect("a final status message");
+    assert!(
+        finished_at.elapsed() >= delay - Duration::from_millis(50),
+        "the final status message waited for the saves: {:?} before the end",
+        finished_at.elapsed()
+    );
     assert!(elapsed >= delay, "{elapsed:?}");
     assert!(elapsed < delay * 2 - Duration::from_millis(50), "the saves went out one after the other: {elapsed:?}");
     assert_eq!(writes.load(Ordering::SeqCst), 1, "the statistics are saved once");
