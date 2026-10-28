@@ -1,9 +1,9 @@
 //! Autoscaling: the [`ConcurrencySystem`] decides how many requests run at once, from the load of
 //! the system. It is a port of `ConcurrencySystem`, `SystemStatus` and the load signals of Crawlee
-//! for JS, with the same defaults and the same algorithm:
+//! for JS, with the same algorithm and the same defaults except two, for the CPU signal (below):
 //!
 //! - **Starting a request.** A new request may start while fewer than `desired` requests run, and
-//!   only if the system was idle over the last 5 s. The exception is below
+//!   only if the system was idle over the last 20 s (5 s in Crawlee for JS). The exception is below
 //!   [`min_concurrency`](ConcurrencyOptions::min_concurrency), where a request may always start.
 //! - **Scaling up.** Every 10 s, `desired` grows by 5 % when the system was idle over the last
 //!   30 s and at least 90 % of `desired` is in use.
@@ -11,6 +11,10 @@
 //! - **What "overloaded" means.** The system is overloaded when any load signal is: memory,
 //!   CPU, runtime responsiveness or storage rate limits. A signal is overloaded when more than
 //!   its ratio of the sampled time was.
+//! - **The CPU signal** is overloaded when the CPU was flagged over 95 % of the window (40 % in
+//!   Crawlee for JS). The Apify platform flags a run that uses about its whole CPU share, which a
+//!   run near its best throughput does most of the time: with 0.4 over 5 s, requests started in
+//!   stop-and-go and the concurrency stayed far below the best throughput.
 //! - **Scaling-only signals** (not in Crawlee for JS). A signal whose
 //!   [`gates_task_start`](LoadSignal::gates_task_start) is `false` counts only in the scaling
 //!   decisions: its overload never holds back the start of a request.
@@ -88,7 +92,8 @@ pub struct ConcurrencyOptions {
     pub load_signals: LoadSignalsOptions,
     /// The window of the scaling decisions.
     pub snapshot_history: Duration,
-    /// The window of the decision to start a request.
+    /// The window of the decision to start a request: 20 s, not Crawlee for JS's 5 s, for the
+    /// CPU signal's ratio of 0.95 (see [`CpuLoadSignalOptions`]).
     pub current_history: Duration,
 }
 
@@ -106,7 +111,7 @@ impl Default for ConcurrencyOptions {
             max_tasks_per_minute: None,
             load_signals: LoadSignalsOptions::default(),
             snapshot_history: Duration::from_secs(30),
-            current_history: Duration::from_secs(5),
+            current_history: Duration::from_secs(20),
         }
     }
 }
@@ -148,7 +153,7 @@ impl SystemStatusInfo {
     }
 }
 
-/// Evaluates the signals over the current (5 s) and historical (30 s) windows.
+/// Evaluates the signals over the current (20 s) and historical (30 s) windows.
 pub struct SystemStatus {
     signals: Vec<Arc<dyn LoadSignal>>,
     current_history: Duration,
@@ -428,7 +433,7 @@ impl ConcurrencySystem {
         state.current = state.current.saturating_sub(1);
     }
 
-    /// The load over the current window (`current_history`, 5 s), which decides whether a task
+    /// The load over the current window (`current_history`, 20 s), which decides whether a task
     /// may start. Signals that do not [gate task starts](LoadSignal::gates_task_start) are
     /// listed, with `gates_task_start: false`, but do not count in `is_system_idle`.
     pub fn current_status(&self) -> SystemStatusInfo {
@@ -614,6 +619,17 @@ mod tests {
     }
 
     /// A contradictory pair (min above max) resolves in favour of the maximum, as in JS.
+    /// Not Crawlee for JS's 5 s: the window of the CPU signal's ratio of 0.95 (see
+    /// `CpuLoadSignalOptions`), long enough that a short pause in the CPU use does not count.
+    #[test]
+    fn a_task_starts_unless_a_signal_was_overloaded_over_the_last_20_s() {
+        let options = ConcurrencyOptions::default();
+        assert_eq!(options.current_history, Duration::from_secs(20));
+        assert_eq!(options.snapshot_history, Duration::from_secs(30));
+        assert_eq!(options.load_signals.cpu.unwrap().overloaded_ratio, 0.95);
+        assert_eq!(ConcurrencyOptions::http_optimized().current_history, Duration::from_secs(20));
+    }
+
     #[test]
     fn min_above_max_clamps_the_desired_concurrency_to_the_max() {
         let system = ConcurrencySystem::new(ConcurrencyOptions {
