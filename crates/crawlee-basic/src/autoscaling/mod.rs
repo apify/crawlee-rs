@@ -11,6 +11,9 @@
 //! - **What "overloaded" means.** The system is overloaded when any load signal is: memory,
 //!   CPU, runtime responsiveness or storage rate limits. A signal is overloaded when more than
 //!   its ratio of the sampled time was.
+//! - **Scaling-only signals** (not in Crawlee for JS). A signal whose
+//!   [`gates_task_start`](LoadSignal::gates_task_start) is `false` counts only in the scaling
+//!   decisions: its overload never holds back the start of a request.
 //!
 //! For a fixed concurrency, set `min_concurrency` and `max_concurrency` to the same value.
 
@@ -130,8 +133,12 @@ impl ConcurrencyOptions {
 /// The load of every signal over one window.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct SystemStatusInfo {
+    /// No signal that counts in this status is overloaded. The current status leaves out the
+    /// signals whose [`gates_task_start`](LoadSignalInfo::gates_task_start) is `false`; the
+    /// historical status counts every signal.
     pub is_system_idle: bool,
-    /// `(signal name, info)`, e.g. `("memInfo", ...)`.
+    /// `(signal name, info)`, e.g. `("memInfo", ...)`, for every signal, including those that do
+    /// not count in [`is_system_idle`](Self::is_system_idle).
     pub signals: Vec<(String, LoadSignalInfo)>,
 }
 
@@ -168,23 +175,39 @@ impl SystemStatus {
         self.current_history.max(self.history)
     }
 
+    /// The status over the current window, which decides whether a request may start. Only the
+    /// signals that [gate task starts](LoadSignal::gates_task_start) count in `is_system_idle`.
     pub fn current_status(&self) -> SystemStatusInfo {
-        self.status(self.current_history)
+        self.status(self.current_history, true)
     }
 
+    /// The status over the historical window, which drives the scaling. Every signal counts.
     pub fn historical_status(&self) -> SystemStatusInfo {
-        self.status(self.history)
+        self.status(self.history, false)
     }
 
-    fn status(&self, window: Duration) -> SystemStatusInfo {
+    /// `current_status().is_system_idle`, without sampling the signals that do not count in it.
+    fn is_idle_for_task_start(&self) -> bool {
+        self.signals.iter().filter(|signal| signal.gates_task_start()).all(|signal| {
+            !evaluate_sample(&signal.sample(Some(self.current_history)), signal.overloaded_ratio()).is_overloaded
+        })
+    }
+
+    fn status(&self, window: Duration, gating_only: bool) -> SystemStatusInfo {
         let signals: Vec<(String, LoadSignalInfo)> = self
             .signals
             .iter()
             .map(|signal| {
-                (signal.name().to_owned(), evaluate_sample(&signal.sample(Some(window)), signal.overloaded_ratio()))
+                let info = LoadSignalInfo {
+                    gates_task_start: signal.gates_task_start(),
+                    ..evaluate_sample(&signal.sample(Some(window)), signal.overloaded_ratio())
+                };
+                (signal.name().to_owned(), info)
             })
             .collect();
-        SystemStatusInfo { is_system_idle: signals.iter().all(|(_, info)| !info.is_overloaded), signals }
+        let is_system_idle =
+            signals.iter().all(|(_, info)| !info.is_overloaded || (gating_only && !info.gates_task_start));
+        SystemStatusInfo { is_system_idle, signals }
     }
 }
 
@@ -362,13 +385,14 @@ impl ConcurrencySystem {
     }
 
     /// Whether a task may start now: fewer than `desired` are running, and the system is idle
-    /// (or fewer than `min` are running).
+    /// in the [current status](Self::current_status) (or fewer than `min` are running).
+    /// Signals that do not [gate task starts](LoadSignal::gates_task_start) are not sampled.
     pub fn has_capacity_for_task(&self) -> bool {
         let state = self.state.lock();
         if state.current >= state.desired {
             return false;
         }
-        if state.current >= state.min && !self.status.current_status().is_system_idle {
+        if state.current >= state.min && !self.status.is_idle_for_task_start() {
             tracing::trace!("Task will not run. System is overloaded.");
             return false;
         }
@@ -404,8 +428,17 @@ impl ConcurrencySystem {
         state.current = state.current.saturating_sub(1);
     }
 
+    /// The load over the current window (`current_history`, 5 s), which decides whether a task
+    /// may start. Signals that do not [gate task starts](LoadSignal::gates_task_start) are
+    /// listed, with `gates_task_start: false`, but do not count in `is_system_idle`.
     pub fn current_status(&self) -> SystemStatusInfo {
         self.status.current_status()
+    }
+
+    /// The load over the historical window (`snapshot_history`, 30 s), which
+    /// [`autoscale`](Self::autoscale) scales on. Every signal counts in `is_system_idle`.
+    pub fn historical_status(&self) -> SystemStatusInfo {
+        self.status.historical_status()
     }
 
     /// One autoscaling step; runs every `autoscale_interval` while started.
@@ -435,11 +468,16 @@ impl ConcurrencySystem {
                 None => state.last_logged = Some(now),
                 Some(last) if now.duration_since(last) > interval => {
                     state.last_logged = Some(now);
-                    let overloaded: Vec<&str> = status
+                    // Signals that only steer scaling are marked, as they do not hold back requests.
+                    let overloaded: Vec<String> = status
                         .signals
                         .iter()
                         .filter(|(_, info)| info.is_overloaded)
-                        .map(|(name, _)| name.as_str())
+                        .map(
+                            |(name, info)| {
+                                if info.gates_task_start { name.clone() } else { format!("{name} (scaling only)") }
+                            },
+                        )
                         .collect();
                     tracing::info!(
                         current_concurrency = state.current,
@@ -481,19 +519,98 @@ mod tests {
         }
     }
 
+    /// A [`Switch`] that only steers scaling.
+    #[derive(Default)]
+    struct ScalingOnly(Switch);
+
+    impl LoadSignal for ScalingOnly {
+        fn name(&self) -> &str {
+            "scalingOnly"
+        }
+        fn overloaded_ratio(&self) -> f64 {
+            self.0.overloaded_ratio()
+        }
+        fn start(&self, _: &Services, _: Duration) {}
+        fn stop(&self) {}
+        fn sample(&self, duration: Option<Duration>) -> Vec<LoadSnapshot> {
+            self.0.sample(duration)
+        }
+        fn gates_task_start(&self) -> bool {
+            false
+        }
+    }
+
     fn system(options: ConcurrencyOptions, switch: &Arc<Switch>) -> ConcurrencySystem {
         let custom: Arc<dyn LoadSignal> = switch.clone();
+        system_with(options, vec![custom])
+    }
+
+    fn system_with(options: ConcurrencyOptions, custom: Vec<Arc<dyn LoadSignal>>) -> ConcurrencySystem {
         ConcurrencySystem::new(ConcurrencyOptions {
-            load_signals: LoadSignalsOptions {
-                memory: None,
-                event_loop: None,
-                cpu: None,
-                storage: None,
-                custom: vec![custom],
-            },
+            load_signals: LoadSignalsOptions { memory: None, event_loop: None, cpu: None, storage: None, custom },
             ..options
         })
         .unwrap()
+    }
+
+    /// A gating switch and a scaling-only one, both idle, in a system at its minimum
+    /// concurrency, where the load decides whether a task may start.
+    fn gating_and_scaling_only() -> (ConcurrencySystem, Arc<Switch>, Arc<ScalingOnly>) {
+        let (gating, scaling_only) = (Arc::new(Switch::default()), Arc::new(ScalingOnly::default()));
+        let system = system_with(
+            ConcurrencyOptions { desired_concurrency: Some(10), ..Default::default() },
+            vec![gating.clone(), scaling_only.clone()],
+        );
+        system.register_task_start();
+        assert!(system.has_capacity_for_task());
+        (system, gating, scaling_only)
+    }
+
+    #[test]
+    fn an_overloaded_scaling_only_signal_scales_down_without_holding_back_tasks() {
+        let (system, _, scaling_only) = gating_and_scaling_only();
+        scaling_only.0.overloaded.store(true, Ordering::SeqCst);
+
+        assert!(system.has_capacity_for_task());
+        let current = system.current_status();
+        assert!(current.is_system_idle);
+        let info = current.signal("scalingOnly").unwrap();
+        assert!(info.is_overloaded, "reported although it does not count");
+        assert!(!info.gates_task_start);
+        assert!(current.signal("switch").unwrap().gates_task_start);
+
+        let historical = system.historical_status();
+        assert!(!historical.is_system_idle);
+        assert!(!historical.signal("scalingOnly").unwrap().gates_task_start);
+        system.autoscale();
+        assert_eq!(system.desired_concurrency(), 9);
+    }
+
+    #[test]
+    fn an_overloaded_gating_signal_holds_back_tasks_and_scales_down() {
+        let (system, gating, _) = gating_and_scaling_only();
+        gating.overloaded.store(true, Ordering::SeqCst);
+
+        assert!(!system.has_capacity_for_task());
+        assert!(!system.current_status().is_system_idle);
+        assert!(!system.historical_status().is_system_idle);
+        system.autoscale();
+        assert_eq!(system.desired_concurrency(), 9);
+    }
+
+    #[test]
+    fn signals_gate_task_starts_by_default() {
+        let switch = Switch::default();
+        assert!(switch.gates_task_start(), "the default of the trait");
+        assert!(LoadSignalInfo::default().gates_task_start);
+        assert!(evaluate_sample(&switch.sample(None), 0.5).gates_task_start);
+
+        let system = ConcurrencySystem::new(ConcurrencyOptions::default()).unwrap();
+        for status in [system.current_status(), system.historical_status()] {
+            let names: Vec<&str> = status.signals.iter().map(|(name, _)| name.as_str()).collect();
+            assert_eq!(names, ["memInfo", "eventLoopInfo", "cpuInfo", "storageBackendInfo"]);
+            assert!(status.signals.iter().all(|(_, info)| info.gates_task_start));
+        }
     }
 
     /// A contradictory pair (min above max) resolves in favour of the maximum, as in JS.
