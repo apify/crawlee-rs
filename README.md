@@ -185,13 +185,17 @@ The goal was to keep Crawlee v4's architecture and change it only where Rust nee
 - **Errors.** Handlers return `anyhow::Result<()>`. To steer retries, return `SessionError`,
   `NonRetryableError`, `RetryRequestError`, `CriticalError` or `RequestThrottledError`; they are
   found anywhere in the error chain. The retry logic ports `requestFunctionErrorHandler`.
-- **Autoscaling** ports `ConcurrencySystem` with the same defaults:
+- **Autoscaling** ports `ConcurrencySystem` with the same defaults, except for the CPU signal:
   - It runs between `min_concurrency` (1) and `max_concurrency` (200). `HttpCrawler` and
     `HtmlCrawler` start at 10.
   - Every 10 s it scales by 5 % up or down, based on memory, CPU, storage rate limits and runtime
     responsiveness.
   - Runtime responsiveness stands in for the event loop signal of Node. It measures how late a
     timer task fires on the tokio runtime.
+  - The CPU signal holds back only when the CPU was flagged over 95 % of the last 20 s (Crawlee
+    for JS: 40 % of 5 s). On the Apify platform, a run near its best throughput uses its whole
+    CPU share most of the time, which the platform flags. See
+    [conformance/allowed-differences.md](conformance/allowed-differences.md).
   - `fixed_concurrency(n)` pins it, and `max_requests_per_minute` caps the rate.
   - Custom load signals can be added. Not in Crawlee for JS: a signal whose `gates_task_start()`
     returns `false` only steers scaling and never holds back a request start.

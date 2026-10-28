@@ -57,7 +57,7 @@ pub trait LoadSignal: Send + Sync + 'static {
     /// signal in Crawlee for JS.
     ///
     /// - `true`: the signal counts in both decisions. A request starts only if the signal was
-    ///   idle over the current window (`current_history`, 5 s), and autoscaling scales down when
+    ///   idle over the current window (`current_history`, 20 s), and autoscaling scales down when
     ///   it was overloaded over the historical window (`snapshot_history`, 30 s).
     /// - `false`: the signal only steers scaling. It counts in the historical status, but not in
     ///   the current one, so its overload never stops a request from starting. Use it for
@@ -299,12 +299,15 @@ impl LoadSignal for MemoryLoadSignal {
 
 #[derive(Clone, Copy, Debug)]
 pub struct CpuLoadSignalOptions {
+    /// 0.95, not Crawlee for JS's 0.4: overloaded only when the CPU was flagged nearly all of the
+    /// window. The Apify platform flags a run that uses about its whole CPU share, which a run
+    /// near its best throughput does most of the time, so 0.4 kept the concurrency far below it.
     pub overloaded_ratio: f64,
 }
 
 impl Default for CpuLoadSignalOptions {
     fn default() -> Self {
-        CpuLoadSignalOptions { overloaded_ratio: 0.4 }
+        CpuLoadSignalOptions { overloaded_ratio: 0.95 }
     }
 }
 
@@ -526,6 +529,39 @@ mod tests {
         assert_eq!(info.actual_ratio, 0.25);
         assert!(info.is_overloaded);
         assert!(!evaluate_sample(&sample, 0.3).is_overloaded);
+    }
+
+    /// Not Crawlee for JS's 0.4: overloaded only when the CPU was flagged nearly all of the window,
+    /// since a run near its best throughput uses its whole CPU share most of the time.
+    #[tokio::test]
+    async fn the_cpu_signal_is_overloaded_only_when_flagged_nearly_all_of_the_window() {
+        let services = Services::in_memory();
+        let signal = CpuLoadSignal::new(CpuLoadSignalOptions::default());
+        assert_eq!(signal.overloaded_ratio(), 0.95);
+        signal.start(&services, Duration::from_secs(60));
+        let info = |second: i64, flagged: bool| {
+            Event::SystemInfo(SystemInfo {
+                created_at: DateTime::from_timestamp_millis(1_000_000 + second * 1000).unwrap(),
+                cpu_current_usage: if flagged { 100.0 } else { 50.0 },
+                is_cpu_overloaded: flagged,
+                mem_total_bytes: None,
+                mem_current_bytes: None,
+            })
+        };
+        // One event a second, as on the Apify platform: 19 of the last 20 s flagged.
+        for second in 0..=20 {
+            services.events.emit(info(second, second != 10));
+        }
+        services.events.wait_for_all_listeners_to_complete().await;
+        let window = Some(Duration::from_secs(20));
+        assert!(!evaluate_sample(&signal.sample(window), signal.overloaded_ratio()).is_overloaded);
+        // 20 of 20.
+        for second in 21..=40 {
+            services.events.emit(info(second, true));
+        }
+        services.events.wait_for_all_listeners_to_complete().await;
+        signal.stop();
+        assert!(evaluate_sample(&signal.sample(window), signal.overloaded_ratio()).is_overloaded);
     }
 
     /// Like JS, a `SystemInfo` without the total memory (as some platforms send it) is measured
