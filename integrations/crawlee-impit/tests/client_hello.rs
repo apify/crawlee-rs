@@ -20,6 +20,11 @@ struct ClientHello {
     cipher_suites: Vec<u16>,
     extensions: Vec<u16>,
     alpn: Vec<String>,
+    /// `supported_groups`, and the groups of `key_share`, GREASE left out.
+    groups: Vec<u16>,
+    key_shares: Vec<u16>,
+    /// The bytes of the TLS record.
+    len: usize,
 }
 
 fn is_grease(value: u16) -> bool {
@@ -42,8 +47,21 @@ fn parse_client_hello(data: &[u8]) -> ClientHello {
 
     let mut extensions = Vec::new();
     let mut alpn = Vec::new();
+    let (mut groups, mut key_shares) = (Vec::new(), Vec::new());
     while pos + 4 <= extensions_end {
         let (kind, len) = (u16_at(pos), u16_at(pos + 2) as usize);
+        if kind == 10 {
+            // supported_groups: list length (2), then the groups.
+            groups = (0..u16_at(pos + 4) as usize / 2).map(|i| u16_at(pos + 6 + i * 2)).collect();
+        }
+        if kind == 51 {
+            // key_share: list length (2), then group (2) and length-prefixed key of each share.
+            let mut p = pos + 6;
+            while p < pos + 4 + len {
+                key_shares.push(u16_at(p));
+                p += 4 + u16_at(p + 2) as usize;
+            }
+        }
         if kind == 16 {
             // ALPN: list length (2), then length-prefixed protocol names.
             let mut p = pos + 6;
@@ -56,7 +74,9 @@ fn parse_client_hello(data: &[u8]) -> ClientHello {
         extensions.push(kind);
         pos += 4 + len;
     }
-    ClientHello { cipher_suites, extensions, alpn }
+    groups.retain(|group| !is_grease(*group));
+    key_shares.retain(|group| !is_grease(*group));
+    ClientHello { cipher_suites, extensions, alpn, groups, key_shares, len: data.len() }
 }
 
 async fn capture(transport: impl Transport + 'static) -> ClientHello {
@@ -125,4 +145,29 @@ async fn the_session_fingerprint_picks_the_browser() {
     let hello = capture_with(ImpitTransport::new(), options).await;
     assert!(!hello.cipher_suites.iter().copied().any(is_grease), "{hello:?}");
     assert!(hello.extensions.contains(&DELEGATED_CREDENTIALS), "{hello:?}");
+}
+
+/// Chrome offers the post-quantum hybrid X25519MLKEM768 first, with a 1,216-byte key share. Without
+/// it (not in Crawlee for JS), the ClientHello offers X25519, P-256 and P-384 with one 32-byte
+/// X25519 key share, as got-scraping's Chrome profile does: about 1.2 KB less per connection.
+#[tokio::test]
+async fn chrome_without_the_post_quantum_key_exchange() {
+    const X25519_MLKEM768: u16 = 0x11ec;
+    const X25519: u16 = 0x001d;
+    const SECP256R1: u16 = 0x0017;
+    const SECP384R1: u16 = 0x0018;
+    let chrome = capture(ImpitTransport::with_browser(Browser::Chrome)).await;
+    assert_eq!(chrome.groups, [X25519_MLKEM768, X25519, SECP256R1, SECP384R1], "{chrome:?}");
+    assert_eq!(chrome.key_shares, [X25519_MLKEM768, X25519], "{chrome:?}");
+
+    let classic = capture(ImpitTransport::with_browser(Browser::Chrome).without_post_quantum_key_exchange()).await;
+    assert_eq!(classic.groups, [X25519, SECP256R1, SECP384R1], "{classic:?}");
+    assert_eq!(classic.key_shares, [X25519], "{classic:?}");
+    let sorted = |hello: &ClientHello| {
+        let mut extensions: Vec<u16> = hello.extensions.iter().copied().filter(|e| !is_grease(*e)).collect();
+        extensions.sort_unstable();
+        extensions
+    };
+    assert_eq!(sorted(&classic), sorted(&chrome), "otherwise Chrome's");
+    assert!(chrome.len - classic.len > 1200, "{} -> {} bytes", chrome.len, classic.len);
 }
