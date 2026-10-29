@@ -1047,20 +1047,38 @@ where
             events.off(id);
         }
 
-        // Save the final state: the statistics and the sessions, then everything else that
-        // listens to `PersistState` (such as `use_state`).
-        inner.statistics_state.teardown().await;
-        if inner.options.use_session_pool {
-            inner.session_pool_state.teardown().await;
-        }
-        if owns_event_manager {
-            events.close().await;
-        } else {
-            events.emit(Event::PersistState { is_migrating: false });
-            events.wait_for_all_listeners_to_complete().await;
-        }
-
+        // The final status message, from the final statistics, goes out with the final saves; JS
+        // sets it after them. No periodic status message comes after it.
+        status_logger.abort();
         let stats = inner.statistics.snapshot();
+        self.set_status_message(
+            format!(
+                "Finished! Total {} requests: {} succeeded, {} failed.",
+                stats.requests_total, stats.requests_succeeded, stats.requests_failed
+            ),
+            StatusLevel::Info,
+            true,
+        );
+
+        // Save the final state: the statistics, the sessions and everything else that listens to
+        // `PersistState` (such as `use_state`), all at once; JS saves them one after the other.
+        // Polled in order (`biased`): each teardown stops listening before its first `await`, so
+        // `PersistState`, emitted last, does not save the statistics or the sessions a second time.
+        let sessions = async {
+            if inner.options.use_session_pool {
+                inner.session_pool_state.teardown().await;
+            }
+        };
+        let others = async {
+            if owns_event_manager {
+                events.close().await;
+            } else {
+                events.emit(Event::PersistState { is_migrating: false });
+                events.wait_for_all_listeners_to_complete().await;
+            }
+        };
+        tokio::join!(biased; inner.statistics_state.teardown(), sessions, others);
+
         tracing::info!(
             requests_succeeded = stats.requests_succeeded,
             requests_failed = stats.requests_failed,
@@ -1105,15 +1123,6 @@ where
             result = result.and(Err(err.into()));
         }
 
-        status_logger.abort();
-        self.set_status_message(
-            format!(
-                "Finished! Total {} requests: {} succeeded, {} failed.",
-                stats.requests_total, stats.requests_succeeded, stats.requests_failed
-            ),
-            StatusLevel::Info,
-            true,
-        );
         if owns_concurrency {
             concurrency.stop();
         }

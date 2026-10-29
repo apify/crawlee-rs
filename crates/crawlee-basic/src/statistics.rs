@@ -18,6 +18,8 @@ use serde_json::Value;
 #[derive(Debug)]
 pub struct Statistics {
     id: String,
+    /// Set by [`with_persist_state_key`](Self::with_persist_state_key).
+    persist_state_key: Option<String>,
     times: Mutex<Times>,
     /// The instance start was taken from a saved record, so `start()` keeps it.
     restored: AtomicBool,
@@ -128,6 +130,7 @@ impl Statistics {
     pub fn with_id(id: impl Into<String>) -> Self {
         Statistics {
             id: id.into(),
+            persist_state_key: None,
             times: Mutex::new(Times::default()),
             restored: AtomicBool::new(false),
             succeeded: AtomicU64::new(0),
@@ -146,9 +149,16 @@ impl Statistics {
         &self.id
     }
 
+    /// Saves the statistics under `key` instead of `CRAWLEE_CRAWLER_STATISTICS_{id}`, for example
+    /// under the `SDK_CRAWLER_STATISTICS_{id}` of Crawlee for JS 3. Not in Crawlee for JS 4.
+    pub fn with_persist_state_key(mut self, key: impl Into<String>) -> Self {
+        self.persist_state_key = Some(key.into());
+        self
+    }
+
     /// The key the statistics are saved under.
     pub fn persist_state_key(&self) -> String {
-        format!("CRAWLEE_CRAWLER_STATISTICS_{}", self.id)
+        self.persist_state_key.clone().unwrap_or_else(|| format!("CRAWLEE_CRAWLER_STATISTICS_{}", self.id))
     }
 
     pub fn start(&self) {
