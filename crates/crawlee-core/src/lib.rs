@@ -25,6 +25,7 @@ pub use crate::storage::dataset::{Dataset, DatasetExportOptions, DatasetStats};
 #[cfg(feature = "fs-storage")]
 pub use crate::storage::file_system::FileSystemStorageBackend;
 pub use crate::storage::key_value_store::{KeyValueStore, KeyValueStoreStats, RecordValue};
+pub use crate::storage::list_and_queue::RequestListAndQueue;
 pub use crate::storage::memory::MemoryStorageBackend;
 pub use crate::storage::request_list::{RequestList, RequestListOptions, RequestListSource, RequestListState};
 pub use crate::storage::request_loader::{

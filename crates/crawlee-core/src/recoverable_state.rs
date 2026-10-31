@@ -2,12 +2,15 @@
 //! on every [`Event::PersistState`](crate::events::Event::PersistState). It is the counterpart
 //! of `RecoverableState` in Crawlee for JS.
 //!
+//! Unlike in JS, a record equal to the one last saved (or restored) is not written again, and the
+//! state can also be saved on an interval of its own ([`RecoverableState::persist_every`]).
+//!
 //! The state itself lives in a type implementing [`PersistedState`], which decides what the record
 //! looks like. For plain serde types, [`SerdeState`] does that. The statistics and the session
 //! pool implement it themselves, so their records keep the exact shape Crawlee for JS writes.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use parking_lot::{Mutex, MutexGuard};
@@ -82,6 +85,11 @@ struct Inner<S> {
     listener: Mutex<Option<ListenerId>>,
     initialized: AtomicBool,
     loaded: AtomicBool,
+    /// The record last saved or restored, which a save leaves alone when the state still gives it.
+    /// Its lock also keeps saves from overtaking each other.
+    saved: tokio::sync::Mutex<Option<Value>>,
+    interval: Mutex<Option<Duration>>,
+    ticker: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 /// State saved under `key` in a key-value store (the default one unless set otherwise).
@@ -126,8 +134,19 @@ impl<S: PersistedState> RecoverableState<S> {
                 listener: Mutex::new(None),
                 initialized: AtomicBool::new(false),
                 loaded: AtomicBool::new(false),
+                saved: tokio::sync::Mutex::new(None),
+                interval: Mutex::new(None),
+                ticker: Mutex::new(None),
             }),
         }
+    }
+
+    /// Also saves the state every `interval` from [`initialize`](Self::initialize) until
+    /// [`teardown`](Self::teardown), when it changed: for state that should not wait for the next
+    /// `PersistState` event (every 60 s by default).
+    pub fn persist_every(self, interval: Duration) -> Self {
+        *self.inner.interval.lock() = Some(interval);
+        self
     }
 
     pub fn key(&self) -> &str {
@@ -157,10 +176,13 @@ impl<S: PersistedState> RecoverableState<S> {
             let record: Option<Value> = tokio::time::timeout(PERSISTENCE_TIMEOUT, store.get_value(&self.inner.key))
                 .await
                 .map_err(|_| self.timeout_error("Loading"))??;
-            if let Some(record) = record.filter(|record| !record.is_null())
-                && let Err(source) = self.inner.state.restore(record)
-            {
-                invalid = Some(StateValidationError { persist_state_key: self.inner.key.clone(), source });
+            if let Some(record) = record.filter(|record| !record.is_null()) {
+                match self.inner.state.restore(record.clone()) {
+                    Ok(()) => *self.inner.saved.lock().await = Some(record),
+                    Err(source) => {
+                        invalid = Some(StateValidationError { persist_state_key: self.inner.key.clone(), source })
+                    }
+                }
             }
         }
 
@@ -170,6 +192,11 @@ impl<S: PersistedState> RecoverableState<S> {
             async move { this.persist_quietly().await }
         });
         *self.inner.listener.lock() = Some(id);
+        let interval = *self.inner.interval.lock();
+        if let Some(interval) = interval {
+            let inner = Arc::downgrade(&self.inner);
+            *self.inner.ticker.lock() = Some(tokio::spawn(persist_periodically(inner, interval)));
+        }
         // As in JS, a record that cannot be restored fails the initialization, leaving the state
         // initialized (and saved on events) with its default value.
         match invalid {
@@ -183,6 +210,9 @@ impl<S: PersistedState> RecoverableState<S> {
         self.inner.initialized.store(false, Ordering::Release);
         if let Some(id) = self.inner.listener.lock().take() {
             self.inner.services.events.off(id);
+        }
+        if let Some(ticker) = self.inner.ticker.lock().take() {
+            ticker.abort();
         }
         self.persist_quietly().await;
     }
@@ -204,20 +234,28 @@ impl<S: PersistedState> RecoverableState<S> {
         if !self.inner.persistence_enabled {
             return Ok(());
         }
-        self.store().await?.delete_value(&self.inner.key).await
+        self.store().await?.delete_value(&self.inner.key).await?;
+        *self.inner.saved.lock().await = None;
+        Ok(())
     }
 
-    /// Saves the state now.
+    /// Saves the state now, unless the record would be the one last saved or restored.
     pub async fn persist(&self) -> StorageResult<()> {
         if !self.inner.persistence_enabled {
             return Ok(());
         }
         let store = self.store().await?;
-        tracing::debug!(key = %self.inner.key, "Persisting state.");
+        let mut saved = self.inner.saved.lock().await;
         let record = self.inner.state.to_record();
+        if saved.as_ref() == Some(&record) {
+            return Ok(());
+        }
+        tracing::debug!(key = %self.inner.key, "Persisting state.");
         tokio::time::timeout(PERSISTENCE_TIMEOUT, store.set_value(&self.inner.key, &record))
             .await
-            .map_err(|_| self.timeout_error("Persisting"))?
+            .map_err(|_| self.timeout_error("Persisting"))??;
+        *saved = Some(record);
+        Ok(())
     }
 
     async fn persist_quietly(&self) {
@@ -235,6 +273,15 @@ impl<S: PersistedState> RecoverableState<S> {
             )
             .into(),
         )
+    }
+}
+
+/// Saves the state every `interval` while it exists.
+async fn persist_periodically<S: PersistedState>(inner: Weak<Inner<S>>, interval: Duration) {
+    loop {
+        tokio::time::sleep(interval).await;
+        let Some(inner) = inner.upgrade() else { return };
+        RecoverableState { inner }.persist_quietly().await;
     }
 }
 
@@ -347,6 +394,118 @@ mod tests {
         assert_eq!(state.state().lock().count, 0);
         assert_eq!(services.events.listener_count(EventKind::PersistState), 1);
         state.initialize().await.unwrap();
+    }
+
+    /// A key-value store that counts the records written.
+    struct CountingWrites {
+        inner: Arc<dyn crate::storage::backend::KeyValueStoreBackend>,
+        writes: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage::backend::KeyValueStoreBackend for CountingWrites {
+        async fn get_metadata(&self) -> StorageResult<crate::storage::backend::KeyValueStoreInfo> {
+            self.inner.get_metadata().await
+        }
+        async fn drop_storage(&self) -> StorageResult<()> {
+            self.inner.drop_storage().await
+        }
+        async fn purge(&self) -> StorageResult<()> {
+            self.inner.purge().await
+        }
+        async fn get_value(&self, key: &str) -> StorageResult<Option<crate::storage::backend::KeyValueStoreRecord>> {
+            self.inner.get_value(key).await
+        }
+        async fn set_value(&self, record: crate::storage::backend::KeyValueStoreRecord) -> StorageResult<()> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            self.inner.set_value(record).await
+        }
+        async fn delete_value(&self, key: &str) -> StorageResult<()> {
+            self.inner.delete_value(key).await
+        }
+        async fn list_keys(
+            &self,
+            options: crate::storage::backend::KeyValueStoreListKeysOptions,
+        ) -> StorageResult<crate::storage::backend::KeyValueStoreListKeysResult> {
+            self.inner.list_keys(options).await
+        }
+        async fn record_exists(&self, key: &str) -> StorageResult<bool> {
+            self.inner.record_exists(key).await
+        }
+    }
+
+    /// A state saving into a [`CountingWrites`] store over the default one.
+    async fn counted_state(services: &Services) -> (RecoverableState<SerdeState<Counter>>, Arc<CountingWrites>) {
+        let state = RecoverableState::new(services, "COUNTER", Arc::new(SerdeState::new(Counter::default)), true);
+        let store = services.open_key_value_store(&StorageIdentifier::Default).await.unwrap();
+        let counting = Arc::new(CountingWrites { inner: store.backend().clone(), writes: Default::default() });
+        state.inner.store.set(KeyValueStore::from_backend(counting.clone())).unwrap();
+        (state, counting)
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_state_is_not_saved_again() {
+        let services = Services::in_memory();
+        let (state, counting) = counted_state(&services).await;
+        state.initialize().await.unwrap();
+        let writes = || counting.writes.load(Ordering::SeqCst);
+
+        state.persist().await.unwrap();
+        assert_eq!(writes(), 1, "the first save writes the record");
+        for _ in 0..3 {
+            services.events.emit(crate::events::Event::PersistState { is_migrating: false });
+            services.events.wait_for_all_listeners_to_complete().await;
+        }
+        state.persist().await.unwrap();
+        assert_eq!(writes(), 1, "nothing changed since");
+
+        state.state().lock().count = 1;
+        services.events.emit(crate::events::Event::PersistState { is_migrating: false });
+        services.events.wait_for_all_listeners_to_complete().await;
+        assert_eq!(writes(), 2);
+        state.teardown().await;
+        assert_eq!(writes(), 2, "the last save has nothing new either");
+
+        // A restored record counts as saved.
+        let (restored, counting) = counted_state(&services).await;
+        restored.initialize().await.unwrap();
+        assert_eq!(restored.state().lock().count, 1);
+        restored.persist().await.unwrap();
+        assert_eq!(counting.writes.load(Ordering::SeqCst), 0);
+        restored.state().lock().count = 2;
+        restored.teardown().await;
+        assert_eq!(counting.writes.load(Ordering::SeqCst), 1);
+
+        // Once its record is deleted, the state is saved again.
+        restored.reset_store().await.unwrap();
+        restored.persist().await.unwrap();
+        assert_eq!(counting.writes.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn saves_on_an_interval_when_the_state_changed() {
+        let services = Services::in_memory();
+        let (state, counting) = counted_state(&services).await;
+        let state = state.persist_every(Duration::from_secs(5));
+        state.initialize().await.unwrap();
+        let writes = || counting.writes.load(Ordering::SeqCst);
+
+        tokio::time::sleep(Duration::from_millis(5100)).await;
+        assert_eq!(writes(), 1, "the initial state, saved once");
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        assert_eq!(writes(), 1, "unchanged");
+
+        state.state().lock().count = 1;
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        assert_eq!(writes(), 2);
+        let store = services.open_key_value_store(&StorageIdentifier::Default).await.unwrap();
+        assert_eq!(store.get_value::<Counter>("COUNTER").await.unwrap(), Some(Counter { count: 1 }));
+
+        // The interval stops with the events.
+        state.teardown().await;
+        state.state().lock().count = 2;
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        assert_eq!(writes(), 2);
     }
 
     #[tokio::test]

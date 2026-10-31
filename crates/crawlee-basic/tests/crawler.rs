@@ -1546,6 +1546,115 @@ async fn crawls_a_request_list_through_the_queue() {
     assert!(matches!(built, Err(crawlee_basic::BuildError::RequestListWithRequestManager)));
 }
 
+/// What the Apify SDK does on a graceful abort: `Aborting`, then the exit's last `PersistState`
+/// right away, then it waits for the listeners (the crawler's pause) before the process ends.
+#[tokio::test]
+async fn an_abort_saves_the_request_list_once_the_running_requests_finished() {
+    use crawlee_core::{Event, RequestList, RequestListOptions, RequestListState, StorageIdentifier};
+
+    let services = services();
+    let options = RequestListOptions {
+        sources: ["https://a.dev/1", "https://a.dev/2"].into_iter().map(Into::into).collect(),
+        persist_state_key: Some("INPUTS".into()),
+        ..RequestListOptions::default()
+    };
+    let list = RequestList::open_with_options(&services, options).await.unwrap();
+    let started = Arc::new(AtomicUsize::new(0));
+    let counter = started.clone();
+    let crawler = BasicCrawler::builder()
+        .services(services.clone())
+        .max_concurrency(1)
+        .request_manager(Arc::new(list.with_queue(None).await.unwrap()))
+        .request_handler(move |_ctx: BasicContext| {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                Ok(())
+            }
+        })
+        .build()
+        .unwrap();
+    let run = tokio::spawn({
+        let crawler = crawler.clone();
+        async move { crawler.run(Vec::<String>::new()).await }
+    });
+    while started.load(Ordering::SeqCst) == 0 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    services.events.emit(Event::Aborting);
+    services.events.emit(Event::PersistState { is_migrating: false });
+    services.events.wait_for_all_listeners_to_complete().await;
+
+    // The request running at the abort finished during the pause: saved as handled, not in
+    // progress, so a resurrected run does not crawl it again.
+    let store = services.open_key_value_store(&StorageIdentifier::Default).await.unwrap();
+    let saved: RequestListState = store.get_value("CRAWLEE_INPUTS").await.unwrap().unwrap();
+    assert_eq!((saved.next_index, saved.in_progress), (1, Vec::<String>::new()));
+    run.abort();
+}
+
+#[tokio::test]
+async fn crawls_a_request_list_beside_the_queue() {
+    use crawlee_core::{RequestList, RequestManager, StorageIdentifier};
+
+    let services = services();
+    let list =
+        RequestList::open(&services, None, ["https://a.dev/1", "https://a.dev/2", "https://a.dev/3"]).await.unwrap();
+    let queue = Arc::new(services.open_request_queue(&StorageIdentifier::alias("beside")).await.unwrap());
+    let manager = Arc::new(list.with_queue(Some(queue.clone())).await.unwrap());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let crawler = BasicCrawler::builder()
+        .services(services.clone())
+        .max_concurrency(1)
+        .request_manager(manager.clone())
+        .request_handler(move |mut ctx: BasicContext| {
+            let log = log.clone();
+            async move {
+                let (url, retry_count) = (ctx.request().url.clone(), ctx.request().retry_count);
+                log.lock().push((url.clone(), retry_count));
+                match (url.as_str(), retry_count) {
+                    // Adds a new request and one the list has.
+                    ("https://a.dev/1", 0) => {
+                        ctx.add_requests(["https://a.dev/new", "https://a.dev/2"]).await?;
+                        anyhow::bail!("fails once, unchanged")
+                    }
+                    ("https://a.dev/2", 0) => {
+                        ctx.request_mut().user_data.insert("tried".into(), json!(true));
+                        anyhow::bail!("fails once, changed")
+                    }
+                    _ => Ok(()),
+                }
+            }
+        })
+        .build()
+        .unwrap();
+
+    let stats = crawler.run(Vec::<String>::new()).await.unwrap();
+    assert_eq!((stats.requests_succeeded, stats.requests_failed), (4, 0));
+    let seen: Vec<(String, u32)> = seen.lock().clone();
+    let seen: Vec<(&str, u32)> = seen.iter().map(|(url, retries)| (url.as_str(), *retries)).collect();
+    assert_eq!(
+        seen,
+        [
+            // The queue first: what the run added, then the unchanged retry from the list.
+            ("https://a.dev/1", 0),
+            ("https://a.dev/new", 0),
+            ("https://a.dev/1", 1),
+            // The changed retry, at the front of the queue, before the rest of the list.
+            ("https://a.dev/2", 0),
+            ("https://a.dev/2", 1),
+            ("https://a.dev/3", 0),
+        ]
+    );
+    // The queue got only the new request and the changed retry.
+    assert_eq!(queue.total_count().await.unwrap(), 2);
+    assert_eq!(manager.handled_count().await.unwrap(), 4);
+    assert!(manager.is_finished().await.unwrap());
+}
+
 /// A crawler whose every request to `a.dev` is answered with a 429, through a throttling manager
 /// that gives up on a domain after `max_domain_stall`.
 async fn always_rate_limited(services: &Services, keep_alive: bool, hits: Arc<AtomicUsize>) -> BasicCrawler {

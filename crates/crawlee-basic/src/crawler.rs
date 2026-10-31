@@ -803,8 +803,20 @@ where
                  time. Those requests' results may be duplicated."
             );
         }
-        if let Err(err) = self.inner.statistics_state.persist().await {
+        // Now that the running requests finished, as in JS: a request list saved earlier (by the
+        // `PersistState` of an exit) still has them in progress, and would crawl them again.
+        let request_manager = async {
+            match self.shared().await {
+                Ok(shared) => shared.request_manager.persist_state().await.map_err(anyhow::Error::from),
+                Err(err) => Err(err),
+            }
+        };
+        let (statistics, request_manager) = tokio::join!(self.inner.statistics_state.persist(), request_manager);
+        if let Err(err) = statistics {
             tracing::warn!("Failed to persist the statistics: {err}");
+        }
+        if let Err(err) = request_manager {
+            tracing::warn!("Failed to persist the state of the request manager: {err}");
         }
     }
 
