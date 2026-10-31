@@ -716,6 +716,11 @@ impl RequestLoader for RequestList {
     async fn total_count(&self) -> StorageResult<u64> {
         Ok(self.state.state().requests.len() as u64)
     }
+
+    /// Saves the position now, when it is saved at all (with a `persist_state_key`).
+    async fn persist_state(&self) -> StorageResult<()> {
+        self.state.persist().await
+    }
 }
 
 #[cfg(test)]

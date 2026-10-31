@@ -1546,6 +1546,55 @@ async fn crawls_a_request_list_through_the_queue() {
     assert!(matches!(built, Err(crawlee_basic::BuildError::RequestListWithRequestManager)));
 }
 
+/// What the Apify SDK does on a graceful abort: `Aborting`, then the exit's last `PersistState`
+/// right away, then it waits for the listeners (the crawler's pause) before the process ends.
+#[tokio::test]
+async fn an_abort_saves_the_request_list_once_the_running_requests_finished() {
+    use crawlee_core::{Event, RequestList, RequestListOptions, RequestListState, StorageIdentifier};
+
+    let services = services();
+    let options = RequestListOptions {
+        sources: ["https://a.dev/1", "https://a.dev/2"].into_iter().map(Into::into).collect(),
+        persist_state_key: Some("INPUTS".into()),
+        ..RequestListOptions::default()
+    };
+    let list = RequestList::open_with_options(&services, options).await.unwrap();
+    let started = Arc::new(AtomicUsize::new(0));
+    let counter = started.clone();
+    let crawler = BasicCrawler::builder()
+        .services(services.clone())
+        .max_concurrency(1)
+        .request_manager(Arc::new(list.with_queue(None).await.unwrap()))
+        .request_handler(move |_ctx: BasicContext| {
+            let counter = counter.clone();
+            async move {
+                counter.fetch_add(1, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                Ok(())
+            }
+        })
+        .build()
+        .unwrap();
+    let run = tokio::spawn({
+        let crawler = crawler.clone();
+        async move { crawler.run(Vec::<String>::new()).await }
+    });
+    while started.load(Ordering::SeqCst) == 0 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    services.events.emit(Event::Aborting);
+    services.events.emit(Event::PersistState { is_migrating: false });
+    services.events.wait_for_all_listeners_to_complete().await;
+
+    // The request running at the abort finished during the pause: saved as handled, not in
+    // progress, so a resurrected run does not crawl it again.
+    let store = services.open_key_value_store(&StorageIdentifier::Default).await.unwrap();
+    let saved: RequestListState = store.get_value("CRAWLEE_INPUTS").await.unwrap().unwrap();
+    assert_eq!((saved.next_index, saved.in_progress), (1, Vec::<String>::new()));
+    run.abort();
+}
+
 #[tokio::test]
 async fn crawls_a_request_list_beside_the_queue() {
     use crawlee_core::{RequestList, RequestManager, StorageIdentifier};
