@@ -30,8 +30,8 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use http::Method;
 use impit::errors::ImpitError;
-use impit::fingerprint::BrowserFingerprint;
 use impit::fingerprint::database as fingerprints;
+use impit::fingerprint::{BrowserFingerprint, KeyExchangeGroup};
 use impit::impit::{Impit, RedirectBehavior};
 use impit::request::{ImpitBody, RequestOptions};
 use parking_lot::Mutex;
@@ -201,6 +201,8 @@ impl VersionsByFingerprint {
 pub struct ImpitTransport {
     browser: Option<Browser>,
     cache_clients: bool,
+    /// Set by [`without_post_quantum_key_exchange`](Self::without_post_quantum_key_exchange).
+    classic_key_exchange: bool,
     clients: Mutex<ClientCache>,
     versions: Mutex<VersionsByFingerprint>,
 }
@@ -221,7 +223,13 @@ impl ImpitTransport {
     /// Impersonates the browser of each session's fingerprint, in a version picked once per
     /// session. Requests without a fingerprint use impit's defaults.
     pub fn new() -> Self {
-        ImpitTransport { browser: None, cache_clients: true, clients: Mutex::default(), versions: Mutex::default() }
+        ImpitTransport {
+            browser: None,
+            cache_clients: true,
+            classic_key_exchange: false,
+            clients: Mutex::default(),
+            versions: Mutex::default(),
+        }
     }
 
     /// Impersonates `browser` for every request, whatever the session's fingerprint says.
@@ -246,6 +254,15 @@ impl ImpitTransport {
     /// reuse connections.
     pub fn with_cache_clients(mut self, cache_clients: bool) -> Self {
         self.cache_clients = cache_clients;
+        self
+    }
+
+    /// Leaves the post-quantum hybrid X25519MLKEM768 out of the browser's key exchange groups, so
+    /// the ClientHello offers X25519 first, with one 32-byte key share instead of a 1,216-byte one,
+    /// as got-scraping's browser profiles do. Saves about 1.2 KB per connection, and about as much
+    /// again from servers that would pick the hybrid. Not in Crawlee for JS.
+    pub fn without_post_quantum_key_exchange(mut self) -> Self {
+        self.classic_key_exchange = true;
         self
     }
 
@@ -274,7 +291,11 @@ impl ImpitTransport {
             .with_redirect(RedirectBehavior::ManualRedirect)
             .with_ignore_tls_errors(options.ignore_tls_errors);
         if let Some(browser) = browser {
-            builder = builder.with_fingerprint(browser.fingerprint());
+            let mut fingerprint = browser.fingerprint();
+            if self.classic_key_exchange {
+                fingerprint.tls.key_exchange_groups.retain(|group| *group != KeyExchangeGroup::X25519MLKEM768);
+            }
+            builder = builder.with_fingerprint(fingerprint);
         }
         if let Some(proxy) = &options.proxy_url {
             builder = builder.with_proxy(proxy.to_string());
