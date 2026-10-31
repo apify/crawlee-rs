@@ -1549,7 +1549,7 @@ async fn crawls_a_request_list_through_the_queue() {
 /// What the Apify SDK does on a graceful abort: `Aborting`, then the exit's last `PersistState`
 /// right away, then it waits for the listeners (the crawler's pause) before the process ends.
 #[tokio::test]
-async fn an_abort_saves_the_request_list_once_the_running_requests_finished() {
+async fn an_abort_saves_all_state_once_the_running_requests_finished() {
     use crawlee_core::{Event, RequestList, RequestListOptions, RequestListState, StorageIdentifier};
 
     let services = services();
@@ -1563,13 +1563,17 @@ async fn an_abort_saves_the_request_list_once_the_running_requests_finished() {
     let counter = started.clone();
     let crawler = BasicCrawler::builder()
         .services(services.clone())
+        .id("abort")
         .max_concurrency(1)
         .request_manager(Arc::new(list.with_queue(None).await.unwrap()))
-        .request_handler(move |_ctx: BasicContext| {
+        .request_handler(move |ctx: BasicContext| {
             let counter = counter.clone();
             async move {
                 counter.fetch_add(1, Ordering::SeqCst);
                 tokio::time::sleep(Duration::from_millis(200)).await;
+                let state = ctx.use_state(|| json!({ "pages": 0 })).await?;
+                let mut state = state.lock();
+                state["pages"] = json!(state["pages"].as_u64().unwrap() + 1);
                 Ok(())
             }
         })
@@ -1587,11 +1591,13 @@ async fn an_abort_saves_the_request_list_once_the_running_requests_finished() {
     services.events.emit(Event::PersistState { is_migrating: false });
     services.events.wait_for_all_listeners_to_complete().await;
 
-    // The request running at the abort finished during the pause: saved as handled, not in
-    // progress, so a resurrected run does not crawl it again.
+    // The request running at the abort finished during the pause, and every state was saved after
+    // it: the list has it handled, not in progress, so a resurrected run does not crawl it again,
+    // and the state it changed is saved too.
     let store = services.open_key_value_store(&StorageIdentifier::Default).await.unwrap();
     let saved: RequestListState = store.get_value("CRAWLEE_INPUTS").await.unwrap().unwrap();
     assert_eq!((saved.next_index, saved.in_progress), (1, Vec::<String>::new()));
+    assert_eq!(store.get_value::<Value>("CRAWLEE_STATE_abort").await.unwrap(), Some(json!({ "pages": 1 })));
     run.abort();
 }
 

@@ -185,11 +185,6 @@ impl RequestManager for RequestListAndQueue {
         self.queue.extend_request_processing_time(request, by).await
     }
 
-    async fn persist_state(&self) -> StorageResult<()> {
-        let (list, queue) = tokio::join!(RequestLoader::persist_state(&self.list), self.queue.persist_state());
-        list.and(queue)
-    }
-
     fn record_pacing_signal(&self, signal: &PacingSignal) -> bool {
         self.queue.record_pacing_signal(signal)
     }

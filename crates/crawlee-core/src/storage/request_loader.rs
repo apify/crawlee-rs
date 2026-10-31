@@ -104,10 +104,6 @@ pub trait RequestLoader: Send + Sync {
     async fn total_count(&self) -> StorageResult<u64> {
         Ok(self.handled_count().await? + self.pending_count().await?)
     }
-    /// Saves the loader's state, if it keeps one (see [`RequestManager::persist_state`]).
-    async fn persist_state(&self) -> StorageResult<()> {
-        Ok(())
-    }
 }
 
 /// A [`RequestLoader`] in front of a [`RequestManager`]: each fetch first moves one request from
@@ -207,11 +203,6 @@ impl RequestManager for RequestManagerTandem {
 
     async fn extend_request_processing_time(&self, request: &Request, by: Duration) -> StorageResult<bool> {
         self.manager.extend_request_processing_time(request, by).await
-    }
-
-    async fn persist_state(&self) -> StorageResult<()> {
-        let (loader, manager) = tokio::join!(self.loader.persist_state(), self.manager.persist_state());
-        loader.and(manager)
     }
 
     fn record_pacing_signal(&self, signal: &PacingSignal) -> bool {

@@ -673,10 +673,6 @@ impl RequestManager for ThrottlingRequestManager {
         self.0.inner_manager.set_expected_request_processing_time(duration).await
     }
 
-    async fn persist_state(&self) -> StorageResult<()> {
-        self.0.inner_manager.persist_state().await
-    }
-
     /// The earliest moment a held-back domain with a queue may be fetched from again.
     fn ready_at(&self) -> Option<std::time::Instant> {
         let state = self.0.state.lock();

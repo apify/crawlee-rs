@@ -73,12 +73,6 @@ pub trait RequestManager: Send + Sync {
     async fn extend_request_processing_time(&self, _request: &Request, _by: Duration) -> StorageResult<bool> {
         Ok(false)
     }
-    /// Saves the state the manager keeps itself, such as the position of a request list. The
-    /// crawler calls it once its running requests finished before a migration or an abort, as it
-    /// saves a request list then in JS. Nothing by default.
-    async fn persist_state(&self) -> StorageResult<()> {
-        Ok(())
-    }
 
     /// Whether a request can be fetched now, later, never, or all work is done
     /// (`checkReadiness`). By default, from [`is_empty`](Self::is_empty),

@@ -796,28 +796,21 @@ where
     }
 
     /// On a migration or abort: let running requests finish, then save the statistics.
-    async fn pause_on_migration(&self) {
+    /// Pauses the crawl until the running requests finished (for at most `SAFE_MIGRATION_WAIT`),
+    /// then saves every state after them, all at once: the statistics, the sessions, a request
+    /// list, `use_state` and any other `RecoverableState`. In JS, the state is saved as the
+    /// migration or abort starts, while requests still run, and only the statistics after them; a
+    /// request that finished meanwhile stayed in progress in a saved request list and was crawled
+    /// again. The saves are not awaited here, in a listener: whoever waits for the listeners (the
+    /// Apify SDK's exit and reboot) waits for them too.
+    async fn pause_on_migration(&self, is_migrating: bool) {
         if self.pause(SAFE_MIGRATION_WAIT).await.is_err() {
             tracing::error!(
                 "The crawler was paused due to migration to another host, but some requests did not finish in \
                  time. Those requests' results may be duplicated."
             );
         }
-        // Now that the running requests finished, as in JS: a request list saved earlier (by the
-        // `PersistState` of an exit) still has them in progress, and would crawl them again.
-        let request_manager = async {
-            match self.shared().await {
-                Ok(shared) => shared.request_manager.persist_state().await.map_err(anyhow::Error::from),
-                Err(err) => Err(err),
-            }
-        };
-        let (statistics, request_manager) = tokio::join!(self.inner.statistics_state.persist(), request_manager);
-        if let Err(err) = statistics {
-            tracing::warn!("Failed to persist the statistics: {err}");
-        }
-        if let Err(err) = request_manager {
-            tracing::warn!("Failed to persist the state of the request manager: {err}");
-        }
+        self.inner.services.events.emit(Event::PersistState { is_migrating });
     }
 
     /// Updates the status message every `status_message_interval` until the returned task is
@@ -1035,7 +1028,7 @@ where
             let crawler = self.clone();
             events.on(kind, move |_| {
                 let crawler = crawler.clone();
-                async move { crawler.pause_on_migration().await }
+                async move { crawler.pause_on_migration(kind == EventKind::Migrating).await }
             })
         });
         let sigint = sigint::listen();
@@ -1046,7 +1039,8 @@ where
                 tracing::warn!(
                     "Pausing... Press CTRL+C again to force exit. To resume, do: CRAWLEE_PURGE_ON_START=0 cargo run"
                 );
-                crawler.pause_on_migration().await;
+                crawler.pause_on_migration(false).await;
+                crawler.inner.services.events.wait_for_all_listeners_to_complete().await;
                 run.abort();
             })
         };
