@@ -316,12 +316,9 @@ fn ensure_unique_key_valid(unique_key: &str) -> StorageResult<()> {
 pub struct RequestList {
     services: Services,
     state: RecoverableState<ListState>,
-    /// Requests to serve again first: those in progress when the state was restored, and those
-    /// reclaimed to the front in a [`RequestListAndQueue`].
+    /// Requests to serve again before the rest of the list: those in progress when the state was
+    /// restored, and those reclaimed in a [`RequestListAndQueue`].
     requests_to_retry: Arc<Mutex<VecDeque<String>>>,
-    /// Requests reclaimed (not to the front) in a [`RequestListAndQueue`]: served again after the
-    /// rest of the list, as a tandem's queue serves them.
-    requests_to_retry_last: Arc<Mutex<VecDeque<String>>>,
     /// The reclaimed requests, as they were reclaimed (with their error messages).
     reclaimed: Arc<Mutex<HashMap<String, Request>>>,
     persist_state_key: Option<String>,
@@ -421,7 +418,6 @@ impl RequestList {
             services: services.clone(),
             state,
             requests_to_retry: Arc::new(Mutex::new(requests_to_retry)),
-            requests_to_retry_last: Arc::default(),
             reclaimed: Arc::default(),
             persist_state_key,
             are_requests_persisted: Arc::new(AtomicBool::new(are_requests_persisted)),
@@ -540,10 +536,11 @@ impl RequestList {
             position.retries.remove(unique_key);
         }
         reclaimed.insert(unique_key.clone(), request.clone());
+        let mut requests_to_retry = self.requests_to_retry.lock();
         if forefront {
-            self.requests_to_retry.lock().push_front(unique_key.clone());
+            requests_to_retry.push_front(unique_key.clone());
         } else {
-            self.requests_to_retry_last.lock().push_back(unique_key.clone());
+            requests_to_retry.push_back(unique_key.clone());
         }
         Reclaimed::Kept
     }
@@ -563,7 +560,7 @@ impl RequestList {
             position.retries.insert(unique_key.clone(), request.retry_count);
         }
         self.reclaimed.lock().insert(unique_key.clone(), request.clone());
-        self.requests_to_retry_last.lock().push_back(unique_key.clone());
+        self.requests_to_retry.lock().push_back(unique_key.clone());
     }
 }
 
@@ -664,12 +661,9 @@ fn deserialize_requests(compressed: &[u8]) -> StorageResult<Vec<Request>> {
 impl RequestLoader for RequestList {
     async fn fetch_next_request(&self) -> StorageResult<Option<Request>> {
         let list = self.state.state();
-        // First the requests interrupted before the state was saved, and those reclaimed to the
-        // front; the other reclaimed ones after the rest of the list.
-        let mut retry = self.requests_to_retry.lock().pop_front();
-        if retry.is_none() && list.position.lock().next_index >= list.requests.len() {
-            retry = self.requests_to_retry_last.lock().pop_front();
-        }
+        // First the requests interrupted before the state was saved, and those reclaimed: unlike
+        // in a tandem's queue, retries do not wait for the rest of the list, so they never pile up.
+        let retry = self.requests_to_retry.lock().pop_front();
         if let Some(unique_key) = retry {
             if let Some(request) = self.reclaimed.lock().remove(&unique_key) {
                 return Ok(Some(request));
@@ -701,10 +695,7 @@ impl RequestLoader for RequestList {
     async fn status(&self) -> StorageResult<LoaderStatus> {
         let list = self.state.state();
         let position = list.position.lock();
-        if !self.requests_to_retry.lock().is_empty()
-            || position.next_index < list.requests.len()
-            || !self.requests_to_retry_last.lock().is_empty()
-        {
+        if !self.requests_to_retry.lock().is_empty() || position.next_index < list.requests.len() {
             return Ok(LoaderStatus::Ready);
         }
         // The requests to retry are in progress, so nothing in progress means nothing left.
