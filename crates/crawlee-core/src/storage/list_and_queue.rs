@@ -13,21 +13,19 @@
 //! - **A failed request stays in the list** and is served again, unless a handler changed its data
 //!   (user data, headers, ...): that one is added to the front of the queue, which keeps a request
 //!   whole, and the queue serves it from then on.
-//! - **Retries are served next**, before the rest of the list, from the list or from the queue.
-//!   In a tandem, a retry goes to the back of the queue, behind every list request not fetched
-//!   yet: in a large list, retries would pile up until its end.
+//! - **The queue is served first**, then the list: what the run added, and the retries, before
+//!   the next list request. In a tandem, every list request goes to the front of the queue, so the
+//!   requests a run adds and its retries wait behind the whole list, and pile up in a large one.
+//! - **Retries are served next**: the list's before its next request, the changed ones at the
+//!   front of the queue.
 //! - **A request added during the run whose unique key is in the list is not added**: it is
 //!   reported as already present (and handled if the list handled it).
-//! - **Otherwise the list is served first**, then the queue, as the tandem does by adding each
-//!   list request to the front of the queue.
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
-use parking_lot::Mutex;
 
 use super::backend::{BatchAddRequestsResult, ProcessedRequest, QueueOperationInfo};
 use super::batched_adds::{AddRequestsBatchedOptions, AddRequestsBatchedResult};
@@ -44,13 +42,11 @@ pub struct RequestListAndQueue {
     queue: Arc<dyn RequestManager>,
     /// The list's requests handed over to the queue, which count there.
     moved: AtomicU64,
-    /// Those not fetched from the queue yet: the queue goes first while there are any.
-    moved_waiting: Mutex<HashSet<String>>,
 }
 
 impl RequestListAndQueue {
     pub(crate) fn new(list: RequestList, queue: Arc<dyn RequestManager>) -> Self {
-        RequestListAndQueue { list, queue, moved: AtomicU64::new(0), moved_waiting: Mutex::default() }
+        RequestListAndQueue { list, queue, moved: AtomicU64::new(0) }
     }
 
     pub fn list(&self) -> &RequestList {
@@ -103,23 +99,13 @@ impl RequestManager for RequestListAndQueue {
     }
 
     async fn fetch_next_request(&self) -> StorageResult<Option<Request>> {
-        // A retry handed over to the queue is at its front.
-        if !self.moved_waiting.lock().is_empty()
-            && let Some(request) = self.queue.fetch_next_request().await?
-        {
-            self.moved_waiting.lock().remove(&request.unique_key);
+        if let Some(request) = self.queue.fetch_next_request().await? {
             return Ok(Some(request));
         }
-        if self.list.status().await? == LoaderStatus::Ready
-            && let Some(request) = self.list.fetch_next_request().await?
-        {
-            return Ok(Some(request));
+        if self.list.status().await? == LoaderStatus::Ready {
+            return self.list.fetch_next_request().await;
         }
-        let request = self.queue.fetch_next_request().await?;
-        if let Some(request) = &request {
-            self.moved_waiting.lock().remove(&request.unique_key);
-        }
-        Ok(request)
+        Ok(None)
     }
 
     async fn mark_request_as_handled(&self, request: &mut Request) -> StorageResult<Option<QueueOperationInfo>> {
@@ -149,7 +135,6 @@ impl RequestManager for RequestListAndQueue {
                 self.list.finish_move(request, added_ok);
                 if added_ok {
                     self.moved.fetch_add(1, Ordering::Relaxed);
-                    self.moved_waiting.lock().insert(request.unique_key.clone());
                 }
                 let result = added?;
                 Ok(result.processed_requests.into_iter().next().map(|processed| QueueOperationInfo {
@@ -230,17 +215,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serves_the_list_first_and_keeps_its_requests_out_of_the_queue() {
+    async fn serves_the_queue_first_and_keeps_the_list_requests_out_of_it() {
         let services = Services::in_memory();
         let (manager, queue) = open(&services, &["1", "2"]).await;
+        let mut first = manager.fetch_next_request().await.unwrap().unwrap();
         manager.add_requests(vec![url("queued").into()], false).await.unwrap();
+        manager.mark_request_as_handled(&mut first).await.unwrap();
 
-        let mut urls = Vec::new();
+        let mut urls = vec![first.url];
         while let Some(mut request) = manager.fetch_next_request().await.unwrap() {
             urls.push(request.url.clone());
             manager.mark_request_as_handled(&mut request).await.unwrap();
         }
-        assert_eq!(urls, [url("1"), url("2"), url("queued")]);
+        // What the run added before the next input.
+        assert_eq!(urls, [url("1"), url("queued"), url("2")]);
         assert!(manager.is_finished().await.unwrap());
         assert_eq!(queue.total_count().await.unwrap(), 1, "only the request added during the run");
         assert_eq!(manager.handled_count().await.unwrap(), 3);
@@ -311,26 +299,26 @@ mod tests {
     async fn a_retry_with_changed_data_moves_to_the_queue() {
         let services = Services::in_memory();
         let (manager, queue) = open(&services, &["1", "2"]).await;
-        manager.add_requests(vec![url("queued").into()], false).await.unwrap();
         let mut request = manager.fetch_next_request().await.unwrap().unwrap();
+        manager.add_requests(vec![url("queued").into()], false).await.unwrap();
         request.retry_count = 1;
         request.user_data.insert("attempts".into(), json!(1));
         manager.reclaim_request(&request, false).await.unwrap();
         assert_eq!(queue.total_count().await.unwrap(), 2);
         assert_eq!(manager.list.get_state().in_progress, Vec::<String>::new(), "handed over");
 
-        // Retried next too, ahead of the rest of the list and of the queue.
+        // Retried next too: at the front of the queue, which goes first.
         let mut moved = manager.fetch_next_request().await.unwrap().unwrap();
         assert_eq!((moved.url.as_str(), moved.retry_count), (url("1").as_str(), 1));
         assert_eq!(moved.user_data.get("attempts"), Some(&json!(1)));
         manager.mark_request_as_handled(&mut moved).await.unwrap();
         assert_eq!(queue.handled_count().await.unwrap(), 1, "marked in the queue that has it");
-        let mut second = manager.fetch_next_request().await.unwrap().unwrap();
-        assert_eq!(second.url, url("2"));
-        manager.mark_request_as_handled(&mut second).await.unwrap();
         let mut queued = manager.fetch_next_request().await.unwrap().unwrap();
         assert_eq!(queued.url, url("queued"));
         manager.mark_request_as_handled(&mut queued).await.unwrap();
+        let mut second = manager.fetch_next_request().await.unwrap().unwrap();
+        assert_eq!(second.url, url("2"));
+        manager.mark_request_as_handled(&mut second).await.unwrap();
         assert!(manager.is_finished().await.unwrap());
         assert_eq!(manager.handled_count().await.unwrap(), 3, "the moved request counts once");
         assert_eq!(manager.total_count().await.unwrap(), 3);

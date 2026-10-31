@@ -1590,14 +1590,14 @@ async fn crawls_a_request_list_beside_the_queue() {
     assert_eq!(
         seen,
         [
-            // Each retry next: from the list unchanged, from the queue changed.
+            // The queue first: what the run added, then the unchanged retry from the list.
             ("https://a.dev/1", 0),
+            ("https://a.dev/new", 0),
             ("https://a.dev/1", 1),
+            // The changed retry, at the front of the queue, before the rest of the list.
             ("https://a.dev/2", 0),
             ("https://a.dev/2", 1),
-            // The rest of the list, then the queue.
             ("https://a.dev/3", 0),
-            ("https://a.dev/new", 0),
         ]
     );
     // The queue got only the new request and the changed retry.
