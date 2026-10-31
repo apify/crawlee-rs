@@ -112,7 +112,11 @@ storage/
 - **Request lists.** `RequestList::open(&services, Some("name"), sources)` is a static list of
   URLs, requests and remote lists. `.request_list(Arc::new(list))` makes a crawler read it before
   its queue. With a name (or `persist_state_key` / `persist_requests_key`), its position and its
-  requests are saved, so a resumed crawl continues where it stopped.
+  requests are saved, so a resumed crawl continues where it stopped. As in JS, the list's
+  requests go through the queue. `.request_manager(Arc::new(list.with_queue(None).await?))`
+  instead keeps them out of it: the list tracks them, and their retries, itself (see
+  `RequestListAndQueue`). Set `persist_state_interval` to save its position more often than on
+  `PersistState` events.
 
 ## Events and saved state
 
@@ -132,7 +136,9 @@ keys and in the record formats of Crawlee for JS:
 | `CRAWLEE_SESSION_POOL_STATE_{id}` | Sessions, with their cookies in tough-cookie's JSON |
 | `CRAWLEE_STATE` / `CRAWLEE_STATE_{id}` | `ctx.use_state(default)` / `crawler.use_state(default)` |
 
-`RecoverableState` is the building block for all three, and is public for custom state.
+`RecoverableState` is the building block for all three, and is public for custom state. Unlike in
+JS, it does not write a record equal to the one it last saved or restored, and
+`persist_every(interval)` also saves it on an interval of its own.
 
 ## Politeness: robots.txt, rate limits and sitemaps
 

@@ -2,19 +2,21 @@
 //! Crawlee for JS.
 //!
 //! The list is read-only: it is a [`RequestLoader`]. A crawler reads it through a
-//! [`RequestManagerTandem`] with a request queue, which takes the retries and the new links.
+//! [`RequestManagerTandem`] with a request queue, which takes the retries and the new links, or
+//! through a [`RequestListAndQueue`], in which the list keeps its own requests and their retries.
 //!
 //! Its crawling position (the next request, and the requests in progress) can be saved on every
 //! `PersistState` event under `persist_state_key`, and its requests once under
 //! `persist_requests_key`, so that a restarted crawl continues where it left off, even when the
 //! sources (such as a remote list of URLs) have changed meanwhile.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io::{Read as _, Write as _};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -24,11 +26,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::backend::StorageIdentifier;
+use super::list_and_queue::RequestListAndQueue;
 use super::request_loader::{LoaderStatus, RequestLoader, RequestManagerTandem};
 use super::request_queue::{RequestManager, RequestsFromUrl, UrlListFetcher};
 use crate::errors::{StateValidationError, StorageError, StorageResult};
 use crate::recoverable_state::{BoxError, PersistedState, RecoverableState};
-use crate::request::{Request, compute_unique_key};
+use crate::request::{CrawleeRequestData, Request, compute_unique_key};
 use crate::services::Services;
 
 /// The key the state is saved under, after the list name (`STATE_PERSISTENCE_KEY`).
@@ -97,6 +100,10 @@ pub struct RequestListState {
     pub next_unique_key: Option<String>,
     /// Unique keys of the requests being processed.
     pub in_progress: Vec<String>,
+    /// The retry counts of the requests in progress that failed before, in a
+    /// [`RequestListAndQueue`] (an extra of crawlee-rs, which JS ignores).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub retries: BTreeMap<String, u32>,
 }
 
 /// Options of [`RequestList::open_with_options`] (`RequestListOptions`).
@@ -116,6 +123,10 @@ pub struct RequestListOptions {
     pub persist_requests_key: Option<String>,
     /// Where to start when no saved state is restored.
     pub state: Option<RequestListState>,
+    /// With a [`persist_state_key`](Self::persist_state_key), also save the crawling position
+    /// every `persist_state_interval` when it changed, not only on `PersistState` events (an extra
+    /// of crawlee-rs). A shorter interval means fewer requests crawled again after a crash.
+    pub persist_state_interval: Option<Duration>,
     /// Keep requests with the same URL: a unique key not set explicitly gets the position of the
     /// request appended. A request counts as having one set explicitly when its unique key is not
     /// the one its URL gives.
@@ -134,6 +145,7 @@ impl std::fmt::Debug for RequestListOptions {
             .field("persist_state_key", &self.persist_state_key)
             .field("persist_requests_key", &self.persist_requests_key)
             .field("state", &self.state)
+            .field("persist_state_interval", &self.persist_state_interval)
             .field("keep_duplicate_urls", &self.keep_duplicate_urls)
             .finish_non_exhaustive()
     }
@@ -163,6 +175,11 @@ struct Position {
     next_index: usize,
     /// In the order they were fetched, like the `Set` of JS.
     in_progress: IndexSet<String>,
+    /// The retry counts of the requests in progress that failed before.
+    retries: BTreeMap<String, u32>,
+    /// Requests in progress being handed over to the queue of a [`RequestListAndQueue`]: saved
+    /// as in progress until the queue has them, but no longer the list's.
+    moving: HashSet<String>,
 }
 
 /// The requests and the crawling position of a list: what its [`RecoverableState`] saves.
@@ -180,12 +197,13 @@ impl ListState {
             next_index: position.next_index,
             next_unique_key: self.requests.get(position.next_index).map(|request| request.unique_key.clone()),
             in_progress: position.in_progress.iter().cloned().collect(),
+            retries: position.retries.clone(),
         }
     }
 
     /// Checks a saved state against the requests (the decoding of the state codec in JS).
     fn decode(&self, record: RequestListState) -> Result<Position, BoxError> {
-        let RequestListState { next_index, next_unique_key, in_progress } = record;
+        let RequestListState { next_index, next_unique_key, in_progress, mut retries } = record;
         if next_index > self.requests.len() {
             return Err("The state object is not consistent with RequestList, too few requests loaded.".into());
         }
@@ -220,7 +238,8 @@ impl ListState {
                 in_progress.shift_remove(unique_key);
             }
         }
-        Ok(Position { next_index, in_progress })
+        retries.retain(|unique_key, _| in_progress.contains(unique_key));
+        Ok(Position { next_index, in_progress, retries, moving: HashSet::new() })
     }
 }
 
@@ -297,8 +316,14 @@ fn ensure_unique_key_valid(unique_key: &str) -> StorageResult<()> {
 pub struct RequestList {
     services: Services,
     state: RecoverableState<ListState>,
-    /// Requests in progress when the state was restored: served again first.
+    /// Requests to serve again first: those in progress when the state was restored, and those
+    /// reclaimed to the front in a [`RequestListAndQueue`].
     requests_to_retry: Arc<Mutex<VecDeque<String>>>,
+    /// Requests reclaimed (not to the front) in a [`RequestListAndQueue`]: served again after the
+    /// rest of the list, as a tandem's queue serves them.
+    requests_to_retry_last: Arc<Mutex<VecDeque<String>>>,
+    /// The reclaimed requests, as they were reclaimed (with their error messages).
+    reclaimed: Arc<Mutex<HashMap<String, Request>>>,
     persist_state_key: Option<String>,
     are_requests_persisted: Arc<AtomicBool>,
 }
@@ -340,6 +365,7 @@ impl RequestList {
             sources,
             sources_function,
             state,
+            persist_state_interval,
             keep_duplicate_urls,
             url_list_fetcher,
             proxy_url,
@@ -382,7 +408,10 @@ impl RequestList {
             list_state.position = Mutex::new(initial.clone());
             list_state.initial = initial;
         }
-        let state = RecoverableState::new(services, state_key, Arc::new(list_state), persist_state_key.is_some());
+        let mut state = RecoverableState::new(services, state_key, Arc::new(list_state), persist_state_key.is_some());
+        if let Some(interval) = persist_state_interval {
+            state = state.persist_every(interval);
+        }
         // Restores the saved position, and saves it on every `PersistState` event.
         state.initialize().await?;
         // The requests in progress were interrupted: they are crawled again.
@@ -392,6 +421,8 @@ impl RequestList {
             services: services.clone(),
             state,
             requests_to_retry: Arc::new(Mutex::new(requests_to_retry)),
+            requests_to_retry_last: Arc::default(),
+            reclaimed: Arc::default(),
             persist_state_key,
             are_requests_persisted: Arc::new(AtomicBool::new(are_requests_persisted)),
         };
@@ -451,6 +482,113 @@ impl RequestList {
         };
         Ok(RequestManagerTandem::new(Arc::new(self.clone()), manager))
     }
+
+    /// The list in front of `manager` (by default, the default request queue), each keeping its
+    /// own requests: unlike in a [tandem](Self::to_tandem), the list's requests never enter the
+    /// queue, except retries a handler changed (see [`RequestListAndQueue`]).
+    pub async fn with_queue(&self, manager: Option<Arc<dyn RequestManager>>) -> StorageResult<RequestListAndQueue> {
+        let manager = match manager {
+            Some(manager) => manager,
+            None => Arc::new(self.services.open_request_queue(&StorageIdentifier::Default).await?),
+        };
+        Ok(RequestListAndQueue::new(self.clone(), manager))
+    }
+
+    /// Whether the list has a request with this unique key.
+    pub(crate) fn contains(&self, unique_key: &str) -> bool {
+        self.state.state().index.contains_key(unique_key)
+    }
+
+    /// Whether the list's request with this unique key was handled.
+    pub(crate) fn is_handled(&self, unique_key: &str) -> bool {
+        let list = self.state.state();
+        let position = list.position.lock();
+        list.index.get(unique_key).is_some_and(|&index| {
+            index < position.next_index
+                && (!position.in_progress.contains(unique_key) || position.moving.contains(unique_key))
+        })
+    }
+
+    /// Whether the request in progress with this unique key is the list's (and not the queue's).
+    pub(crate) fn owns(&self, unique_key: &str) -> bool {
+        let position = self.state.state().position.lock();
+        position.in_progress.contains(unique_key) && !position.moving.contains(unique_key)
+    }
+
+    /// Takes a failed request of the list back. One with the data the list has for it is kept,
+    /// to be served again (`Kept`); one a handler changed is to be handed to the queue
+    /// (`Changed`), and [`finish_move`](Self::finish_move) called then.
+    pub(crate) fn reclaim(&self, request: &Request, forefront: bool) -> Reclaimed {
+        let list = self.state.state();
+        let unique_key = &request.unique_key;
+        let mut position = list.position.lock();
+        if !position.in_progress.contains(unique_key) || position.moving.contains(unique_key) {
+            return Reclaimed::NotOwned;
+        }
+        if !has_same_data(&list.requests[list.index[unique_key]], request) {
+            position.moving.insert(unique_key.clone());
+            return Reclaimed::Changed;
+        }
+        let mut reclaimed = self.reclaimed.lock();
+        if reclaimed.contains_key(unique_key) {
+            // Already waiting to be served again.
+            return Reclaimed::Kept;
+        }
+        if request.retry_count > 0 {
+            position.retries.insert(unique_key.clone(), request.retry_count);
+        } else {
+            position.retries.remove(unique_key);
+        }
+        reclaimed.insert(unique_key.clone(), request.clone());
+        if forefront {
+            self.requests_to_retry.lock().push_front(unique_key.clone());
+        } else {
+            self.requests_to_retry_last.lock().push_back(unique_key.clone());
+        }
+        Reclaimed::Kept
+    }
+
+    /// Ends the hand-over of a changed request: the queue has it now, or, when adding it failed,
+    /// the list serves it again.
+    pub(crate) fn finish_move(&self, request: &Request, added: bool) {
+        let unique_key = &request.unique_key;
+        let mut position = self.state.state().position.lock();
+        position.moving.remove(unique_key);
+        if added {
+            position.in_progress.shift_remove(unique_key);
+            position.retries.remove(unique_key);
+            return;
+        }
+        if request.retry_count > 0 {
+            position.retries.insert(unique_key.clone(), request.retry_count);
+        }
+        self.reclaimed.lock().insert(unique_key.clone(), request.clone());
+        self.requests_to_retry_last.lock().push_back(unique_key.clone());
+    }
+}
+
+/// What [`RequestList::reclaim`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Reclaimed {
+    /// Not a request in progress of the list.
+    NotOwned,
+    /// Kept by the list, to be served again.
+    Kept,
+    /// A handler changed it: it is to be handed to the queue.
+    Changed,
+}
+
+/// Whether a reclaimed request has the data of the list's request: everything but what crawling
+/// it changes (its retries, errors, loaded URL and state).
+fn has_same_data(original: &Request, request: &Request) -> bool {
+    let crawlee = |data: &CrawleeRequestData| CrawleeRequestData { state: None, ..data.clone() };
+    original.url == request.url
+        && original.method == request.method
+        && original.payload == request.payload
+        && original.headers == request.headers
+        && original.user_data == request.user_data
+        && original.no_retry == request.no_retry
+        && crawlee(&original.crawlee) == crawlee(&request.crawlee)
 }
 
 /// How remote lists of URLs are downloaded.
@@ -526,9 +664,19 @@ fn deserialize_requests(compressed: &[u8]) -> StorageResult<Vec<Request>> {
 impl RequestLoader for RequestList {
     async fn fetch_next_request(&self) -> StorageResult<Option<Request>> {
         let list = self.state.state();
-        // First the requests interrupted before the state was saved.
-        if let Some(unique_key) = self.requests_to_retry.lock().pop_front() {
-            return Ok(Some(list.requests[list.index[&unique_key]].clone()));
+        // First the requests interrupted before the state was saved, and those reclaimed to the
+        // front; the other reclaimed ones after the rest of the list.
+        let mut retry = self.requests_to_retry.lock().pop_front();
+        if retry.is_none() && list.position.lock().next_index >= list.requests.len() {
+            retry = self.requests_to_retry_last.lock().pop_front();
+        }
+        if let Some(unique_key) = retry {
+            if let Some(request) = self.reclaimed.lock().remove(&unique_key) {
+                return Ok(Some(request));
+            }
+            let mut request = list.requests[list.index[&unique_key]].clone();
+            request.retry_count = list.position.lock().retries.get(&unique_key).copied().unwrap_or(0);
+            return Ok(Some(request));
         }
         let mut position = list.position.lock();
         let Some(request) = list.requests.get(position.next_index) else { return Ok(None) };
@@ -546,13 +694,17 @@ impl RequestLoader for RequestList {
                 request.unique_key
             )));
         }
+        position.retries.remove(&request.unique_key);
         Ok(())
     }
 
     async fn status(&self) -> StorageResult<LoaderStatus> {
         let list = self.state.state();
         let position = list.position.lock();
-        if !self.requests_to_retry.lock().is_empty() || position.next_index < list.requests.len() {
+        if !self.requests_to_retry.lock().is_empty()
+            || position.next_index < list.requests.len()
+            || !self.requests_to_retry_last.lock().is_empty()
+        {
             return Ok(LoaderStatus::Ready);
         }
         // The requests to retry are in progress, so nothing in progress means nothing left.
@@ -598,6 +750,7 @@ mod tests {
                 next_index: 2,
                 next_unique_key: Some("https://example.com/3".into()),
                 in_progress: urls(&["1", "2"]),
+                retries: Default::default(),
             }
         );
         assert_eq!(list.status().await.unwrap(), LoaderStatus::Ready);
@@ -663,6 +816,7 @@ mod tests {
                     next_index: 1,
                     next_unique_key: Some("https://example.com/3".into()),
                     in_progress: vec![],
+                    retries: Default::default(),
                 },
             )
             .await
@@ -683,6 +837,7 @@ mod tests {
                     next_index: 2,
                     next_unique_key: Some("https://example.com/3".into()),
                     in_progress: vec![],
+                    retries: Default::default(),
                 },
             )
             .await
@@ -694,6 +849,7 @@ mod tests {
                 next_index: 1,
                 next_unique_key: Some("https://example.com/2".into()),
                 in_progress: vec![],
+                retries: Default::default(),
             }),
             ..RequestListOptions::default()
         };
@@ -711,6 +867,7 @@ mod tests {
                 next_index: 2,
                 next_unique_key: Some("https://example.com/c".into()),
                 in_progress: urls(&["a", "b", "c"]),
+                retries: Default::default(),
             }),
             ..RequestListOptions::default()
         };
