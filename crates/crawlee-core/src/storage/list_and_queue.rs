@@ -19,13 +19,15 @@
 //! - **Retries are served next**: the list's before its next request, the changed ones at the
 //!   front of the queue.
 //! - **A request added during the run whose unique key is in the list is not added**: it is
-//!   reported as already present (and handled if the list handled it).
+//!   reported as already present (and handled if the list handled it). One the list handed over
+//!   to the queue is the queue's to report.
 
+use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use parking_lot::Mutex;
 
 use super::backend::{BatchAddRequestsResult, ProcessedRequest, QueueOperationInfo};
 use super::batched_adds::{AddRequestsBatchedOptions, AddRequestsBatchedResult};
@@ -40,13 +42,14 @@ use crate::request::{Request, unique_key_to_request_id};
 pub struct RequestListAndQueue {
     list: RequestList,
     queue: Arc<dyn RequestManager>,
-    /// The list's requests handed over to the queue, which count there.
-    moved: AtomicU64,
+    /// The unique keys of the list's requests handed over to the queue, which has them now and
+    /// counts them.
+    moved: Mutex<HashSet<String>>,
 }
 
 impl RequestListAndQueue {
     pub(crate) fn new(list: RequestList, queue: Arc<dyn RequestManager>) -> Self {
-        RequestListAndQueue { list, queue, moved: AtomicU64::new(0) }
+        RequestListAndQueue { list, queue, moved: Mutex::new(HashSet::new()) }
     }
 
     pub fn list(&self) -> &RequestList {
@@ -57,10 +60,15 @@ impl RequestListAndQueue {
         &self.queue
     }
 
-    /// Splits off the requests the list has: reported as already present.
+    /// Splits off the requests the list has: reported as already present. Those it handed over
+    /// to the queue are the queue's to report.
     fn without_list_requests(&self, requests: Vec<Request>) -> (Vec<Request>, Vec<ProcessedRequest>) {
-        let (in_list, rest): (Vec<_>, Vec<_>) =
-            requests.into_iter().partition(|request| self.list.contains(&request.unique_key));
+        let (in_list, rest): (Vec<_>, Vec<_>) = {
+            let moved = self.moved.lock();
+            requests
+                .into_iter()
+                .partition(|request| self.list.contains(&request.unique_key) && !moved.contains(&request.unique_key))
+        };
         let present = in_list
             .into_iter()
             .map(|request| ProcessedRequest {
@@ -132,10 +140,11 @@ impl RequestManager for RequestListAndQueue {
                 // To the front, so that it is retried next, as the list's retries are.
                 let added = self.queue.add_requests(vec![request.clone()], true).await;
                 let added_ok = matches!(&added, Ok(result) if result.unprocessed_requests.is_empty());
-                self.list.finish_move(request, added_ok);
                 if added_ok {
-                    self.moved.fetch_add(1, Ordering::Relaxed);
+                    // Before the list lets go of it, so that it is always someone's to report.
+                    self.moved.lock().insert(request.unique_key.clone());
                 }
+                self.list.finish_move(request, added_ok);
                 let result = added?;
                 Ok(result.processed_requests.into_iter().next().map(|processed| QueueOperationInfo {
                     request_id: processed.request_id,
@@ -160,12 +169,12 @@ impl RequestManager for RequestListAndQueue {
     }
 
     async fn handled_count(&self) -> StorageResult<u64> {
-        let list = self.list.handled_count().await?.saturating_sub(self.moved.load(Ordering::Relaxed));
+        let list = self.list.handled_count().await?.saturating_sub(self.moved.lock().len() as u64);
         Ok(list + self.queue.handled_count().await?)
     }
 
     async fn total_count(&self) -> StorageResult<u64> {
-        let list = self.list.total_count().await?.saturating_sub(self.moved.load(Ordering::Relaxed));
+        let list = self.list.total_count().await?.saturating_sub(self.moved.lock().len() as u64);
         Ok(list + self.queue.total_count().await?)
     }
 
@@ -322,6 +331,28 @@ mod tests {
         assert!(manager.is_finished().await.unwrap());
         assert_eq!(manager.handled_count().await.unwrap(), 3, "the moved request counts once");
         assert_eq!(manager.total_count().await.unwrap(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_request_moved_to_the_queue_is_reported_by_the_queue() {
+        let services = Services::in_memory();
+        let (manager, queue) = open(&services, &["1", "2"]).await;
+        let mut request = manager.fetch_next_request().await.unwrap().unwrap();
+        request.user_data.insert("attempts".into(), json!(1));
+        manager.reclaim_request(&request, false).await.unwrap();
+
+        let added = manager.add_requests(vec![url("1").into()], false).await.unwrap();
+        let processed = &added.processed_requests[0];
+        assert_eq!((processed.was_already_present, processed.was_already_handled), (true, false), "not handled yet");
+        assert_eq!(queue.total_count().await.unwrap(), 1, "added to the queue once");
+        let moved = manager.fetch_next_request().await.unwrap().unwrap();
+        assert_eq!(moved.user_data.get("attempts"), Some(&json!(1)), "the changed request is kept");
+
+        // Nor while it is being handed over.
+        let mut request = manager.fetch_next_request().await.unwrap().unwrap();
+        request.user_data.insert("attempts".into(), json!(1));
+        assert_eq!(manager.list.reclaim(&request, false), Reclaimed::Changed);
+        assert!(!manager.list.is_handled(&request.unique_key));
     }
 
     #[tokio::test]

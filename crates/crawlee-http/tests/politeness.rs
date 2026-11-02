@@ -89,6 +89,14 @@ async fn serve(robots: Option<&'static str>) -> Site {
                 ([(header::CONTENT_TYPE, "application/octet-stream")], gzip(xml.as_bytes())).into_response()
             }
             "list.txt" => format!("{base}/page/s3\n{base}/page/excluded\n").into_response(),
+            // A cycle: a.xml lists itself and b.xml, which lists a.xml again.
+            "a.xml" => format!(
+                "<sitemapindex><sitemap><loc>{base}/sitemaps/a.xml</loc></sitemap>\
+                 <sitemap><loc>{base}/sitemaps/b.xml</loc></sitemap></sitemapindex>"
+            )
+            .into_response(),
+            "b.xml" => format!("<sitemapindex><sitemap><loc>{base}/sitemaps/a.xml</loc></sitemap></sitemapindex>")
+                .into_response(),
             _ => StatusCode::NOT_FOUND.into_response(),
         }
     }
@@ -185,4 +193,29 @@ async fn crawls_the_pages_of_sitemaps() {
     assert_eq!(stats.requests_succeeded, 3);
     assert!(loader.is_sitemap_fully_loaded());
     assert_eq!(site.hits("/sitemaps/pages.xml.gz"), 1);
+}
+
+#[tokio::test]
+async fn nested_sitemaps_are_loaded_once_even_in_a_cycle() {
+    let site = serve(None).await;
+    let services = Services::in_memory();
+    let options = SitemapRequestLoaderOptions::new([format!("{}/sitemaps/a.xml", site.base())]);
+    let loader = SitemapRequestLoader::open(options, &services, crawlee_http_client::default_client()).await.unwrap();
+    let queue = Arc::new(services.open_request_queue(&StorageIdentifier::Default).await.unwrap());
+
+    let crawler = HtmlCrawler::builder()
+        .services(services)
+        .request_manager(Arc::new(RequestManagerTandem::new(loader.clone(), queue)))
+        .request_handler(|_: HtmlContext| async move { Ok(()) })
+        .build()
+        .unwrap();
+    // Only a guard against hanging: the run ends as soon as both sitemaps are loaded.
+    tokio::time::timeout(Duration::from_secs(30), crawler.run(Vec::<String>::new()))
+        .await
+        .expect("the loader finishes")
+        .unwrap();
+
+    assert!(loader.is_sitemap_fully_loaded());
+    assert_eq!(site.hits("/sitemaps/a.xml"), 1);
+    assert_eq!(site.hits("/sitemaps/b.xml"), 1);
 }

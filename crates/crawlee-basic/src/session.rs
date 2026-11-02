@@ -99,6 +99,12 @@ pub struct Session {
     state: Mutex<SessionState>,
 }
 
+/// Where a huge `max_age` saturates: the latest time an RFC 3339 timestamp (and so the saved
+/// `expiresAt`) can hold.
+fn latest_expiry() -> DateTime<Utc> {
+    DateTime::parse_from_rfc3339("9999-12-31T23:59:59.999Z").map_or(DateTime::<Utc>::MAX_UTC, |time| time.to_utc())
+}
+
 fn iso(time: DateTime<Utc>) -> String {
     time.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
@@ -120,7 +126,10 @@ fn proxy_info_json(proxy: &ProxyInfo) -> Value {
 impl Session {
     pub fn new(id: String, proxy_info: Option<ProxyInfo>, options: SessionOptions) -> Self {
         let created_at = Utc::now();
-        let expires_at = created_at + chrono::Duration::from_std(options.max_age).unwrap_or(chrono::Duration::MAX);
+        let expires_at = chrono::Duration::from_std(options.max_age)
+            .ok()
+            .and_then(|max_age| created_at.checked_add_signed(max_age))
+            .map_or_else(latest_expiry, |expires_at| expires_at.min(latest_expiry()));
         Session {
             id,
             cookie_jar: Arc::new(CookieJar::new()),
@@ -822,6 +831,46 @@ mod tests {
             session.cookie_jar().cookie_header(&Url::parse("https://a.test/x").unwrap()).as_deref(),
             Some("sid=1")
         );
+    }
+
+    #[test]
+    fn a_session_with_a_huge_max_age_does_not_expire() {
+        let options = SessionOptions { max_age: Duration::MAX, ..SessionOptions::default() };
+        let session = Session::new("s".into(), None, options.clone());
+        assert!(session.is_usable());
+        assert!(!session.is_expired());
+
+        // Saved with an expiry that reads back.
+        let restored = Session::from_state(&session.to_state(), &options).unwrap();
+        assert!(restored.is_usable());
+    }
+
+    #[test]
+    fn a_session_is_not_usable_once_its_max_age_has_passed() {
+        let session =
+            Session::new("s".into(), None, SessionOptions { max_age: Duration::ZERO, ..SessionOptions::default() });
+        assert!(session.is_expired());
+        assert!(!session.is_usable());
+        session.mark_good();
+        assert!(session.is_retired(), "an expired session retires itself");
+    }
+
+    #[test]
+    fn restoring_a_pool_drops_expired_sessions() {
+        let pool = SessionPool::with_id("0", SessionPoolOptions { max_pool_size: 2, ..Default::default() }, None);
+        let expired = pool.get_session();
+        let kept = pool.get_session();
+        let mut record = pool.to_record();
+        let saved = record["sessions"].as_array_mut().unwrap();
+        let index = saved.iter().position(|session| session["id"] == expired.id()).unwrap();
+        saved[index]["createdAt"] = json!("2020-01-01T00:00:00.000Z");
+        saved[index]["expiresAt"] = json!("2020-01-01T00:50:00.000Z");
+
+        let restored = SessionPool::with_id("0", SessionPoolOptions::default(), None);
+        restored.restore(record).unwrap();
+        assert_eq!(restored.usable_count(), 1);
+        assert!(restored.get_session_by_id(expired.id()).is_none());
+        assert!(restored.get_session_by_id(kept.id()).is_some());
     }
 
     #[test]

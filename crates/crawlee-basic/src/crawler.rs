@@ -986,7 +986,21 @@ where
             if inner.options.use_session_pool {
                 inner.session_pool_state.initialize().await?;
             }
-            self.add_requests(requests).await?;
+            let added = self.add_requests(requests).await?;
+            if let Some(rest) = added.wait_for_all_requests_to_be_added {
+                // The requests of a failed batch, and of the batches after it, are not crawled:
+                // said at error level, where JS stays silent.
+                tokio::spawn(async move {
+                    let failure = match rest.await {
+                        Ok(Ok(_)) => return,
+                        Ok(Err(err)) => err.to_string(),
+                        Err(err) => err.to_string(),
+                    };
+                    tracing::error!(
+                        "Failed to add some of the requests passed to run(), they will not be crawled: {failure}"
+                    );
+                });
+            }
             if owns_concurrency {
                 concurrency.start(&inner.services);
             } else if !concurrency.is_running() {
@@ -1886,16 +1900,54 @@ mod sigint {
     }
 
     async fn watch() {
-        let mut pausing = false;
+        let mut watcher = Watcher::default();
         while tokio::signal::ctrl_c().await.is_ok() {
             let listeners: Vec<Arc<Notify>> = LISTENERS.lock().iter().filter_map(Weak::upgrade).collect();
-            if listeners.is_empty() || pausing {
+            if !watcher.on_sigint(listeners) {
                 std::process::exit(130);
             }
-            pausing = true;
+        }
+    }
+
+    /// What a SIGINT does to the runs.
+    #[derive(Default)]
+    struct Watcher {
+        /// The runs the last SIGINT paused. Once they ended, the next SIGINT pauses the runs again.
+        pausing: Vec<Weak<Notify>>,
+    }
+
+    impl Watcher {
+        /// Wakes the runs listening. False when the process is to exit instead: no run listens,
+        /// or one is already pausing.
+        fn on_sigint(&mut self, listeners: Vec<Arc<Notify>>) -> bool {
+            if listeners.is_empty() || self.pausing.iter().any(|run| run.strong_count() > 0) {
+                return false;
+            }
+            self.pausing = listeners.iter().map(Arc::downgrade).collect();
             for listener in listeners {
                 listener.notify_one();
             }
+            true
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn the_first_sigint_of_each_run_pauses_it() {
+            let mut watcher = Watcher::default();
+            let first = Arc::new(Notify::new());
+            assert!(watcher.on_sigint(vec![first.clone()]), "the first one pauses the run");
+            assert!(!watcher.on_sigint(vec![first.clone()]), "a second one exits");
+
+            // The run ended; a later one in the same process starts over.
+            drop(first);
+            let later = Arc::new(Notify::new());
+            assert!(watcher.on_sigint(vec![later.clone()]), "the first one pauses the later run");
+            assert!(!watcher.on_sigint(vec![later]), "a second one exits");
+            assert!(!Watcher::default().on_sigint(Vec::new()), "one when no run listens exits");
         }
     }
 }

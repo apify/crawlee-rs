@@ -495,14 +495,14 @@ impl RequestList {
         self.state.state().index.contains_key(unique_key)
     }
 
-    /// Whether the list's request with this unique key was handled.
+    /// Whether the list's request with this unique key was handled (or handed over to a queue).
+    /// One being handed over is not handled yet.
     pub(crate) fn is_handled(&self, unique_key: &str) -> bool {
         let list = self.state.state();
         let position = list.position.lock();
-        list.index.get(unique_key).is_some_and(|&index| {
-            index < position.next_index
-                && (!position.in_progress.contains(unique_key) || position.moving.contains(unique_key))
-        })
+        list.index
+            .get(unique_key)
+            .is_some_and(|&index| index < position.next_index && !position.in_progress.contains(unique_key))
     }
 
     /// Whether the request in progress with this unique key is the list's (and not the queue's).

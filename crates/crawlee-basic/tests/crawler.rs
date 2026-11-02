@@ -10,7 +10,11 @@ use serde_json::{Value, json};
 
 use crawlee_basic::{BasicContext, BasicCrawler, Router};
 use crawlee_core::errors::{CriticalError, NonRetryableError, RetryRequestError, SessionError};
-use crawlee_core::{Configuration, Request, Services};
+use crawlee_core::storage::backend::{BatchAddRequestsResult, QueueOperationInfo};
+use crawlee_core::storage::batched_adds::{AddRequestsBatchedOptions, AddRequestsBatchedResult};
+use crawlee_core::{
+    Configuration, Request, RequestManager, RequestQueue, Services, StorageError, StorageIdentifier, StorageResult,
+};
 
 fn services() -> Services {
     Services::in_memory()
@@ -91,6 +95,102 @@ async fn add_requests_returns_after_the_first_batch() {
     assert_eq!(result.added_requests.len(), 1000);
     let rest = result.wait_for_all_requests_to_be_added.expect("a background batch");
     assert_eq!(rest.await.unwrap().unwrap().len(), 500);
+}
+
+/// A request queue whose batches after the first fail to be added.
+struct LaterBatchesFail(RequestQueue);
+
+#[async_trait::async_trait]
+impl RequestManager for LaterBatchesFail {
+    async fn add_requests(&self, requests: Vec<Request>, forefront: bool) -> StorageResult<BatchAddRequestsResult> {
+        self.0.add_requests(requests, forefront).await
+    }
+    async fn add_requests_batched(
+        &self,
+        mut requests: Vec<Request>,
+        options: AddRequestsBatchedOptions,
+    ) -> StorageResult<AddRequestsBatchedResult> {
+        requests.truncate(options.batch_size);
+        let first = self.0.add_requests(requests, options.forefront).await?;
+        let rest = tokio::spawn(async { Err(StorageError::Backend("the storage is gone".into())) });
+        Ok(AddRequestsBatchedResult {
+            added_requests: first.processed_requests,
+            wait_for_all_requests_to_be_added: Some(rest),
+            ..Default::default()
+        })
+    }
+    async fn fetch_next_request(&self) -> StorageResult<Option<Request>> {
+        self.0.fetch_next_request().await
+    }
+    async fn mark_request_as_handled(&self, request: &mut Request) -> StorageResult<Option<QueueOperationInfo>> {
+        self.0.mark_request_as_handled(request).await
+    }
+    async fn reclaim_request(&self, request: &Request, forefront: bool) -> StorageResult<Option<QueueOperationInfo>> {
+        self.0.reclaim_request(request, forefront).await
+    }
+    async fn is_empty(&self) -> StorageResult<bool> {
+        self.0.is_empty().await
+    }
+    async fn is_finished(&self) -> StorageResult<bool> {
+        self.0.is_finished().await
+    }
+    async fn handled_count(&self) -> StorageResult<u64> {
+        self.0.handled_count().await
+    }
+}
+
+/// Collects the messages of the errors logged while it is the default subscriber.
+#[derive(Clone, Default)]
+struct ErrorLog(Arc<Mutex<Vec<String>>>);
+
+impl tracing::Subscriber for ErrorLog {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+        true
+    }
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+        tracing::span::Id::from_u64(1)
+    }
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+    fn event(&self, event: &tracing::Event<'_>) {
+        struct Message(String);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        if *event.metadata().level() == tracing::Level::ERROR {
+            let mut message = Message(String::new());
+            event.record(&mut message);
+            self.0.lock().push(message.0);
+        }
+    }
+    fn enter(&self, _: &tracing::span::Id) {}
+    fn exit(&self, _: &tracing::span::Id) {}
+}
+
+/// The requests of a background batch that could not be added are not lost silently.
+#[tokio::test(start_paused = true)]
+async fn a_failed_background_batch_of_run_is_logged_as_an_error() {
+    let log = ErrorLog::default();
+    let _subscriber = tracing::subscriber::set_default(log.clone());
+    let services = services();
+    let queue = services.open_request_queue(&StorageIdentifier::Default).await.unwrap();
+    let crawler = BasicCrawler::builder()
+        .services(services)
+        .request_manager(Arc::new(LaterBatchesFail(queue)))
+        .request_handler(|_ctx: BasicContext| async move { Ok(()) })
+        .build()
+        .unwrap();
+
+    let stats = crawler.run(["https://a.dev/1"]).await.unwrap();
+    assert_eq!(stats.requests_succeeded, 1);
+    // Returns once every task is idle, the background batch and whatever awaits it included.
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let errors = log.0.lock().clone();
+    assert!(errors.iter().any(|message| message.contains("the storage is gone")), "{errors:#?}");
 }
 
 #[tokio::test]
