@@ -986,7 +986,21 @@ where
             if inner.options.use_session_pool {
                 inner.session_pool_state.initialize().await?;
             }
-            self.add_requests(requests).await?;
+            let added = self.add_requests(requests).await?;
+            if let Some(rest) = added.wait_for_all_requests_to_be_added {
+                // The requests of a failed batch, and of the batches after it, are not crawled:
+                // said at error level, where JS stays silent.
+                tokio::spawn(async move {
+                    let failure = match rest.await {
+                        Ok(Ok(_)) => return,
+                        Ok(Err(err)) => err.to_string(),
+                        Err(err) => err.to_string(),
+                    };
+                    tracing::error!(
+                        "Failed to add some of the requests passed to run(), they will not be crawled: {failure}"
+                    );
+                });
+            }
             if owns_concurrency {
                 concurrency.start(&inner.services);
             } else if !concurrency.is_running() {

@@ -108,6 +108,10 @@ Differences that make runs faster or waits shorter without doing less work.
 - **Cycles of nested sitemaps.** `SitemapRequestLoader` loads each sitemap once and saves the
   ones it loaded with its state (`visitedSitemapUrls`). JS loads a sitemap again whenever it is
   listed, so it never finishes a sitemap index that lists itself.
+- **A failed background batch of `run`.** The requests passed to `run` after the first batch are
+  added in the background. When adding a batch fails, the requests of that batch and the later ones
+  are not crawled, as in JS, but an error is logged; JS ignores the failure. The run goes on either
+  way.
 - **Public Suffix List version.** Domains are computed with the `psl` crate's built-in list and
   `tldts`'s default ICANN-only mode is emulated. The two list snapshots can differ for newly added
   suffixes.
