@@ -87,18 +87,22 @@ fn error_group(message: &str) -> String {
 }
 
 /// The saved record, with the fields in the order Crawlee for JS writes them. Values that are
-/// `Infinity` in JS until something finished are `null`.
+/// `Infinity` in JS until something finished are `null`. The record of Crawlee for JS 3 is read
+/// too: it says "finished" for "succeeded", and its `statsId` is a number.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StatisticsRecord {
+    #[serde(alias = "requestsFinished")]
     requests_succeeded: u64,
     requests_failed: u64,
     requests_retries: u64,
     requests_failed_per_minute: Option<u64>,
+    #[serde(alias = "requestsFinishedPerMinute")]
     requests_succeeded_per_minute: Option<u64>,
     request_min_duration_millis: Option<u64>,
     request_max_duration_millis: u64,
     request_total_failed_duration_millis: u64,
+    #[serde(alias = "requestTotalFinishedDurationMillis")]
     request_total_succeeded_duration_millis: u64,
     crawler_started_at: Option<String>,
     crawler_finished_at: Option<String>,
@@ -106,14 +110,30 @@ struct StatisticsRecord {
     crawler_runtime_millis: u64,
     crawler_last_start_timestamp: i64,
     request_retry_histogram: Vec<Option<u64>>,
+    #[serde(deserialize_with = "string_or_number")]
     stats_id: String,
     request_avg_failed_duration_millis: Option<u64>,
+    #[serde(alias = "requestAvgFinishedDurationMillis")]
     request_avg_succeeded_duration_millis: Option<u64>,
     request_total_duration_millis: u64,
     requests_total: u64,
     requests_with_status_code: BTreeMap<String, u64>,
     errors: Value,
     retry_errors: Value,
+}
+
+/// The `statsId` of Crawlee for JS 3 is a number.
+fn string_or_number<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Id {
+        String(String),
+        Number(serde_json::Number),
+    }
+    Ok(match Id::deserialize(deserializer)? {
+        Id::String(id) => id,
+        Id::Number(id) => id.to_string(),
+    })
 }
 
 fn parse_time(value: Option<&str>) -> Result<Option<DateTime<Utc>>, BoxError> {
@@ -358,7 +378,7 @@ impl PersistedState for Statistics {
         serde_json::to_value(self.record()).unwrap_or_default()
     }
 
-    /// Restores a record written by crawlee-rs or Crawlee for JS. A record missing any field is
+    /// Restores a record written by crawlee-rs or Crawlee for JS (3 or later). A record missing any field is
     /// discarded whole with a warning, starting from scratch, as statistics are bookkeeping and not
     /// worth failing a crawl over (JS `#deserializeState`). Error groups are kept only if they have
     /// the flat shape crawlee-rs writes (JS groups errors differently).
@@ -501,6 +521,45 @@ mod tests {
         let fresh = Statistics::new();
         fresh.restore(broken).unwrap();
         assert_eq!(fresh.snapshot().requests_succeeded, 0);
+    }
+
+    /// A record saved by Crawlee for JS 3 (`Statistics.toJSON`), which says "finished" for
+    /// "succeeded" and has a numeric `statsId`.
+    #[test]
+    fn restores_a_record_of_crawlee_for_js_3() {
+        let record = serde_json::json!({
+            "requestsFinished": 5,
+            "requestsFailed": 2,
+            "requestsRetries": 1,
+            "requestsFailedPerMinute": 0,
+            "requestsFinishedPerMinute": 3,
+            "requestMinDurationMillis": 40,
+            "requestMaxDurationMillis": 900,
+            "requestTotalFailedDurationMillis": 300,
+            "requestTotalFinishedDurationMillis": 1500,
+            "crawlerStartedAt": "2024-05-01T10:00:00.000Z",
+            "crawlerFinishedAt": null,
+            "statsPersistedAt": "2024-05-01T10:01:00.000Z",
+            "crawlerRuntimeMillis": 60000,
+            "crawlerLastStartTimestamp": 1_714_557_600_000_i64,
+            "requestRetryHistogram": [6, 1],
+            "statsId": 0,
+            "requestAvgFailedDurationMillis": 150,
+            "requestAvgFinishedDurationMillis": 300,
+            "requestTotalDurationMillis": 1800,
+            "requestsTotal": 7,
+            "requestsWithStatusCode": { "200": 5, "404": 2 },
+            "errors": { "file:///main.js:10:5": { "Error": { "boom": { "count": 2 } } } },
+            "retryErrors": {},
+        });
+        let stats = Statistics::with_id("0").with_persist_state_key("SDK_CRAWLER_STATISTICS_0");
+        stats.restore(record).unwrap();
+        let snapshot = stats.snapshot();
+        assert_eq!((snapshot.requests_succeeded, snapshot.requests_failed, snapshot.requests_retries), (5, 2, 1));
+        assert_eq!(snapshot.request_avg_succeeded_duration_millis, 300);
+        assert_eq!((snapshot.request_min_duration_millis, snapshot.request_max_duration_millis), (40, 900));
+        assert_eq!(snapshot.retry_histogram, [6, 1]);
+        assert_eq!(snapshot.status_codes, BTreeMap::from([(200, 5), (404, 2)]));
     }
 
     #[test]
