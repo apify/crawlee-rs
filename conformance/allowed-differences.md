@@ -6,12 +6,51 @@ This file lists every deliberate difference between crawlee-rs and Crawlee for J
   `ALLOWED_DIFFERENCES` in `crates/crawlee/tests/golden.rs`, under the id of the case, and
   explained here. The test fails for unlisted mismatches. It also fails for listed cases that
   match again, so the list cannot go stale.
-- **Other differences.** Differences that no golden case covers yet are documented below, so that
-  reviewers and users know them.
+- **Other differences.** Differences that no golden case covers yet are documented below, with the
+  optimizations in a section of their own, so that reviewers and users know them.
 
 ## Golden-file cases
 
 _None._ All 755 checks match.
+
+## Optimizations
+
+These differences exist to make crawls cheaper or faster.
+
+### CPU and memory
+
+Differences that use less CPU or memory for the same work.
+
+| Area | Crawlee for JS | crawlee-rs | Why |
+|---|---|---|---|
+| Request queue caches | A 1M-slot dedup cache of keys plus a 2M-entry LRU of requests with their handled state; requests added in background batches skip the LRU, so a later add of one reports `wasAlreadyHandled: false` | One 1M-slot cache of 64-bit key fingerprints with a handled bit (8 MiB), kept for every add | Memory |
+
+### Fewer API calls
+
+Differences that make fewer storage or platform API requests, such as queue or key-value store writes.
+
+| Area | Crawlee for JS | crawlee-rs | Why |
+|---|---|---|---|
+| Saving unchanged state | `RecoverableState` writes its record on every `persistState` event | A record equal to the one last saved (or restored) is not written again, on events, on teardown and on `persist()` | Most state does not change between two events once a crawl idles or ends; each write is a key-value store write billed on the platform. Saves are also serialized, so an older record can no longer overwrite a newer one |
+| Request list beside the queue (extra) | A `RequestList` is crawled through a `RequestManagerTandem`: each request is added to the front of the queue when fetched, then handled there | The same with `to_tandem`; `RequestList::with_queue` gives a `RequestListAndQueue`, in which the list serves and tracks its own requests. Its saved state is JS's (`nextIndex`, `nextUniqueKey`, `inProgress`) plus `retries`, the retry counts of the requests in progress that failed before. The queue is served first, then the list. A failed request stays in the list and is retried before its next request, unless a handler changed its data: that one is added to the front of the queue. A request added during the run with the unique key of a list request is not added, and reported as already present | The tandem costs two queue writes per list request (the add and the handled mark), which a list of inputs does not need. In a tandem, every list request goes to the front of the queue, so the requests a run adds and its retries wait behind the whole list, and pile up in a large one. A JS tandem deduplicates such a request in the queue too, but keeps whichever copy reached the queue first; here the list's copy always wins |
+
+### Network traffic
+
+Differences that send fewer bytes over the network or a proxy.
+
+| Area | Crawlee for JS | crawlee-rs | Why |
+|---|---|---|---|
+| Post-quantum key exchange (extra) | Crawlee for JS has no impit transport; got-scraping's Chrome profile offers X25519, P-256 and P-384 | impit's Chrome fingerprints offer the hybrid X25519MLKEM768 first, as Chrome does; `ImpitTransport::without_post_quantum_key_exchange` leaves it out | The hybrid's key share is 1,216 bytes of every ClientHello (and about 1.1 KB of the server's answer); through a proxy billed by the byte, that is a few percent of a small response |
+
+### Run time and latency
+
+Differences that make runs faster or waits shorter without doing less work.
+
+| Area | Crawlee for JS | crawlee-rs | Why |
+|---|---|---|---|
+| CPU load signal and start window | The CPU signal is overloaded above 40 % of the window (`CpuLoadSignalOptions`), and a request starts only if every signal was idle over the last 5 s (`currentHistorySecs`) | 95 % and 20 s. The start window applies to every signal, so a memory, runtime or storage overload now holds back request starts once it lasted its ratio of 20 s, not of 5 s. Set `overloaded_ratio: 0.4` and `current_history: 5 s` for the JS behavior | The Apify platform flags `isCpuOverloaded` once a run uses about 96 % of its CPU share, which a run near its best throughput does 74–95 % of the time. With 0.4 over 5 s, requests started in stop-and-go and the concurrency stayed far below the best throughput. Over 24 runs of the Instagram profile scraper at 1–4 GB, 0.95 with 20 s was the fastest setting, about as fast as no CPU signal with half the concurrency |
+| Scaling-only load signals (extra) | Every load signal both holds back request starts (5 s window) and drives scaling (30 s window) | Same by default; a `LoadSignal` whose `gates_task_start()` returns `false` only drives scaling. The current status still lists it, with `LoadSignalInfo::gates_task_start` set to `false`, and the state log marks it `(scaling only)` | Some signals, such as throughput per added concurrency, are only meaningful over the longer window; gating request starts on them makes the crawl stop and go |
+| Final saves of a run | The statistics, then the session pool, then the other `persistState` listeners, one after the other; then the final status message (`Finished! Total ...`) | All at once, with the final status message (from the same final statistics) | They write different records; one after the other, a run's end waited for each write's round trip in turn |
 
 ## API and design differences
 
@@ -23,15 +62,9 @@ _None._ All 755 checks match.
 | `errorMessages` | `error.stack` | The error with its cause chain (`{error:#}`) | Rust errors have no JS stack traces |
 | Error grouping in statistics | By error code, name, stack path and message placeholders | By first message line with digits masked | Same reason |
 | Event loop load signal | Lateness of a Node timer | Lateness of a tokio timer task | There is no single event loop; a starved tokio runtime is the equivalent |
-| CPU load signal and start window | The CPU signal is overloaded above 40 % of the window (`CpuLoadSignalOptions`), and a request starts only if every signal was idle over the last 5 s (`currentHistorySecs`) | 95 % and 20 s. The start window applies to every signal, so a memory, runtime or storage overload now holds back request starts once it lasted its ratio of 20 s, not of 5 s. Set `overloaded_ratio: 0.4` and `current_history: 5 s` for the JS behavior | The Apify platform flags `isCpuOverloaded` once a run uses about 96 % of its CPU share, which a run near its best throughput does 74–95 % of the time. With 0.4 over 5 s, requests started in stop-and-go and the concurrency stayed far below the best throughput. Over 24 runs of the Instagram profile scraper at 1–4 GB, 0.95 with 20 s was the fastest setting, about as fast as no CPU signal with half the concurrency |
-| Scaling-only load signals (extra) | Every load signal both holds back request starts (5 s window) and drives scaling (30 s window) | Same by default; a `LoadSignal` whose `gates_task_start()` returns `false` only drives scaling. The current status still lists it, with `LoadSignalInfo::gates_task_start` set to `false`, and the state log marks it `(scaling only)` | Some signals, such as throughput per added concurrency, are only meaningful over the longer window; gating request starts on them makes the crawl stop and go |
-| Final saves of a run | The statistics, then the session pool, then the other `persistState` listeners, one after the other; then the final status message (`Finished! Total ...`) | All at once, with the final status message (from the same final statistics) | They write different records; one after the other, a run's end waited for each write's round trip in turn |
 | Statistics key (extra) | `CRAWLEE_CRAWLER_STATISTICS_{id}` (`SDK_CRAWLER_STATISTICS_{id}` in Crawlee for JS 3) | The same by default; `Statistics::with_persist_state_key` saves them under another key and resumes from it | A scraper ported from Crawlee for JS 3 can keep its key with a single write |
-| Post-quantum key exchange (extra) | Crawlee for JS has no impit transport; got-scraping's Chrome profile offers X25519, P-256 and P-384 | impit's Chrome fingerprints offer the hybrid X25519MLKEM768 first, as Chrome does; `ImpitTransport::without_post_quantum_key_exchange` leaves it out | The hybrid's key share is 1,216 bytes of every ClientHello (and about 1.1 KB of the server's answer); through a proxy billed by the byte, that is a few percent of a small response |
-| Saving unchanged state | `RecoverableState` writes its record on every `persistState` event | A record equal to the one last saved (or restored) is not written again, on events, on teardown and on `persist()` | Most state does not change between two events once a crawl idles or ends; each write is a key-value store write billed on the platform. Saves are also serialized, so an older record can no longer overwrite a newer one |
 | State saves on a migration or abort | The state is saved as the migration or abort starts (the Apify SDK's `persistState`), while the crawler waits for its running requests; only the statistics are saved again after them | The crawler waits for its running requests (at most 20 s), then emits `PersistState`, so every state (statistics, sessions, a request list, `use_state`, ...) is saved after them, all at once; the Apify SDK's exit and reboot wait for these saves | A request that finished during the wait stayed in progress in a saved request list, and a resurrected or migrated run crawled it again, with its item already stored. Saving all state the same way also keeps the other states in step with what was stored |
 | State save interval (extra) | State is saved on `persistState` events only (every 60 s by default) | The same by default; `RecoverableState::persist_every` and `RequestListOptions::persist_state_interval` also save every interval, when the state changed | A request list saved every few seconds crawls fewer requests again after a crash, and costs nothing while nothing changes |
-| Request list beside the queue (extra) | A `RequestList` is crawled through a `RequestManagerTandem`: each request is added to the front of the queue when fetched, then handled there | The same with `to_tandem`; `RequestList::with_queue` gives a `RequestListAndQueue`, in which the list serves and tracks its own requests. Its saved state is JS's (`nextIndex`, `nextUniqueKey`, `inProgress`) plus `retries`, the retry counts of the requests in progress that failed before. The queue is served first, then the list. A failed request stays in the list and is retried before its next request, unless a handler changed its data: that one is added to the front of the queue. A request added during the run with the unique key of a list request is not added, and reported as already present | The tandem costs two queue writes per list request (the add and the handled mark), which a list of inputs does not need. In a tandem, every list request goes to the front of the queue, so the requests a run adds and its retries wait behind the whole list, and pile up in a large one. A JS tandem deduplicates such a request in the queue too, but keeps whichever copy reached the queue first; here the list's copy always wins |
 | `maxRequestsPerCrawl` | Can overshoot by in-flight requests (5042 of 5000 in the benchmark) | Never exceeded; what is enqueued is capped as in JS | Running tasks are counted before another one starts |
 | SIGINT | `process.once('SIGINT')` during a run; outside one, Node's default | The first Ctrl+C during a run pauses and ends it; a second one, or one when no crawler runs, exits the process with status 130 | tokio's handler replaces the default one for the rest of the process, so the default is emulated |
 | `statusMessageCallback` | Gets the crawler and the statistics state; `previousState` is the state just read | Gets the message and statistics snapshots; `previous_state` is the one of the previous status message | No typed crawler handle in a callback shared by every pipeline; the JS value is always the current state |
@@ -43,7 +76,6 @@ _None._ All 755 checks match.
 | `RequestList` | `RequestList.open(nameOrOptions, sources, options)`; `proxyConfiguration`; `keepDuplicateUrls` leaves sources with a `uniqueKey` property alone; `requestList` with the deprecated `requestQueue` makes a tandem of them | `open(services, name, sources)` and `open_with_options(services, options)`; a `proxy_url` closure; a request counts as having a unique key set when it differs from the one its URL gives; a list and a `request_manager` are combined by the caller, with `to_tandem` | Storages are opened through explicit `Services`; proxies live in crawlee-basic; a `Request` always has a unique key; there is no `request_queue` option |
 | Pausing for a migration | Every request queue stops fetching on `MIGRATING` of the global event manager | Queues opened through `Services` (or given `with_events`) stop on `Event::Migrating` of its event manager | No ambient event manager |
 | `Dataset.forEach` / `values` | Async iterables (and promises of arrays) | Methods taking async closures, and `Vec`s | No async iterators in stable Rust without extra dependencies |
-| Request queue caches | A 1M-slot dedup cache of keys plus a 2M-entry LRU of requests with their handled state; requests added in background batches skip the LRU, so a later add of one reports `wasAlreadyHandled: false` | One 1M-slot cache of 64-bit key fingerprints with a handled bit (8 MiB), kept for every add | Memory |
 | Default HTTP client | `impit` (browser impersonation) | reqwest (rustls, h2); impit through `integrations/crawlee-impit` | impit needs patched dependencies, which cannot be forced on every user |
 | `createSessionFunction` | Also recreates the sessions restored from the saved pool, from their record | Makes new sessions only; restored sessions are rebuilt from their record (their proxy through `ProxySource::restored_proxy_info`) | A Rust `Session` is not built from an options bag holding its whole saved state |
 | Navigation hooks | Async; may return a partial object whose properties are merged into the crawling context | Async; take the context by value and hand it on (`BasicContext`, or `PostNavigationContext` whose `response` can be replaced); they cannot add members | Rust cannot grow a struct at runtime (see Crawling context) |
