@@ -96,6 +96,8 @@ struct Progress {
     pending_sitemap_urls: Vec<String>,
     in_progress_sitemap_url: Option<String>,
     in_progress_entries: Vec<String>,
+    /// Not in the JS record, which follows a cycle of nested sitemaps forever.
+    visited_sitemap_urls: Vec<String>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -121,6 +123,9 @@ struct LoaderState {
     /// Pages of the sitemap being loaded that were already buffered, so a resumed load does
     /// not buffer them twice.
     in_progress_entries: HashSet<String>,
+    /// Sitemaps started loading (normalized), so that a nested sitemap listed again, as in a
+    /// cycle, is not loaded again.
+    visited_sitemaps: HashSet<String>,
     abort_loading: bool,
     closed: bool,
     handled: u64,
@@ -150,6 +155,7 @@ impl PersistedState for Shared {
                 pending_sitemap_urls: state.pending_sitemaps.iter().cloned().collect(),
                 in_progress_sitemap_url: state.in_progress_sitemap.clone(),
                 in_progress_entries: state.in_progress_entries.iter().cloned().collect(),
+                visited_sitemap_urls: state.visited_sitemaps.iter().cloned().collect(),
             },
             // In-progress pages go back to the queue on restore: they may not have finished.
             url_queue: state.in_progress.iter().chain(&state.queue).cloned().collect(),
@@ -169,6 +175,7 @@ impl PersistedState for Shared {
             pending_sitemaps: record.sitemap_parsing_progress.pending_sitemap_urls.into_iter().collect(),
             in_progress_sitemap: record.sitemap_parsing_progress.in_progress_sitemap_url,
             in_progress_entries: record.sitemap_parsing_progress.in_progress_entries.into_iter().collect(),
+            visited_sitemaps: record.sitemap_parsing_progress.visited_sitemap_urls.into_iter().collect(),
             abort_loading: record.abort_loading,
             closed: record.closed,
             ..LoaderState::default()
@@ -217,11 +224,19 @@ impl Shared {
                 let next = state.in_progress_sitemap.clone().or_else(|| state.pending_sitemaps.first().cloned());
                 let Some(next) = next else { break };
                 state.in_progress_sitemap = Some(next.clone());
+                state.visited_sitemaps.insert(normalize_url(&next));
                 next
             };
 
             if let Some(contents) = fetch_sitemap(&sitemap, client.as_ref(), &options).await {
-                self.state.lock().pending_sitemaps.extend(contents.nested_sitemaps);
+                {
+                    let mut state = self.state.lock();
+                    for nested in contents.nested_sitemaps {
+                        if !state.visited_sitemaps.contains(&normalize_url(&nested)) {
+                            state.pending_sitemaps.insert(nested);
+                        }
+                    }
+                }
                 for page in contents.pages {
                     let seen = !self.state.lock().in_progress_entries.insert(page.loc.clone());
                     if !seen {
@@ -238,6 +253,11 @@ impl Shared {
             state.in_progress_sitemap = None;
         }
     }
+}
+
+/// The URL as a visited sitemap is remembered by, as `Sitemap::load_entries` does.
+fn normalize_url(url: &str) -> String {
+    url::Url::parse(url).map_or_else(|_| url.to_owned(), |url| url.to_string())
 }
 
 /// Crawls the pages of sitemaps; see the [module documentation](self).
@@ -403,6 +423,7 @@ mod tests {
             state.queue.push_back("https://a.test/2".into());
             state.in_progress.insert("https://a.test/1".into());
             state.request_data.insert("https://a.test/1".into(), Request::new("https://a.test/1"));
+            state.visited_sitemaps.insert("https://a.test/index.xml".into());
         }
         let record = original.to_record();
         let keys: Vec<&str> = record.as_object().unwrap().keys().map(String::as_str).collect();
@@ -418,6 +439,7 @@ mod tests {
         let state = restored.state.lock();
         assert_eq!(state.queue, ["https://a.test/1", "https://a.test/2"], "in-progress pages are queued again");
         assert!(state.request_data.contains_key("https://a.test/1"));
+        assert!(state.visited_sitemaps.contains("https://a.test/index.xml"), "loaded sitemaps are not loaded again");
         assert!(!state.fully_loaded());
     }
 

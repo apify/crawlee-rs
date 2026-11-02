@@ -105,6 +105,9 @@ Differences that make runs faster or waits shorter without doing less work.
 - **Malformed sitemaps.** A sitemap is parsed whole once fetched. A syntax error discards it and
   is retried like a failed fetch. JS streams it: it yields the entries before the error, then the
   error ends the whole `Sitemap.load`.
+- **Cycles of nested sitemaps.** `SitemapRequestLoader` loads each sitemap once and saves the
+  ones it loaded with its state (`visitedSitemapUrls`). JS loads a sitemap again whenever it is
+  listed, so it never finishes a sitemap index that lists itself.
 - **Public Suffix List version.** Domains are computed with the `psl` crate's built-in list and
   `tldts`'s default ICANN-only mode is emulated. The two list snapshots can differ for newly added
   suffixes.
