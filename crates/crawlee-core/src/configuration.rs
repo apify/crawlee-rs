@@ -85,7 +85,10 @@ impl Configuration {
     pub fn from_sources(env: impl Fn(&str) -> Option<String>, file: Option<String>) -> Self {
         let mut config = Configuration::default();
 
-        if let Some(file) = file.and_then(|text| serde_json::from_str::<FileConfiguration>(&text).ok()) {
+        if let Some(file) = file.and_then(|text| {
+            // Some Windows tools write a leading UTF-8 byte order mark, which JSON does not allow.
+            serde_json::from_str::<FileConfiguration>(text.strip_prefix('\u{feff}').unwrap_or(&text)).ok()
+        }) {
             if let Some(v) = file.storage_dir {
                 config.storage_dir = v;
             }
@@ -165,6 +168,13 @@ mod tests {
         assert_eq!(config.memory_mbytes, Some(512), "empty env var is ignored");
         assert_eq!(config.available_memory_ratio, 0.25);
         assert_eq!(config.internal_timeout, None);
+    }
+
+    #[test]
+    fn a_crawlee_json_with_a_utf8_bom_is_read() {
+        let file = "\u{feff}{ \"storageDir\": \"/from/file\" }";
+        let config = Configuration::from_sources(|_| None, Some(file.to_owned()));
+        assert_eq!(config.storage_dir, PathBuf::from("/from/file"));
     }
 
     #[test]
