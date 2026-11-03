@@ -250,9 +250,31 @@ pub fn resolve_base_url_for_filtering(
     }
 }
 
+/// `encodeURIComponent` of JavaScript: percent-encodes the UTF-8 bytes of every character but the
+/// ASCII letters and digits and `-_.!~*'()`, with uppercase hex digits.
+pub fn encode_uri_component(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&byte) {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The results of `encodeURIComponent` in Node.
+    #[test]
+    fn encode_uri_component_matches_javascript() {
+        assert_eq!(encode_uri_component("AZaz09-_.!~*'()"), "AZaz09-_.!~*'()");
+        assert_eq!(encode_uri_component(";/?:@&=+$,# %"), "%3B%2F%3F%3A%40%26%3D%2B%24%2C%23%20%25");
+        assert_eq!(encode_uri_component("a.b:8080/ž😀"), "a.b%3A8080%2F%C5%BE%F0%9F%98%80");
+    }
 
     #[test]
     fn normalize_url_matches_apify_utilities() {
