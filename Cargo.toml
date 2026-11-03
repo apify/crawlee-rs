@@ -36,6 +36,7 @@ indexmap = { version = "2", features = ["serde"] }
 lol_html = "3"
 mime = "0.3"
 parking_lot = "0.12"
+percent-encoding = "2"
 psl = "2"
 quick-xml = "0.42"
 rand = "0.9"

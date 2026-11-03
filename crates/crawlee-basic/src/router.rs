@@ -54,12 +54,25 @@ impl<C: CrawlingContext> Router<C> {
         Self::default()
     }
 
+    /// Routes the requests labeled `label` to `handler`.
+    ///
+    /// # Panics
+    ///
+    /// If `label` already has a route, as Crawlee for JS throws.
     pub fn add_handler(&mut self, label: impl Into<String>, handler: impl RequestHandler<C>) -> &mut Self {
-        self.routes.insert(label.into(), Arc::new(handler));
+        let label = label.into();
+        assert!(!self.routes.contains_key(&label), "Route for label '{label}' is already defined!");
+        self.routes.insert(label, Arc::new(handler));
         self
     }
 
+    /// Routes the requests without a label, or with a label without a route, to `handler`.
+    ///
+    /// # Panics
+    ///
+    /// If there already is a default route, as Crawlee for JS throws.
     pub fn add_default_handler(&mut self, handler: impl RequestHandler<C>) -> &mut Self {
+        assert!(self.default.is_none(), "Default route is already defined!");
         self.default = Some(Arc::new(handler));
         self
     }
@@ -138,5 +151,28 @@ impl<C: CrawlingContext> RequestHandler<C> for Router<C> {
 
     fn max_timeout(&self) -> Option<Duration> {
         self.timeouts.values().copied().max()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::BasicContext;
+
+    /// A label registered twice is a programmer error, which JS throws synchronously.
+    #[test]
+    #[should_panic(expected = "Route for label 'DETAIL' is already defined!")]
+    fn a_duplicate_label_panics() {
+        let mut router = Router::<BasicContext>::new();
+        router.add_handler("DETAIL", |_ctx: BasicContext| async move { Ok(()) });
+        router.add_handler_with_timeout("DETAIL", |_ctx: BasicContext| async move { Ok(()) }, Duration::from_secs(1));
+    }
+
+    #[test]
+    #[should_panic(expected = "Default route is already defined!")]
+    fn a_second_default_route_panics() {
+        let mut router = Router::<BasicContext>::new();
+        router.add_default_handler(|_ctx: BasicContext| async move { Ok(()) });
+        router.add_default_handler(|_ctx: BasicContext| async move { Ok(()) });
     }
 }

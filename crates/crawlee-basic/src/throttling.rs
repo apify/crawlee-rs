@@ -38,7 +38,7 @@ use crawlee_core::{
     KeyValueStore, PacingScope, PacingSignal, Request, RequestManager, RequestQueue, RequestSourceStatus, Services,
     StorageError, StorageIdentifier, StorageResult,
 };
-use crawlee_utils::registrable_domain;
+use crawlee_utils::{encode_uri_component, registrable_domain};
 
 const STATE_KEY: &str = "CRAWLEE_THROTTLED_DOMAINS";
 /// Requests of held-back domains moved out of the inner manager per fetch, at most.
@@ -434,19 +434,6 @@ fn domain_key(host: &str, throttle_by: ThrottleBy) -> String {
     }
 }
 
-/// `encodeURIComponent` of JS.
-fn encode_uri_component(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for byte in text.bytes() {
-        if byte.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&byte) {
-            out.push(byte as char);
-        } else {
-            out.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    out
-}
-
 #[async_trait]
 impl RequestManager for ThrottlingRequestManager {
     async fn add_requests(&self, requests: Vec<Request>, forefront: bool) -> StorageResult<BatchAddRequestsResult> {
@@ -723,7 +710,6 @@ mod tests {
     fn domain_keys() {
         assert_eq!(domain_key("WWW.Example.co.uk.", ThrottleBy::Hostname), "www.example.co.uk");
         assert_eq!(domain_key("www.example.co.uk", ThrottleBy::RegistrableDomain), "example.co.uk");
-        assert_eq!(encode_uri_component("a.b:8080/ž"), "a.b%3A8080%2F%C5%BE");
     }
 
     async fn manager(options: ThrottlingOptions) -> ThrottlingRequestManager {

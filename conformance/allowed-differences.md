@@ -112,6 +112,10 @@ Differences that make runs faster or waits shorter without doing less work.
   added in the background. When adding a batch fails, the requests of that batch and the later ones
   are not crawled, as in JS, but an error is logged; JS ignores the failure. The run goes on either
   way.
+- **Proxy credentials with a bad escape.** `ProxyInfo` percent-decodes the username and password
+  of the proxy URL, as `decodeURIComponent` does. Where that throws, nothing fails: a text whose
+  escapes do not decode to UTF-8 (such as `%FF`) is kept as it is, and a `%` not followed by two
+  hex digits stays a `%`.
 - **Public Suffix List version.** Domains are computed with the `psl` crate's built-in list and
   `tldts`'s default ICANN-only mode is emulated. The two list snapshots can differ for newly added
   suffixes.
