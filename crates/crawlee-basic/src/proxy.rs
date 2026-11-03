@@ -12,7 +12,9 @@ pub struct ProxyInfo {
     pub url: Url,
     pub hostname: String,
     pub port: Option<u16>,
+    /// The username of `url`, percent-decoded.
     pub username: String,
+    /// The password of `url`, percent-decoded.
     pub password: String,
     /// The proxy intercepts HTTPS traffic (a man-in-the-middle proxy): TLS certificate errors are
     /// ignored for the session's requests.
@@ -29,13 +31,19 @@ impl ProxyInfo {
         ProxyInfo {
             hostname: url.host_str().unwrap_or_default().to_owned(),
             port: url.port_or_known_default(),
-            username: url.username().to_owned(),
-            password: url.password().unwrap_or_default().to_owned(),
+            username: decode_credential(url.username()),
+            password: decode_credential(url.password().unwrap_or_default()),
             url,
             ignore_tls_errors: false,
             session_specific: false,
         }
     }
+}
+
+/// `decodeURIComponent` of a URL's username or password. Where JS throws, a text whose escapes do
+/// not decode to UTF-8 is kept as it is, and a `%` without two hex digits stays a `%`.
+fn decode_credential(text: &str) -> String {
+    percent_encoding::percent_decode_str(text).decode_utf8().map_or_else(|_| text.to_owned(), Into::into)
 }
 
 /// Source of proxies for new sessions.
@@ -176,6 +184,16 @@ mod tests {
         assert_eq!(config.new_proxy_info("b").unwrap().hostname, "p2");
         assert_eq!(config.new_proxy_info("c").unwrap().hostname, "p1");
         assert!(ProxyConfiguration::new(["ftp://p"]).is_err());
+    }
+
+    /// The credentials are percent-decoded, as `decodeURIComponent` does in `newProxyInfo` (`+` is
+    /// not a space). An escape that does not decode to UTF-8 is kept as it is.
+    #[test]
+    fn credentials_are_percent_decoded() {
+        let info = ProxyInfo::from_url(Url::parse("http://us%40er+1:p%3Ass%20w@p1:8000").unwrap());
+        assert_eq!((info.username.as_str(), info.password.as_str()), ("us@er+1", "p:ss w"));
+        let info = ProxyInfo::from_url(Url::parse("http://groups-ž:%FF@p1:8000").unwrap());
+        assert_eq!((info.username.as_str(), info.password.as_str()), ("groups-ž", "%FF"));
     }
 
     /// `null` entries rotate like URLs and mean "no proxy" (`proxyUrls: [url, null]` in JS).
