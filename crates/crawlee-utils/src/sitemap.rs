@@ -250,7 +250,7 @@ fn is_xml_mime(essence: &str) -> bool {
 ///   starting with `<?xml`. Otherwise the header's type is used.
 /// - **Gzip.** A gzipped body is decompressed, and a `.gz` suffix is dropped from the URL.
 /// - **Parser.** The XML or text parser is chosen by the content type, or else by the URL's
-///   `.xml` or `.txt` extension.
+///   `.xml` or `.txt` extension. A gzipped body with neither is read as XML.
 ///
 /// `url` is updated when the `.gz` suffix is dropped.
 pub fn decode_sitemap(
@@ -290,6 +290,9 @@ pub fn decode_sitemap(
         parse_sitemap_xml(&text)
     } else if essence == "text/plain" || url.path().ends_with(".txt") {
         Ok(parse_sitemap_txt(&text))
+    } else if essence == "application/gzip" {
+        // A name like `sitemap.gz` says nothing about what was compressed. Sitemaps are XML unless named otherwise.
+        parse_sitemap_xml(&text)
     } else {
         Err(SitemapError::UnsupportedContentType {
             content_type: content_type.unwrap_or_default(),
@@ -373,6 +376,10 @@ mod tests {
         let mut url = Url::parse("https://a.test/sitemap.xml.gz").unwrap();
         assert_eq!(decode_sitemap(&gz, Some("application/octet-stream"), &mut url).unwrap().len(), 1);
         assert_eq!(url.path(), "/sitemap.xml");
+
+        let mut url = Url::parse("https://a.test/sitemap.gz").unwrap();
+        assert_eq!(decode_sitemap(&gz, None, &mut url).unwrap().len(), 1, "gzip without an inner extension is XML");
+        assert_eq!(url.path(), "/sitemap");
 
         let mut url = Url::parse("https://a.test/sitemap").unwrap();
         assert_eq!(decode_sitemap(xml, None, &mut url).unwrap().len(), 1, "sniffed as XML");
