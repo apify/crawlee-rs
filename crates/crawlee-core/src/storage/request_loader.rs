@@ -50,22 +50,22 @@ pub enum RequestSourceStatus {
 
 impl RequestSourceStatus {
     /// The status of two sources read as one (`joinRequestSourceStatuses`): `Ready` first, then
-    /// `Stalled`, `Waiting` and `Finished`. Of two waiting sources, the earlier known wake-up
+    /// `Waiting`, `Stalled` and `Finished`. Of two waiting sources, the earlier known wake-up
     /// wins.
     pub fn join(self, other: RequestSourceStatus) -> RequestSourceStatus {
         use RequestSourceStatus::*;
         match (self, other) {
             (Ready, _) | (_, Ready) => Ready,
-            // A source with work masks a stalled one: the stall only matters once nothing else
-            // can make progress.
-            (stalled @ Stalled { .. }, _) | (_, stalled @ Stalled { .. }) => stalled,
+            // A source with work, now or later, masks a stalled one: the stall only matters once
+            // nothing else can make progress.
             (Waiting { ready_at: a }, Waiting { ready_at: b }) => Waiting {
                 ready_at: match (a, b) {
                     (Some(a), Some(b)) => Some(a.min(b)),
                     (a, b) => a.or(b),
                 },
             },
-            (waiting @ Waiting { .. }, Finished) | (Finished, waiting @ Waiting { .. }) => waiting,
+            (waiting @ Waiting { .. }, _) | (_, waiting @ Waiting { .. }) => waiting,
+            (stalled @ Stalled { .. }, _) | (_, stalled @ Stalled { .. }) => stalled,
             (Finished, Finished) => Finished,
         }
     }
@@ -324,7 +324,8 @@ mod tests {
         let later = soon + Duration::from_secs(1);
         let stalled = || Stalled { reason: "x".into() };
         assert_eq!(stalled().join(Ready), Ready);
-        assert_eq!(Waiting { ready_at: None }.join(stalled()), stalled());
+        assert_eq!(Waiting { ready_at: None }.join(stalled()), Waiting { ready_at: None });
+        assert_eq!(stalled().join(Finished), stalled());
         assert_eq!(Finished.join(Waiting { ready_at: Some(later) }), Waiting { ready_at: Some(later) });
         assert_eq!(
             Waiting { ready_at: Some(later) }.join(Waiting { ready_at: Some(soon) }),

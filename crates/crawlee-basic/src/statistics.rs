@@ -232,8 +232,11 @@ impl Statistics {
         self.max_millis.fetch_max(ms, Ordering::Relaxed);
     }
 
-    fn record_retries(&self, retry_count: u32) {
-        if retry_count > 0 {
+    /// Registers a retry as it happens (`registerRetry`): the request moves from the bucket of its
+    /// previous retry count to the bucket of the new one, so a crawl still running reports its
+    /// retries. The first retry of a request counts it in `requests_retries`.
+    pub fn register_retry(&self, retry_count: u32) {
+        if retry_count == 1 {
             self.retries.fetch_add(1, Ordering::Relaxed);
         }
         let mut detail = self.detail.lock();
@@ -242,6 +245,26 @@ impl Statistics {
             detail.retry_histogram.resize(index + 1, 0);
         }
         detail.retry_histogram[index] += 1;
+        if index > 1 && detail.retry_histogram[index - 1] > 0 {
+            detail.retry_histogram[index - 1] -= 1;
+        }
+    }
+
+    /// Records the retries of a finished request. A request that retried was counted as it did
+    /// (see [`register_retry`](Self::register_retry)); one that was not, such as a request
+    /// restored from a saved state, is counted here.
+    fn record_retries(&self, retry_count: u32) {
+        let mut detail = self.detail.lock();
+        let index = retry_count as usize;
+        if detail.retry_histogram.len() <= index {
+            detail.retry_histogram.resize(index + 1, 0);
+        }
+        if index == 0 {
+            detail.retry_histogram[0] += 1;
+        } else if detail.retry_histogram[index] == 0 {
+            detail.retry_histogram[index] += 1;
+            self.retries.fetch_add(u64::from(retry_count), Ordering::Relaxed);
+        }
     }
 
     pub fn requests_succeeded(&self) -> u64 {
@@ -462,6 +485,21 @@ mod tests {
     }
 
     #[test]
+    fn retries_are_registered_as_they_happen() {
+        let stats = Statistics::with_id("0");
+        stats.start();
+        stats.register_retry(1);
+        assert_eq!((stats.snapshot().requests_retries, stats.snapshot().retry_histogram), (1, vec![0, 1]));
+        stats.register_retry(2);
+        assert_eq!((stats.snapshot().requests_retries, stats.snapshot().retry_histogram), (1, vec![0, 0, 1]));
+        // Finishing a request that was registered changes nothing more.
+        stats.record_success(Duration::from_millis(10), 2);
+        assert_eq!((stats.snapshot().requests_retries, stats.snapshot().retry_histogram), (1, vec![0, 0, 1]));
+        stats.record_success(Duration::from_millis(10), 0);
+        assert_eq!(stats.snapshot().retry_histogram, vec![1, 0, 1]);
+    }
+
+    #[test]
     fn record_has_the_js_shape_and_round_trips() {
         let stats = Statistics::with_id("7");
         stats.start();
@@ -509,7 +547,8 @@ mod tests {
         restored.restore(record).unwrap();
         restored.start();
         let snapshot = restored.snapshot();
-        assert_eq!((snapshot.requests_succeeded, snapshot.requests_failed, snapshot.requests_retries), (1, 1, 1));
+        // The retried request was not registered as it retried, so its 2 retries are added at the end.
+        assert_eq!((snapshot.requests_succeeded, snapshot.requests_failed, snapshot.requests_retries), (1, 1, 2));
         assert_eq!(snapshot.request_min_duration_millis, 50);
         assert_eq!(snapshot.retry_errors.get("boom _"), Some(&1));
         assert_eq!(snapshot.status_codes.get(&200), Some(&1));

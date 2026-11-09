@@ -116,6 +116,14 @@ impl DomainState {
     fn throttled_until(&self) -> i64 {
         self.backoff_until.max(self.crawl_delay_until)
     }
+
+    /// Still refusing, and has been for longer than the window. Not dispatched to, so this lapses a
+    /// window after the last 429 and the domain gets one burst to prove itself with.
+    fn is_stalling(&self, now: i64, max_stall: i64) -> bool {
+        self.rate_limited_since != 0
+            && now - self.last_rate_limited_at <= max_stall
+            && now - self.rate_limited_since > max_stall
+    }
 }
 
 struct Inner {
@@ -320,11 +328,13 @@ impl Shared {
         true
     }
 
-    /// A request of the domain of `url` got through, which ends its run of 429s.
+    /// A request of the domain of `url` got through, which ends its run of 429s, both the stall timing and
+    /// the count the backoff doubles for.
     fn record_progress(&self, url: &str) {
         let Some(domain) = self.domain_of(url) else { return };
         if let Some(domain_state) = self.state.lock().states.get_mut(&domain) {
             domain_state.rate_limited_since = 0;
+            domain_state.consecutive_429_count = 0;
         }
     }
 
@@ -346,8 +356,12 @@ impl Shared {
     async fn fetch_from_inner(&self) -> StorageResult<Option<Request>> {
         for _ in 0..MAX_INNER_MIGRATIONS {
             let Some(mut request) = self.inner_manager.fetch_next_request().await? else { return Ok(None) };
+            let max_stall = self.options.max_domain_stall.as_millis() as i64;
             let held_back = self.domain_of(&request.url).is_some_and(|domain| {
-                self.state.lock().states.get(&domain).is_some_and(|s| now_millis() < s.throttled_until())
+                self.state.lock().states.get(&domain).is_some_and(|s| {
+                    let now = now_millis();
+                    now < s.throttled_until() || s.is_stalling(now, max_stall)
+                })
             });
             if !held_back {
                 return Ok(Some(request));
@@ -410,10 +424,11 @@ impl Shared {
     fn fetchable_domains(&self) -> Vec<(String, Arc<RequestQueue>)> {
         let state = self.state.lock();
         let now = now_millis();
+        let max_stall = self.options.max_domain_stall.as_millis() as i64;
         let mut domains: Vec<(i64, String, Arc<RequestQueue>)> = state
             .states
             .iter()
-            .filter(|(_, s)| now >= s.throttled_until())
+            .filter(|(_, s)| now >= s.throttled_until() && !s.is_stalling(now, max_stall))
             .filter_map(|(domain, s)| Some((s.throttled_until(), domain.clone(), state.queues.get(domain)?.clone())))
             .collect();
         // Stable, so equal deadlines keep the insertion order.
@@ -541,24 +556,22 @@ impl RequestManager for ThrottlingRequestManager {
     }
 
     /// Ready when the inner manager or a domain that is not held back has a request; otherwise
+    /// waiting until the earliest held-back domain with work left may be fetched again; otherwise
     /// stalled when a domain rate-limited every request for longer than `max_domain_stall`, and
-    /// still does; otherwise waiting until the earliest held-back domain may be fetched again.
+    /// still does.
     async fn check_readiness(&self) -> StorageResult<RequestSourceStatus> {
         self.0.ensure_ready().await?;
         let now = now_millis();
         let max_stall = self.0.options.max_domain_stall.as_millis() as i64;
         let mut dispatchable = Vec::new();
         let mut stall_candidates = Vec::new();
-        let mut ready_at: Option<i64> = None;
+        let mut cooling: Vec<(i64, Arc<RequestQueue>)> = Vec::new();
         {
             let state = self.0.state.lock();
             for (domain, domain_state) in &state.states {
                 // A crawl delay can give a domain a clock before it has a queue.
                 let Some(queue) = state.queues.get(domain) else { continue };
-                if domain_state.rate_limited_since != 0
-                    && now - domain_state.last_rate_limited_at <= max_stall
-                    && now - domain_state.rate_limited_since > max_stall
-                {
+                if domain_state.is_stalling(now, max_stall) {
                     // Not dispatchable even when its backoff lapsed: that is what it does between 429s.
                     stall_candidates.push((domain.clone(), domain_state.rate_limited_since, queue.clone()));
                     continue;
@@ -566,8 +579,8 @@ impl RequestManager for ThrottlingRequestManager {
                 let until = domain_state.throttled_until();
                 if now >= until {
                     dispatchable.push(queue.clone());
-                } else if ready_at.is_none_or(|ready_at| until < ready_at) {
-                    ready_at = Some(until);
+                } else {
+                    cooling.push((until, queue.clone()));
                 }
             }
         }
@@ -581,6 +594,21 @@ impl RequestManager for ThrottlingRequestManager {
             return Ok(probed);
         }
 
+        // A cooling domain with nothing left to dispatch is nothing to wait for. In deadline order,
+        // the first with work left is the earliest wake-up.
+        cooling.sort_by_key(|(until, _)| *until);
+        for (until, queue) in cooling {
+            if queue.check_readiness().await? != RequestSourceStatus::Finished {
+                let wait = Duration::from_millis(u64::try_from(until - now).unwrap_or(0));
+                let waiting = RequestSourceStatus::Waiting { ready_at: Some(std::time::Instant::now() + wait) };
+                return Ok(probed.join(waiting));
+            }
+        }
+        // Batches still being added in the background are work no queue shows yet.
+        if self.0.in_progress_batches.any() && probed == RequestSourceStatus::Finished {
+            return Ok(RequestSourceStatus::Waiting { ready_at: None });
+        }
+
         let mut stalled = Vec::new();
         for (domain, since, queue) in stall_candidates {
             if queue.check_readiness().await? == RequestSourceStatus::Ready {
@@ -588,7 +616,7 @@ impl RequestManager for ThrottlingRequestManager {
             }
         }
         if !stalled.is_empty() {
-            return Ok(RequestSourceStatus::Stalled {
+            return Ok(probed.join(RequestSourceStatus::Stalled {
                 reason: format!(
                     "{} rate-limited every request for longer than max_domain_stall ({}s). Waiting longer will not \
                      help - lower the crawler's concurrency, or drop these domains. Their requests are still queued, \
@@ -596,18 +624,9 @@ impl RequestManager for ThrottlingRequestManager {
                     stalled.join(", "),
                     max_stall / 1000
                 ),
-            });
+            }));
         }
 
-        if let Some(until) = ready_at {
-            let wait = Duration::from_millis(u64::try_from(until - now).unwrap_or(0));
-            let waiting = RequestSourceStatus::Waiting { ready_at: Some(std::time::Instant::now() + wait) };
-            return Ok(probed.join(waiting));
-        }
-        // Batches still being added in the background are work no queue shows yet.
-        if self.0.in_progress_batches.any() && probed == RequestSourceStatus::Finished {
-            return Ok(RequestSourceStatus::Waiting { ready_at: None });
-        }
         Ok(probed)
     }
 
@@ -833,6 +852,52 @@ mod tests {
         assert_eq!(result.requests_over_limit.len(), 1);
     }
 
+    #[tokio::test]
+    async fn progress_resets_the_429_count_and_a_finished_cooling_domain_is_not_waited_for() {
+        let manager = manager(ThrottlingOptions::default()).await;
+        manager.add_requests(vec!["https://a.test/1".into(), "https://a.test/2".into()], false).await.unwrap();
+        let mut first = manager.fetch_next_request().await.unwrap().unwrap();
+        manager.record_pacing_signal(&PacingSignal::RateLimited { url: first.url.clone(), wait: None });
+        assert_eq!(manager.0.state.lock().states["a.test"].consecutive_429_count, 1);
+        manager.mark_request_as_handled(&mut first).await.unwrap();
+        assert_eq!(manager.0.state.lock().states["a.test"].consecutive_429_count, 0, "progress resets the count");
+
+        // a.test still cools down and has a request queued: waiting.
+        assert!(matches!(manager.check_readiness().await.unwrap(), RequestSourceStatus::Waiting { ready_at: Some(_) }));
+        // Once its queue has nothing left, the cooldown is not worth waiting for.
+        manager.0.state.lock().states.get_mut("a.test").unwrap().backoff_until = 0;
+        let mut second = manager.fetch_next_request().await.unwrap().unwrap();
+        manager.0.state.lock().states.get_mut("a.test").unwrap().backoff_until = now_millis() + 60_000;
+        manager.mark_request_as_handled(&mut second).await.unwrap();
+        assert_eq!(manager.check_readiness().await.unwrap(), RequestSourceStatus::Finished);
+    }
+
+    #[tokio::test]
+    async fn a_cooling_domain_outranks_a_stalling_one_and_a_stalling_domain_is_not_fetched() {
+        let manager = manager(ThrottlingOptions {
+            domains: ThrottledDomains::List(vec!["a.test".into(), "b.test".into()]),
+            max_domain_stall: Duration::from_secs(10),
+            ..Default::default()
+        })
+        .await;
+        manager
+            .add_requests(vec!["https://a.test/1".into(), "https://b.test/1".into(), "https://b.test/2".into()], false)
+            .await
+            .unwrap();
+        {
+            let mut state = manager.0.state.lock();
+            let a = state.states.get_mut("a.test").unwrap();
+            a.rate_limited_since = now_millis() - 11_000;
+            a.last_rate_limited_at = now_millis();
+            let b = state.states.get_mut("b.test").unwrap();
+            b.crawl_delay_until = now_millis() + 60_000;
+        }
+        assert!(matches!(manager.check_readiness().await.unwrap(), RequestSourceStatus::Waiting { .. }));
+        assert!(manager.fetch_next_request().await.unwrap().is_none(), "neither a.test nor b.test is fetched");
+        manager.0.state.lock().states.get_mut("b.test").unwrap().crawl_delay_until = 0;
+        assert_eq!(manager.fetch_next_request().await.unwrap().unwrap().url, "https://b.test/1");
+    }
+
     async fn manager_with_limit() -> ThrottlingRequestManager {
         manager(ThrottlingOptions { max_throttled_domains: 1, ..Default::default() }).await
     }
@@ -876,8 +941,8 @@ mod tests {
         assert_eq!(manager.check_readiness().await.unwrap(), RequestSourceStatus::Ready);
 
         // A request that gets through ends the run of 429s.
-        manager.0.state.lock().states.get_mut("a.test").unwrap().last_rate_limited_at = now_millis();
         let mut request = manager.fetch_next_request().await.unwrap().unwrap();
+        manager.0.state.lock().states.get_mut("a.test").unwrap().last_rate_limited_at = now_millis();
         manager.mark_request_as_handled(&mut request).await.unwrap();
         assert_eq!(manager.0.state.lock().states["a.test"].rate_limited_since, 0);
         assert_eq!(manager.check_readiness().await.unwrap(), RequestSourceStatus::Ready);

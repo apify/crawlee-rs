@@ -1605,6 +1605,7 @@ where
                 );
                 if request.retry_count == retry_count_before {
                     request.retry_count += 1;
+                    shared.statistics.register_retry(request.retry_count);
                 }
                 None
             }
@@ -1682,6 +1683,7 @@ where
             }
             if !request.no_retry {
                 request.retry_count += 1;
+                shared.statistics.register_retry(request.retry_count);
                 tracing::warn!(
                     retry_count = request.retry_count,
                     "Reclaiming failed request back to the list or queue. {message}"
