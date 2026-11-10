@@ -299,21 +299,21 @@ async fn error_handlers_see_the_data_of_their_attempt() {
         .max_request_retries(1)
         .request_handler(|ctx: BasicContext| async move {
             // A retry starts without the data of the attempt before it.
-            assert_eq!(ctx.attempt_data::<u32>(), None);
-            ctx.set_attempt_data(ctx.request().retry_count + 10);
+            assert_eq!(ctx.unpersisted_state::<u32>(), None);
+            ctx.set_unpersisted_state(ctx.request().retry_count + 10);
             anyhow::bail!("boom")
         })
         .error_handler(move |ctx: BasicContext, _error: Arc<anyhow::Error>| {
             let seen = in_error_handler.clone();
             async move {
-                seen.lock().push(format!("error {:?}", ctx.attempt_data::<u32>()));
+                seen.lock().push(format!("error {:?}", ctx.unpersisted_state::<u32>()));
                 Ok(())
             }
         })
         .failed_request_handler(move |ctx: BasicContext, _error: Arc<anyhow::Error>| {
             let seen = in_failed_request_handler.clone();
             async move {
-                seen.lock().push(format!("failed {:?}", ctx.attempt_data::<u32>()));
+                seen.lock().push(format!("failed {:?}", ctx.unpersisted_state::<u32>()));
                 Ok(())
             }
         })

@@ -161,13 +161,13 @@ pub struct RequestScope {
     returned: Mutex<Option<Request>>,
     /// Extensions of the request's timeouts (`extend_timeout`).
     pub(crate) timeouts: Arc<TimeoutExtensions>,
-    /// What the handlers attached to the attempt (`set_attempt_data`).
-    attempt_data: Arc<AttemptData>,
+    /// What the handlers kept on the attempt (`set_unpersisted_state`).
+    unpersisted_state: Arc<UnpersistedState>,
 }
 
 /// Values by their type.
 #[derive(Default)]
-struct AttemptData(Mutex<HashMap<TypeId, Box<dyn Any + Send + Sync>>>);
+struct UnpersistedState(Mutex<HashMap<TypeId, Box<dyn Any + Send + Sync>>>);
 
 impl RequestScope {
     pub(crate) fn new(shared: Arc<CrawlerShared>, session: Option<Arc<Session>>) -> Arc<Self> {
@@ -177,7 +177,7 @@ impl RequestScope {
             transaction: StorageTransaction::new(),
             returned: Mutex::new(None),
             timeouts: Arc::default(),
-            attempt_data: Arc::default(),
+            unpersisted_state: Arc::default(),
         })
     }
 
@@ -190,7 +190,7 @@ impl RequestScope {
             transaction: StorageTransaction::new(),
             returned: Mutex::new(None),
             timeouts: Arc::default(),
-            attempt_data: attempt.map(|attempt| attempt.attempt_data.clone()).unwrap_or_default(),
+            unpersisted_state: attempt.map(|attempt| attempt.unpersisted_state.clone()).unwrap_or_default(),
         })
     }
 
@@ -285,17 +285,18 @@ impl BasicContext {
         self.scope.session.as_ref()
     }
 
-    /// Attaches `value` to this attempt of the request, replacing the value of the same type
-    /// attached before. The error handler and the failed request handler of the attempt read it
-    /// with [`attempt_data`](Self::attempt_data): in Crawlee for JS they get the context of the
-    /// request handler, with whatever it stored on it. A retry starts without any.
-    pub fn set_attempt_data<T: Clone + Send + Sync + 'static>(&self, value: T) {
-        self.scope.attempt_data.0.lock().insert(TypeId::of::<T>(), Box::new(value));
+    /// Keeps `value` on this attempt of the request, replacing the value of the same type kept
+    /// before. Unlike [`Request::user_data`], it lives only in memory: it is not saved to the
+    /// request queue, and a retry starts without it. The error handler and the failed request
+    /// handler of the attempt read it with [`unpersisted_state`](Self::unpersisted_state), as in
+    /// Crawlee for JS they read what the request handler set on its context.
+    pub fn set_unpersisted_state<T: Clone + Send + Sync + 'static>(&self, value: T) {
+        self.scope.unpersisted_state.0.lock().insert(TypeId::of::<T>(), Box::new(value));
     }
 
-    /// The value of type `T` attached to this attempt (`set_attempt_data`).
-    pub fn attempt_data<T: Clone + Send + Sync + 'static>(&self) -> Option<T> {
-        let data = self.scope.attempt_data.0.lock();
+    /// The value of type `T` kept on this attempt (`set_unpersisted_state`).
+    pub fn unpersisted_state<T: Clone + Send + Sync + 'static>(&self) -> Option<T> {
+        let data = self.scope.unpersisted_state.0.lock();
         data.get(&TypeId::of::<T>()).and_then(|value| value.downcast_ref::<T>()).cloned()
     }
 
