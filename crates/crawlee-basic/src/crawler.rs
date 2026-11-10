@@ -1471,7 +1471,7 @@ where
                 shared.statistics.record_success(started.elapsed(), request.retry_count);
                 Ok(())
             }
-            Err(err) => self.handle_request_failure(&shared, Some(&session), request, err, started).await,
+            Err(err) => self.handle_request_failure(&shared, Some(&scope), request, err, started).await,
         }
     }
 
@@ -1502,7 +1502,7 @@ where
     async fn handle_request_failure(
         &self,
         shared: &Arc<CrawlerShared>,
-        session: Option<&Arc<Session>>,
+        attempt: Option<&RequestScope>,
         request: Request,
         err: anyhow::Error,
         started: Instant,
@@ -1517,7 +1517,7 @@ where
             }
             None => (request, err),
         };
-        self.run_error_handler(shared, session, request, err, started).await
+        self.run_error_handler(shared, attempt, request, err, started).await
     }
 
     /// Settles a skipped request: reports it, then marks it as handled (`trySkipRequest`).
@@ -1569,7 +1569,7 @@ where
     async fn run_error_handler(
         &self,
         shared: &Arc<CrawlerShared>,
-        session: Option<&Arc<Session>>,
+        attempt: Option<&RequestScope>,
         mut request: Request,
         err: anyhow::Error,
         started: Instant,
@@ -1577,9 +1577,10 @@ where
         let internal_timeout = self.internal_timeout();
         let kind = ErrorKind::of(&err);
         let retry_count_before = request.retry_count;
+        let session = attempt.and_then(|attempt| attempt.session.as_ref());
         let handled = tokio::time::timeout(
             internal_timeout,
-            self.request_function_error_handler(shared, session, &mut request, err, kind, started),
+            self.request_function_error_handler(shared, attempt, &mut request, err, kind, started),
         )
         .await;
         let timed_out = handled.is_err();
@@ -1633,13 +1634,14 @@ where
     async fn request_function_error_handler(
         &self,
         shared: &Arc<CrawlerShared>,
-        session: Option<&Arc<Session>>,
+        attempt: Option<&RequestScope>,
         request: &mut Request,
         error: anyhow::Error,
         kind: ErrorKind,
         started: Instant,
     ) -> anyhow::Result<()> {
         let manager = &shared.request_manager;
+        let session = attempt.and_then(|attempt| attempt.session.as_ref());
 
         if kind == ErrorKind::Throttled {
             // Never really attempted: no retry is spent and the session is not blamed.
@@ -1661,7 +1663,7 @@ where
             shared.statistics.record_retry(&message);
             if let Some(handler) = &self.inner.error_handler
                 && let Err(handler_error) =
-                    self.call_error_handler(handler, shared, session, request, error.clone()).await
+                    self.call_error_handler(handler, shared, attempt, request, error.clone()).await
             {
                 let Some((reason, skip_message)) = skip_of(&handler_error) else {
                     return Err(handler_error);
@@ -1704,7 +1706,7 @@ where
         tracing::error!("Request failed and reached maximum retries. {message}");
 
         if let Some(handler) = &self.inner.failed_request_handler
-            && let Err(handler_error) = self.call_error_handler(handler, shared, session, request, error).await
+            && let Err(handler_error) = self.call_error_handler(handler, shared, attempt, request, error).await
         {
             if skip_of(&handler_error).is_none() {
                 return Err(handler_error);
@@ -1728,17 +1730,18 @@ where
         request.retry_count < request.max_retries().unwrap_or(self.inner.options.max_request_retries)
     }
 
-    /// Runs an error handler with a fresh context; its storage writes are committed if it
-    /// succeeds. Changes it makes to the request are kept, whatever the outcome.
+    /// Runs an error handler with a fresh context, which has the session and the data of the
+    /// failed attempt; its storage writes are committed if it succeeds. Changes it makes to the
+    /// request are kept, whatever the outcome.
     async fn call_error_handler(
         &self,
         handler: &Arc<dyn ErrorHandler>,
         shared: &Arc<CrawlerShared>,
-        session: Option<&Arc<Session>>,
+        attempt: Option<&RequestScope>,
         request: &mut Request,
         error: Arc<anyhow::Error>,
     ) -> anyhow::Result<()> {
-        let scope = RequestScope::new(shared.clone(), session.cloned());
+        let scope = RequestScope::for_error_handler(shared.clone(), attempt);
         let outcome = AssertUnwindSafe(handler.handle(BasicContext::new(request.clone(), scope.clone()), error))
             .catch_unwind()
             .await;

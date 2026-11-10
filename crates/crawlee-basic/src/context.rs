@@ -1,5 +1,7 @@
 //! The crawling context handed to request handlers.
 
+use std::any::{Any, TypeId};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -159,7 +161,13 @@ pub struct RequestScope {
     returned: Mutex<Option<Request>>,
     /// Extensions of the request's timeouts (`extend_timeout`).
     pub(crate) timeouts: Arc<TimeoutExtensions>,
+    /// What the handlers kept on the attempt (`set_unpersisted_state`).
+    unpersisted_state: Arc<UnpersistedState>,
 }
+
+/// Values by their type.
+#[derive(Default)]
+struct UnpersistedState(Mutex<HashMap<TypeId, Box<dyn Any + Send + Sync>>>);
 
 impl RequestScope {
     pub(crate) fn new(shared: Arc<CrawlerShared>, session: Option<Arc<Session>>) -> Arc<Self> {
@@ -169,6 +177,20 @@ impl RequestScope {
             transaction: StorageTransaction::new(),
             returned: Mutex::new(None),
             timeouts: Arc::default(),
+            unpersisted_state: Arc::default(),
+        })
+    }
+
+    /// The scope of an error handler of the attempt of `attempt` (or of an attempt that failed
+    /// before it had a scope): the attempt's session and data, with a transaction of its own.
+    pub(crate) fn for_error_handler(shared: Arc<CrawlerShared>, attempt: Option<&RequestScope>) -> Arc<Self> {
+        Arc::new(RequestScope {
+            shared,
+            session: attempt.and_then(|attempt| attempt.session.clone()),
+            transaction: StorageTransaction::new(),
+            returned: Mutex::new(None),
+            timeouts: Arc::default(),
+            unpersisted_state: attempt.map(|attempt| attempt.unpersisted_state.clone()).unwrap_or_default(),
         })
     }
 
@@ -261,6 +283,21 @@ impl BasicContext {
 
     pub fn session(&self) -> Option<&Arc<Session>> {
         self.scope.session.as_ref()
+    }
+
+    /// Keeps `value` on this attempt of the request, replacing the value of the same type kept
+    /// before. Unlike [`Request::user_data`], it lives only in memory: it is not saved to the
+    /// request queue, and a retry starts without it. The error handler and the failed request
+    /// handler of the attempt read it with [`unpersisted_state`](Self::unpersisted_state), as in
+    /// Crawlee for JS they read what the request handler set on its context.
+    pub fn set_unpersisted_state<T: Clone + Send + Sync + 'static>(&self, value: T) {
+        self.scope.unpersisted_state.0.lock().insert(TypeId::of::<T>(), Box::new(value));
+    }
+
+    /// The value of type `T` kept on this attempt (`set_unpersisted_state`).
+    pub fn unpersisted_state<T: Clone + Send + Sync + 'static>(&self) -> Option<T> {
+        let data = self.scope.unpersisted_state.0.lock();
+        data.get(&TypeId::of::<T>()).and_then(|value| value.downcast_ref::<T>()).cloned()
     }
 
     pub fn proxy_info(&self) -> Option<&ProxyInfo> {
