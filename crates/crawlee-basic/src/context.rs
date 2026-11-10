@@ -1,5 +1,7 @@
 //! The crawling context handed to request handlers.
 
+use std::any::{Any, TypeId};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
@@ -159,7 +161,13 @@ pub struct RequestScope {
     returned: Mutex<Option<Request>>,
     /// Extensions of the request's timeouts (`extend_timeout`).
     pub(crate) timeouts: Arc<TimeoutExtensions>,
+    /// What the handlers attached to the attempt (`set_attempt_data`).
+    attempt_data: Arc<AttemptData>,
 }
+
+/// Values by their type.
+#[derive(Default)]
+struct AttemptData(Mutex<HashMap<TypeId, Box<dyn Any + Send + Sync>>>);
 
 impl RequestScope {
     pub(crate) fn new(shared: Arc<CrawlerShared>, session: Option<Arc<Session>>) -> Arc<Self> {
@@ -169,6 +177,20 @@ impl RequestScope {
             transaction: StorageTransaction::new(),
             returned: Mutex::new(None),
             timeouts: Arc::default(),
+            attempt_data: Arc::default(),
+        })
+    }
+
+    /// The scope of an error handler of the attempt of `attempt` (or of an attempt that failed
+    /// before it had a scope): the attempt's session and data, with a transaction of its own.
+    pub(crate) fn for_error_handler(shared: Arc<CrawlerShared>, attempt: Option<&RequestScope>) -> Arc<Self> {
+        Arc::new(RequestScope {
+            shared,
+            session: attempt.and_then(|attempt| attempt.session.clone()),
+            transaction: StorageTransaction::new(),
+            returned: Mutex::new(None),
+            timeouts: Arc::default(),
+            attempt_data: attempt.map(|attempt| attempt.attempt_data.clone()).unwrap_or_default(),
         })
     }
 
@@ -261,6 +283,20 @@ impl BasicContext {
 
     pub fn session(&self) -> Option<&Arc<Session>> {
         self.scope.session.as_ref()
+    }
+
+    /// Attaches `value` to this attempt of the request, replacing the value of the same type
+    /// attached before. The error handler and the failed request handler of the attempt read it
+    /// with [`attempt_data`](Self::attempt_data): in Crawlee for JS they get the context of the
+    /// request handler, with whatever it stored on it. A retry starts without any.
+    pub fn set_attempt_data<T: Clone + Send + Sync + 'static>(&self, value: T) {
+        self.scope.attempt_data.0.lock().insert(TypeId::of::<T>(), Box::new(value));
+    }
+
+    /// The value of type `T` attached to this attempt (`set_attempt_data`).
+    pub fn attempt_data<T: Clone + Send + Sync + 'static>(&self) -> Option<T> {
+        let data = self.scope.attempt_data.0.lock();
+        data.get(&TypeId::of::<T>()).and_then(|value| value.downcast_ref::<T>()).cloned()
     }
 
     pub fn proxy_info(&self) -> Option<&ProxyInfo> {
