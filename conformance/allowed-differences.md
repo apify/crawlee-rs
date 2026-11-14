@@ -116,6 +116,10 @@ Differences that make runs faster or waits shorter without doing less work.
   of the proxy URL, as `decodeURIComponent` does. Where that throws, nothing fails: a text whose
   escapes do not decode to UTF-8 (such as `%FF`) is kept as it is, and a `%` not followed by two
   hex digits stays a `%`.
+- **`Request.state` is not tracked.** Crawlee for JS sets `request.state` (`RequestState`) as a
+  request goes through navigation, its handler and its error handling. crawlee-rs never sets it:
+  the field only keeps a state another implementation wrote, so it survives a round trip through
+  the queue.
 - **Public Suffix List version.** Domains are computed with the `psl` crate's built-in list and
   `tldts`'s default ICANN-only mode is emulated. The two list snapshots can differ for newly added
   suffixes.

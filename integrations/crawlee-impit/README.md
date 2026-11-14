@@ -43,8 +43,8 @@ The crate is not published yet, so depend on it by git. Your project needs four 
 
    ```toml
    [dependencies]
-   crawlee = { git = "https://github.com/apify-projects/crawlee-rs" }
-   crawlee-impit = { git = "https://github.com/apify-projects/crawlee-rs" }
+   crawlee = { git = "https://github.com/apify/crawlee-rs" }
+   crawlee-impit = { git = "https://github.com/apify/crawlee-rs" }
    ```
 
 2. The patches, also in `Cargo.toml`, at the same revisions as in this crate's
