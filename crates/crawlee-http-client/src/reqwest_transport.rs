@@ -399,4 +399,47 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, HttpClientError::BodyTooLarge { limit: 1000 }));
     }
+
+    /// The address of a port nothing listens on.
+    fn refusing() -> std::net::SocketAddr {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap()
+    }
+
+    /// A proxy that answers each `CONNECT` with `407 Proxy Authentication Required`.
+    async fn rejecting_proxy() -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0; 1024];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket.write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n").await;
+            }
+        });
+        addr
+    }
+
+    /// Failing to reach a server through a proxy is the proxy's fault (and so the session's,
+    /// whose proxy it is); failing to reach it directly is not.
+    #[tokio::test]
+    async fn connection_failures_through_a_proxy_are_proxy_errors() {
+        let transport = ReqwestTransport::new();
+        let fetch = |url: String, proxy: Option<std::net::SocketAddr>| {
+            let options = TransportOptions {
+                proxy_url: proxy.map(|addr| Url::parse(&format!("http://{addr}")).unwrap()),
+                ..Default::default()
+            };
+            let transport = &transport;
+            async move { transport.fetch(HttpRequest::get(Url::parse(&url).unwrap()), &options).await.unwrap_err() }
+        };
+        let dead = refusing();
+
+        let direct = fetch(format!("http://{dead}/"), None).await;
+        assert!(matches!(direct, HttpClientError::Connect(_)), "{direct:?}");
+        let via_dead_proxy = fetch("http://a.example/".to_owned(), Some(dead)).await;
+        assert!(matches!(via_dead_proxy, HttpClientError::Proxy(_)), "{via_dead_proxy:?}");
+        let tunnel_refused = fetch("https://a.example/".to_owned(), Some(rejecting_proxy().await)).await;
+        assert!(matches!(tunnel_refused, HttpClientError::Proxy(_)), "{tunnel_refused:?}");
+    }
 }
