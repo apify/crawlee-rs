@@ -28,7 +28,7 @@ cargo run
 With [cargo-generate](https://github.com/cargo-generate/cargo-generate) (`cargo install cargo-generate`):
 
 ```sh
-cargo generate --git https://github.com/apify-projects/crawlee-rs templates/html --name my-crawler
+cargo generate --git https://github.com/apify/crawlee-rs templates/html --name my-crawler
 cd my-crawler
 cargo run
 ```

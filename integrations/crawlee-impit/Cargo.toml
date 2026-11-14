@@ -5,7 +5,7 @@ version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
 license = "Apache-2.0"
-repository = "https://github.com/apify-projects/crawlee-rs"
+repository = "https://github.com/apify/crawlee-rs"
 publish = false
 
 # impit needs patched `rustls`, `h2`, `tower-http` and `hyper-util` and `--cfg reqwest_unstable`

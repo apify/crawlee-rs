@@ -42,7 +42,7 @@ cd templates/json-api && cargo run          # typed JSON from the Hacker News AP
 ```
 
 To start your own project from one of them:
-`cargo generate --git https://github.com/apify-projects/crawlee-rs templates/html --name my-crawler`.
+`cargo generate --git https://github.com/apify/crawlee-rs templates/html --name my-crawler`.
 
 ## Benchmark
 
@@ -234,7 +234,10 @@ These are planned in this order, following `docs/plan.md`:
 1. **Side-by-side crawl comparison** (level 3 of the conformance plan): the same crawl run by
    both implementations against the fixture server, comparing their outputs. Today the two are
    compared function by function (golden files) and by benchmark.
-2. **Later:** an Apify SDK crate on top of the Rust `apify-client`; browser and adaptive crawlers.
+2. **Later:** browser and adaptive crawlers.
+
+The Apify SDK for Rust, [apify-sdk-rs](https://github.com/apify/apify-sdk-rs), runs crawlee-rs
+crawlers as Actors on the Apify platform.
 
 ## Development
 
