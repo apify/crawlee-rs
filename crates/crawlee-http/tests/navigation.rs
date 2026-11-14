@@ -239,6 +239,63 @@ async fn the_session_fingerprint_and_its_proxy_tls_mode_reach_the_client() {
     assert!(sent[0].fingerprint.is_some());
 }
 
+/// A proxy nothing listens on, which records the sessions it is asked for.
+struct DeadProxy {
+    url: url::Url,
+    sessions: parking_lot::Mutex<Vec<String>>,
+}
+
+impl ProxySource for DeadProxy {
+    fn new_proxy_info(&self, session_id: &str) -> Option<ProxyInfo> {
+        self.sessions.lock().push(session_id.to_owned());
+        Some(ProxyInfo::from_url(self.url.clone()))
+    }
+}
+
+/// A proxy that cannot be reached is the session's fault: the attempt fails with a session error,
+/// which retires the session, so that the retry goes through a new session and its new proxy.
+#[tokio::test]
+async fn an_unreachable_proxy_retires_the_session_of_each_attempt() {
+    let port = std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let proxy = Arc::new(DeadProxy {
+        url: url::Url::parse(&format!("http://127.0.0.1:{port}")).unwrap(),
+        sessions: Default::default(),
+    });
+    // The session of each failed attempt, whether it failed with a session error, and whether
+    // the session was still usable.
+    type Attempts = Arc<parking_lot::Mutex<Vec<(String, bool, bool)>>>;
+    let attempts = Attempts::default();
+    let record = |attempts: &Attempts| {
+        let attempts = attempts.clone();
+        move |ctx: BasicContext, err: Arc<anyhow::Error>| {
+            let session = ctx.session().unwrap();
+            let is_session_error = err.chain().any(|cause| cause.is::<crawlee_core::SessionError>());
+            attempts.lock().push((session.id().to_owned(), is_session_error, session.is_usable()));
+            async move { Ok(()) }
+        }
+    };
+    let crawler = HttpCrawler::builder()
+        .services(Services::in_memory())
+        .max_request_retries(2)
+        .proxy_configuration(proxy.clone())
+        .request_handler(|_ctx: HttpContext| async move { Ok(()) })
+        .error_handler(record(&attempts))
+        .failed_request_handler(record(&attempts))
+        .build()
+        .unwrap();
+    let stats = crawler.run(["http://a.example/"]).await.unwrap();
+    assert_eq!(stats.requests_failed, 1);
+
+    let attempts = attempts.lock();
+    assert_eq!(attempts.len(), 3, "{attempts:?}");
+    assert!(attempts.iter().all(|(_, is_session_error, _)| *is_session_error), "{attempts:?}");
+    let sessions: Vec<_> = attempts.iter().map(|(id, ..)| id.clone()).collect();
+    assert_eq!(*proxy.sessions.lock(), sessions, "a new session, and a new proxy, for each attempt");
+    // The error handler runs before the session is retired; the failed request handler after.
+    let usable: Vec<_> = attempts.iter().map(|(.., usable)| *usable).collect();
+    assert_eq!(usable, [true, true, false]);
+}
+
 /// `querySelectorAll` / `querySelectorOne` / `waitForSelector` of the HTTP crawler's context.
 #[tokio::test]
 async fn query_selectors_fail_when_nothing_matches() {

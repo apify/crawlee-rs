@@ -2016,3 +2016,236 @@ async fn statistics_can_be_saved_under_another_key() {
     let resumed = crawl(false, "https://a.dev/2").await;
     assert_eq!(resumed.requests_succeeded(), 2, "picked up from the other key");
 }
+
+/// Records each `PersistState { is_migrating: true }` with the value of `probe` at that moment.
+fn record_migration_saves<T: Send + 'static>(
+    services: &Services,
+    probe: impl Fn() -> T + Send + Sync + 'static,
+) -> Arc<Mutex<Vec<T>>> {
+    use crawlee_core::{Event, EventKind};
+    let saves = Arc::new(Mutex::new(Vec::new()));
+    let log = saves.clone();
+    services.events.on(EventKind::PersistState, move |event| {
+        if let Event::PersistState { is_migrating: true } = event {
+            log.lock().push(probe());
+        }
+        async {}
+    });
+    saves
+}
+
+async fn wait_for<T>(saves: &Mutex<Vec<T>>) {
+    for _ in 0..400 {
+        if !saves.lock().is_empty() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    panic!("no migration save");
+}
+
+/// On `Migrating`, the crawler pauses and saves its state once the running request finished
+/// (`pauseOnMigration`), and no request starts after that.
+#[tokio::test]
+async fn a_migration_saves_after_the_running_request_and_starts_nothing_more() {
+    let services = services();
+    let (started, finished) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let saves = record_migration_saves(&services, {
+        let finished = finished.clone();
+        move || finished.load(Ordering::SeqCst)
+    });
+    let crawler = BasicCrawler::builder()
+        .services(services.clone())
+        .max_concurrency(1)
+        .request_handler({
+            let (started, finished) = (started.clone(), finished.clone());
+            move |_ctx: BasicContext| {
+                let (started, finished) = (started.clone(), finished.clone());
+                async move {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    finished.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            }
+        })
+        .build()
+        .unwrap();
+    let run = tokio::spawn({
+        let crawler = crawler.clone();
+        async move { crawler.run(["https://a.dev/1", "https://a.dev/2", "https://a.dev/3"]).await.unwrap() }
+    });
+    while started.load(Ordering::SeqCst) == 0 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    services.events.emit(crawlee_core::Event::Migrating);
+    wait_for(&saves).await;
+    assert_eq!(saves.lock().clone(), [1], "saved once, after the running request finished");
+
+    // Unlike an abort, the queue stays paused: the run continues on another host.
+    crawler.resume().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(started.load(Ordering::SeqCst), 1, "no request starts after a migration");
+    crawler.stop(None);
+    assert_eq!(run.await.unwrap().requests_succeeded, 1);
+}
+
+/// A request that runs on does not hold the migration save back for more than 20 seconds
+/// (`SAFE_MIGRATION_WAIT_MILLIS`).
+#[tokio::test(start_paused = true)]
+async fn a_migration_saves_after_20_seconds_while_a_request_still_runs() {
+    let services = services();
+    let (started, finished) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+    let begun = tokio::time::Instant::now();
+    let saves = record_migration_saves(&services, {
+        let finished = finished.clone();
+        move || (begun.elapsed(), finished.load(Ordering::SeqCst))
+    });
+    let crawler = BasicCrawler::builder()
+        .services(services.clone())
+        .request_handler({
+            let (started, finished) = (started.clone(), finished.clone());
+            move |_ctx: BasicContext| {
+                let (started, finished) = (started.clone(), finished.clone());
+                async move {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_secs(40)).await;
+                    finished.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            }
+        })
+        .build()
+        .unwrap();
+    let run = tokio::spawn({
+        let crawler = crawler.clone();
+        async move { crawler.run(["https://a.dev/1"]).await.unwrap() }
+    });
+    while started.load(Ordering::SeqCst) == 0 {
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    services.events.emit(crawlee_core::Event::Migrating);
+    while saves.lock().is_empty() {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let (at, finished_then) = saves.lock()[0];
+    assert_eq!(finished_then, 0, "saved while the request still ran");
+    assert!(at >= Duration::from_secs(20) && at < Duration::from_secs(21), "{at:?}");
+    // A paused crawler does not finish, even when stopped (as in Crawlee for JS).
+    crawler.resume().await.unwrap();
+    crawler.stop(None);
+    assert_eq!(run.await.unwrap().requests_succeeded, 1, "the running request was not cut off");
+}
+
+/// The run that goes on after a migration crawls only the requests the first one did not handle.
+#[tokio::test]
+async fn after_a_migration_the_next_run_does_not_crawl_the_handled_requests_again() {
+    // Built first, so that neither crawl below is the first crawler of the process, which alone
+    // uses the default request queue.
+    noop_crawler().build().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let handled = Arc::new(Mutex::new(Vec::new()));
+    let crawler_on = |purge_on_start: bool| {
+        let configuration =
+            Configuration { storage_dir: dir.path().to_owned(), purge_on_start, ..Configuration::default() };
+        let services = Services::from_configuration(configuration);
+        let log = handled.clone();
+        let crawler = BasicCrawler::builder()
+            .services(services.clone())
+            .id("migrate")
+            .max_concurrency(1)
+            .request_handler(move |ctx: BasicContext| {
+                let log = log.clone();
+                async move {
+                    log.lock().push(ctx.request().url.clone());
+                    Ok(())
+                }
+            })
+            .build()
+            .unwrap();
+        (services, crawler)
+    };
+
+    let (services, crawler) = crawler_on(true);
+    let saves = record_migration_saves(&services, || ());
+    crawler.add_requests(["https://a.dev/1", "https://a.dev/2", "https://a.dev/3"]).await.unwrap();
+    let run = tokio::spawn({
+        let crawler = crawler.clone();
+        async move { crawler.run(Vec::<Request>::new()).await.unwrap() }
+    });
+    while handled.lock().is_empty() {
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    services.events.emit(crawlee_core::Event::Migrating);
+    wait_for(&saves).await;
+    crawler.resume().await.unwrap();
+    crawler.stop(None);
+    let first = run.await.unwrap();
+    let before = handled.lock().len();
+    assert_eq!(first.requests_succeeded as usize, before);
+    assert!(before < 3, "the migration came before the end of the crawl");
+
+    // On the new host the run goes on with its storages, without purging them.
+    let (_, crawler) = crawler_on(false);
+    crawler.run(Vec::<Request>::new()).await.unwrap();
+    let mut urls = handled.lock().clone();
+    urls.sort();
+    assert_eq!(urls, ["https://a.dev/1", "https://a.dev/2", "https://a.dev/3"], "each request once");
+}
+
+/// What each outcome of a request does to its session (`markGood`, `markBad`, `retire`): a
+/// success counts a use and lowers the error score, a failure counts a use and raises it, a
+/// skipped request leaves the session alone, and a session error retires it without also counting
+/// as a failure.
+#[tokio::test]
+async fn each_outcome_of_a_request_scores_its_session() {
+    use crawlee_basic::{SessionOptions, SessionPoolOptions};
+    // The session's id, use count and error score at the start of each request.
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let last = Arc::new(Mutex::new(None));
+    let crawler = BasicCrawler::builder()
+        .services(services())
+        .max_concurrency(1)
+        .max_request_retries(0)
+        .session_pool_options(SessionPoolOptions {
+            max_pool_size: 1,
+            session_options: SessionOptions { max_error_score: 3.0, ..SessionOptions::default() },
+            ..SessionPoolOptions::default()
+        })
+        .request_handler({
+            let (seen, last) = (seen.clone(), last.clone());
+            move |ctx: BasicContext| {
+                let session = ctx.session().unwrap().clone();
+                seen.lock().push((session.id().to_owned(), session.usage_count(), session.error_score()));
+                *last.lock() = Some(session);
+                async move {
+                    match ctx.request().url.rsplit('/').next().unwrap() {
+                        "fail" => anyhow::bail!("failed"),
+                        "skip" => Err(ctx.skip_request(None)),
+                        "session" => Err(SessionError::new("blocked").into()),
+                        _ => Ok(()),
+                    }
+                }
+            }
+        })
+        .build()
+        .unwrap();
+    let urls = [
+        "https://a.dev/fail",
+        "https://a.dev/1/ok",
+        "https://a.dev/2/ok",
+        "https://a.dev/skip",
+        "https://a.dev/session",
+    ];
+    crawler.run(urls).await.unwrap();
+
+    let seen = seen.lock();
+    assert!(seen.iter().all(|(id, ..)| *id == seen[0].0), "one session for all: {seen:?}");
+    let scores: Vec<_> = seen.iter().map(|(_, usage, score)| (*usage, *score)).collect();
+    assert_eq!(scores, [(0, 0.0), (1, 1.0), (2, 0.5), (3, 0.0), (3, 0.0)]);
+    let session = last.lock().clone().unwrap();
+    assert!(session.is_retired());
+    assert_eq!((session.usage_count(), session.error_score()), (4, 3.0));
+}
