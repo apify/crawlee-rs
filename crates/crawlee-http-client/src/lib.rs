@@ -178,7 +178,10 @@ impl ResponseBody {
         Ok(chunk)
     }
 
-    /// The whole body. A body of a single chunk is not copied.
+    /// The whole body. A body of a single chunk is not copied, and the others are copied once:
+    /// into a buffer of their length when it is known, else, once they are all read, into one of
+    /// their total (a decompressed body), rather than into a buffer that grows, and is copied, as
+    /// they come.
     pub async fn bytes(mut self) -> Result<Bytes, HttpClientError> {
         let Some(first) = self.chunk().await? else {
             return Ok(Bytes::new());
@@ -187,10 +190,21 @@ impl ResponseBody {
             return Ok(first);
         };
         let mut buffer = body_buffer(self.exact_len, self.max_size);
-        buffer.extend_from_slice(&first);
-        buffer.extend_from_slice(&second);
+        if buffer.capacity() > 0 {
+            buffer.extend_from_slice(&first);
+            buffer.extend_from_slice(&second);
+            while let Some(chunk) = self.chunk().await? {
+                buffer.extend_from_slice(&chunk);
+            }
+            return Ok(buffer.freeze());
+        }
+        let mut chunks = vec![first, second];
         while let Some(chunk) = self.chunk().await? {
-            buffer.extend_from_slice(&chunk);
+            chunks.push(chunk);
+        }
+        buffer.reserve(chunks.iter().map(Bytes::len).sum());
+        for chunk in &chunks {
+            buffer.extend_from_slice(chunk);
         }
         Ok(buffer.freeze())
     }
@@ -562,6 +576,29 @@ mod tests {
             }
             Ok(Some(Bytes::from_static(self.0.remove(0))))
         }
+    }
+
+    /// A body that yields its chunks one by one, then ends.
+    struct Finite(Vec<Bytes>);
+
+    #[async_trait]
+    impl BodyStream for Finite {
+        async fn next_chunk(&mut self) -> Result<Option<Bytes>, HttpClientError> {
+            Ok((!self.0.is_empty()).then(|| self.0.remove(0)))
+        }
+    }
+
+    /// A body of many chunks reads whole, whether its length is known or not (a decompressed body).
+    #[tokio::test]
+    async fn a_body_of_many_chunks_reads_whole() {
+        let chunks: Vec<Bytes> = (0..200u8).map(|i| Bytes::from(vec![i; 1000 + usize::from(i)])).collect();
+        let expected: Vec<u8> = chunks.iter().flat_map(|chunk| chunk.to_vec()).collect();
+        for exact_len in [None, Some(expected.len() as u64)] {
+            let body = ResponseBody::from_stream(Finite(chunks.clone()), exact_len);
+            assert_eq!(body.bytes().await.unwrap(), expected, "{exact_len:?}");
+        }
+        let body = ResponseBody::from_stream(Finite(vec![Bytes::from_static(b"one")]), None);
+        assert_eq!(body.bytes().await.unwrap(), "one");
     }
 
     #[test]
