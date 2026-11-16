@@ -786,6 +786,17 @@ where
         }
     }
 
+    /// Ends the run now (`autoscaledPool.abort()`): no new request starts, and the running ones
+    /// are cancelled at their next `.await`, so [`run`](Self::run) returns without waiting for
+    /// them, as in JS (where they are left to the process exit). Their requests are not given back
+    /// to the queue, and requests still in the queue are left there.
+    pub fn abort(&self) {
+        match self.live_run() {
+            Some(run) => run.abort(),
+            None => tracing::warn!("Cannot abort a crawler that is not running."),
+        }
+    }
+
     /// Whether [`run`](Self::run) is in progress.
     pub fn running(&self) -> bool {
         self.live_run().is_some()

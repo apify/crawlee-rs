@@ -1491,6 +1491,50 @@ async fn stop_lets_running_requests_finish_and_starts_no_more() {
 }
 
 #[tokio::test]
+async fn abort_ends_the_run_without_waiting_for_the_running_requests() {
+    let slot: Arc<Mutex<Option<BasicCrawler>>> = Arc::default();
+    let crawler_slot = slot.clone();
+    let crawler = BasicCrawler::builder()
+        .services(services())
+        .desired_concurrency(3)
+        .request_handler(move |ctx: BasicContext| {
+            let crawler_slot = crawler_slot.clone();
+            async move {
+                if ctx.request().url.ends_with("/abort") {
+                    // the others have started
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    let crawler = crawler_slot.lock().clone().unwrap();
+                    crawler.abort();
+                } else {
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }
+                Ok(())
+            }
+        })
+        .build()
+        .unwrap();
+    *slot.lock() = Some(crawler.clone());
+    let stats = tokio::time::timeout(
+        Duration::from_secs(10),
+        crawler.run(["https://a.dev/slow-1", "https://a.dev/slow-2", "https://a.dev/abort"]),
+    )
+    .await
+    .expect("the run ends without waiting for the slow requests")
+    .unwrap();
+    // the request that aborted may still finish, the slow ones are cancelled
+    assert!(stats.requests_succeeded <= 1, "{stats:?}");
+    assert_eq!(stats.requests_failed, 0);
+    assert!(!crawler.running());
+}
+
+#[tokio::test]
+async fn abort_outside_a_run_does_nothing() {
+    let crawler = noop_crawler().build().unwrap();
+    crawler.abort();
+    assert_eq!(crawler.run(["https://a.dev/"]).await.unwrap().requests_succeeded, 1);
+}
+
+#[tokio::test]
 async fn keep_alive_waits_for_more_requests_until_stopped() {
     let crawler = noop_crawler().keep_alive(true).build().unwrap();
     let run = tokio::spawn({
