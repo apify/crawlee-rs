@@ -121,7 +121,7 @@ fn options() -> HttpCrawlerOptions {
 fn defaults_are_those_of_crawlee_for_js() {
     let options = HttpCrawlerOptions::default();
     assert_eq!(options.navigation_timeout, Duration::from_secs(30));
-    assert!(options.ignore_tls_errors);
+    assert!(!options.ignore_tls_errors, "TLS certificates are verified by default");
     assert_eq!(options.max_body_size, None);
     assert!(!options.retry_on_blocked);
 }
@@ -237,6 +237,20 @@ async fn the_session_fingerprint_and_its_proxy_tls_mode_reach_the_client() {
     let sent = client.0.lock();
     assert!(sent[0].ignore_tls_errors);
     assert!(sent[0].fingerprint.is_some());
+}
+
+/// Without a proxy that asks otherwise, the client verifies TLS certificates (crawlee#4317).
+#[tokio::test]
+async fn tls_certificates_are_verified_by_default() {
+    let client = Arc::new(Recording::default());
+    let crawler = HttpCrawler::builder_with_options(options())
+        .services(Services::in_memory())
+        .http_client(client.clone())
+        .request_handler(|_ctx: HttpContext| async move { Ok(()) })
+        .build()
+        .unwrap();
+    crawler.run(["https://a.example/"]).await.unwrap();
+    assert!(!client.0.lock()[0].ignore_tls_errors);
 }
 
 /// A proxy nothing listens on, which records the sessions it is asked for.

@@ -102,7 +102,8 @@ pub struct HttpCrawlerOptions {
     pub suggest_response_encoding: Option<&'static Encoding>,
     /// Store `Set-Cookie` of responses in the session.
     pub save_response_cookies: bool,
-    /// Ignore TLS certificate errors (default `true`, as in Crawlee for JS).
+    /// Ignore TLS certificate errors (default `false`: certificates are verified, as in Crawlee
+    /// for JS). A proxy whose `ignore_tls_errors` is set turns verification off for its requests.
     pub ignore_tls_errors: bool,
     /// Larger bodies fail the request (without retries). No limit by default.
     pub max_body_size: Option<usize>,
@@ -122,7 +123,7 @@ impl Default for HttpCrawlerOptions {
             force_response_encoding: None,
             suggest_response_encoding: None,
             save_response_cookies: true,
-            ignore_tls_errors: true,
+            ignore_tls_errors: false,
             max_body_size: None,
             pre_navigation_hooks: Vec::new(),
             post_navigation_hooks: Vec::new(),
