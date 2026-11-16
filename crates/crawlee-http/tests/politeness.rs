@@ -16,7 +16,7 @@ use parking_lot::Mutex;
 
 use crawlee_basic::sitemap::{Sitemap, SitemapOptions};
 use crawlee_basic::{SitemapRequestLoader, SitemapRequestLoaderOptions};
-use crawlee_core::{RequestManagerTandem, Services, StorageIdentifier};
+use crawlee_core::{LoaderStatus, RequestLoader, RequestManagerTandem, Services, StorageIdentifier};
 use crawlee_http::{EnqueueLinksOptions, HtmlContext, HtmlCrawler};
 
 #[derive(Clone, Default)]
@@ -98,6 +98,26 @@ async fn serve(robots: Option<&'static str>) -> Site {
             .into_response(),
             "b.xml" => format!("<sitemapindex><sitemap><loc>{base}/sitemaps/a.xml</loc></sitemap></sitemapindex>")
                 .into_response(),
+            // Nested sitemaps that each wait up to 1 s for the other to be requested.
+            "pair.xml" => format!(
+                "<sitemapindex><sitemap><loc>{base}/sitemaps/wait-a.xml</loc></sitemap>\
+                 <sitemap><loc>{base}/sitemaps/wait-b.xml</loc></sitemap></sitemapindex>"
+            )
+            .into_response(),
+            "wait-a.xml" | "wait-b.xml" => {
+                let (me, other) =
+                    if name == "wait-a.xml" { ("a", "/sitemaps/wait-b.xml") } else { ("b", "/sitemaps/wait-a.xml") };
+                let mut together = false;
+                for _ in 0..100 {
+                    if site.hits(other) > 0 {
+                        together = true;
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                let how = if together { "together" } else { "alone" };
+                format!("<urlset><url><loc>{base}/page/{how}-{me}</loc></url></urlset>").into_response()
+            }
             // Malformed after its first page: the second `loc` is never closed.
             "broken.xml" => format!(
                 "<urlset><url><loc>{base}/page/b1</loc></url><url><loc>{base}/page/b2</url>\
@@ -243,4 +263,36 @@ async fn a_malformed_sitemap_keeps_the_pages_before_the_error() {
     let urls: Vec<&str> = sitemap.urls.iter().map(|url| url.trim_start_matches(&base)).collect();
     assert_eq!(urls, ["/page/b1", "/page/s3", "/page/excluded"]);
     assert_eq!(site.hits("/sitemaps/broken.xml"), 1, "a malformed sitemap is not retried");
+}
+
+/// The pages a `SitemapRequestLoader` with `concurrency` loads from the sitemap `name`.
+async fn loaded_pages(site: &Site, name: &str, concurrency: usize) -> Vec<String> {
+    let services = Services::in_memory();
+    let mut options = SitemapRequestLoaderOptions::new([format!("{}/sitemaps/{name}", site.base())]);
+    options.concurrency = concurrency;
+    let loader = SitemapRequestLoader::open(options, &services, crawlee_http_client::default_client()).await.unwrap();
+    let mut pages = Vec::new();
+    while loader.status().await.unwrap() != LoaderStatus::Finished {
+        match loader.fetch_next_request().await.unwrap() {
+            Some(request) => {
+                pages.push(request.url.trim_start_matches(&site.base()).to_owned());
+                loader.mark_request_as_handled(&request).await.unwrap();
+            }
+            None => tokio::time::sleep(Duration::from_millis(10)).await,
+        }
+    }
+    assert!(loader.is_sitemap_fully_loaded());
+    pages.sort();
+    pages
+}
+
+/// crawlee#3571: with a `concurrency` of 2, both nested sitemaps are loaded at once. One at a
+/// time is the default.
+#[tokio::test]
+async fn sitemaps_load_in_parallel_up_to_the_concurrency() {
+    let site = serve(None).await;
+    assert_eq!(loaded_pages(&site, "pair.xml", 2).await, ["/page/together-a", "/page/together-b"]);
+
+    let site = serve(None).await;
+    assert_eq!(loaded_pages(&site, "pair.xml", 1).await, ["/page/alone-a", "/page/together-b"]);
 }

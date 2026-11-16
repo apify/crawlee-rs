@@ -106,9 +106,10 @@ Differences that make runs faster or waits shorter without doing less work.
   data is corrupt, it is discarded and fetched again, like a failed fetch. JS streams it and keeps
   the entries before the error. A malformed XML sitemap keeps the entries before the error and is
   not fetched again, as in JS.
-- **Cycles of nested sitemaps.** `SitemapRequestLoader` loads each sitemap once and saves the
-  ones it loaded with its state (`visitedSitemapUrls`). JS loads a sitemap again whenever it is
-  listed, so it never finishes a sitemap index that lists itself.
+- **Loaded sitemaps are compared normalized.** `SitemapRequestLoader` loads each sitemap once, as
+  JS does. To tell whether a nested sitemap was loaded already, it compares URLs normalized by the
+  `url` crate (as `Sitemap::load_entries` does), and saves them so in `processedSitemapUrls`. JS
+  compares and saves them as written.
 - **A failed background batch of `run`.** The requests passed to `run` after the first batch are
   added in the background. When adding a batch fails, the requests of that batch and the later ones
   are not crawled, as in JS, but an error is logged; JS ignores the failure. The run goes on either
