@@ -10,13 +10,14 @@ use http::header::{ACCEPT, CONTENT_TYPE, HeaderValue};
 use url::Url;
 
 use crawlee_http_client::{HttpClient, HttpRequest, SendOptions};
-use crawlee_utils::sitemap::{SitemapItem, SitemapUrl, decode_sitemap};
+use crawlee_utils::sitemap::{SitemapError, SitemapItem, SitemapUrl, decode_sitemap};
 use crawlee_utils::{EnqueueStrategy, filter_url};
 
 /// How sitemaps are fetched and filtered, with the defaults of `ParseSitemapOptions` in JS.
 #[derive(Clone, Debug)]
 pub struct SitemapOptions {
-    /// Retries after a failed fetch or a malformed sitemap.
+    /// Retries after a failed fetch or a sitemap of an unsupported type. A malformed sitemap is
+    /// not fetched again: the pages before the error are kept.
     pub retries: u32,
     pub timeout: Duration,
     /// Log failed fetches (malformed sitemaps are always logged).
@@ -89,6 +90,12 @@ pub async fn fetch_sitemap(url: &str, client: &dyn HttpClient, options: &Sitemap
         let mut sitemap_url = parsed.clone();
         let items = match decode_sitemap(&response.body, content_type.as_deref(), &mut sitemap_url) {
             Ok(items) => items,
+            // As in JS, which reads a sitemap as a stream: the entries before the error are kept,
+            // and the sitemap is not fetched again.
+            Err(SitemapError::Xml { message, items_read }) => {
+                tracing::warn!("Malformed sitemap content: {url} (malformed sitemap XML: {message})");
+                items_read
+            }
             Err(err) => {
                 tracing::warn!("Malformed sitemap content: {url}, {note} ({err})");
                 continue;

@@ -157,8 +157,8 @@ JS, it does not write a record equal to the one it last saved or restored, and
     crawler keeps alive. Its requests stay queued.
 - **Sitemaps.** `Sitemap::load` fetches sitemaps, nested and gzipped ones included, and returns
   their pages.
-  - `SitemapRequestLoader` crawls them in the background. Put it in front of a request queue with
-    `RequestManagerTandem`.
+  - `SitemapRequestLoader` crawls them in the background, loading `concurrency` sitemaps at once
+    (one by default). Put it in front of a request queue with `RequestManagerTandem`.
   - Its progress is saved, so a resumed crawl continues where it stopped.
 
 ## Design notes

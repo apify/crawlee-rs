@@ -68,8 +68,13 @@ impl DerefMut for PostNavigationContext {
 
 /// Elements of pages that block crawlers (`RETRY_CSS_SELECTORS`), checked with
 /// [`HttpCrawlerOptions::retry_on_blocked`].
-pub const RETRY_CSS_SELECTORS: [&str; 3] = [
+pub const RETRY_CSS_SELECTORS: [&str; 5] = [
     r#"#turnstile-wrapper iframe[src^="https://challenges.cloudflare.com"]"#,
+    // The AWS WAF challenge (a 202) and CAPTCHA (a 405). The container must be a child of
+    // `<body>` and the script in `<head>`, so that regular pages of sites using the AWS WAF
+    // integration do not match.
+    r#"html:has(head > script[src*=".awswaf.com/"][src$="/challenge.js"]) > body > #challenge-container"#,
+    r#"html:has(head > script[src*=".awswaf.com/"][src$="/captcha.js"]) > body > #captcha-container"#,
     r#"div#infoDiv0 a[href*="//www.google.com/policies/terms/"]"#,
     r#"iframe[src*="_Incapsula_Resource"]"#,
 ];
@@ -102,7 +107,8 @@ pub struct HttpCrawlerOptions {
     pub suggest_response_encoding: Option<&'static Encoding>,
     /// Store `Set-Cookie` of responses in the session.
     pub save_response_cookies: bool,
-    /// Ignore TLS certificate errors (default `true`, as in Crawlee for JS).
+    /// Ignore TLS certificate errors (default `false`: certificates are verified, as in Crawlee
+    /// for JS). A proxy whose `ignore_tls_errors` is set turns verification off for its requests.
     pub ignore_tls_errors: bool,
     /// Larger bodies fail the request (without retries). No limit by default.
     pub max_body_size: Option<usize>,
@@ -122,7 +128,7 @@ impl Default for HttpCrawlerOptions {
             force_response_encoding: None,
             suggest_response_encoding: None,
             save_response_cookies: true,
-            ignore_tls_errors: true,
+            ignore_tls_errors: false,
             max_body_size: None,
             pre_navigation_hooks: Vec::new(),
             post_navigation_hooks: Vec::new(),

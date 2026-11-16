@@ -71,8 +71,7 @@ fn tls_config() -> Result<&'static rustls::ClientConfig, HttpClientError> {
     })
 }
 
-/// The TLS configuration of every client that ignores certificate errors (the crawler's default),
-/// built once too.
+/// The TLS configuration of every client that ignores certificate errors, built once too.
 fn insecure_tls_config() -> Result<&'static rustls::ClientConfig, HttpClientError> {
     static CONFIG: OnceLock<Result<rustls::ClientConfig, String>> = OnceLock::new();
     cached_config(&CONFIG, || {

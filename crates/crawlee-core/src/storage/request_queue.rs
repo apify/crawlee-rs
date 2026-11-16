@@ -112,7 +112,7 @@ pub trait UrlListFetcher: Send + Sync {
 /// The URLs [`RequestsFromUrl`] finds by default (`URL_NO_COMMAS_REGEX` of `@crawlee/utils`).
 pub static URL_NO_COMMAS_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     RegexBuilder::new(
-        r"https?://(www\.)?([\p{L}0-9]|[\p{L}0-9][-\p{L}0-9@:%._+~#=]{0,254}[\p{L}0-9])\.[a-z]{2,63}(:[0-9]{1,5})?(/[-\p{L}0-9@:%_+.~#?&/=()'*]*)?",
+        r"https?://(www\.)?([\p{L}0-9]|[\p{L}0-9][-\p{L}\p{M}0-9@:%._+~#=]{0,254}[\p{L}\p{M}0-9])\.(xn--[a-z0-9-]{1,59}|[a-z]{2,63}|[\p{L}\p{M}]{2,63})(:[0-9]{1,5})?(/[-\p{L}\p{M}0-9@:%_+.~#?&/=()'*]*)?",
     )
     .case_insensitive(true)
     .size_limit(64 << 20)
@@ -183,14 +183,7 @@ impl RequestsFromUrl {
         let fetcher = fetcher.ok_or_else(|| {
             cannot_fetch(&"no URL list fetcher was set; set one with RequestQueue::set_url_list_fetcher")
         })?;
-        // A Google Sheets sharing link is fetched as the CSV export of the sheet.
-        static GOOGLE_SHEETS: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"^(https://docs\.google\.com/spreadsheets/d/[A-Za-z0-9_-]+)/?").unwrap());
-        let url = match GOOGLE_SHEETS.captures(requests_from_url) {
-            Some(sheet) => format!("{}/gviz/tq?tqx=out:csv", &sheet[1]),
-            None => requests_from_url.clone(),
-        };
-        let body = fetcher.fetch(&url, proxy_url).await.map_err(|err| cannot_fetch(&err))?;
+        let body = fetcher.fetch(requests_from_url, proxy_url).await.map_err(|err| cannot_fetch(&err))?;
         let urls = extract_urls(&String::from_utf8_lossy(&body), self.regex.as_ref());
         if urls.is_empty() {
             tracing::warn!(requests_from_url, regex = ?self.regex, "The fetched list contains no valid URLs.");
@@ -903,6 +896,24 @@ mod tests {
         assert_eq!(extract_urls(text, Some(&only_b)), ["https://b.com/y"]);
     }
 
+    /// crawlee#4380: internationalized and punycode top-level domains, and combining marks.
+    #[test]
+    fn extracts_urls_with_internationalized_top_level_domains() {
+        let urls = [
+            "https://пример.рф/путь",
+            "https://xn--e1afmkfd.xn--p1ai/path",
+            "https://例子.中国/",
+            "https://उदाहरण.भारत/page",
+            "https://test.みんな/",
+        ];
+        assert_eq!(extract_urls(&urls.join(" "), None), urls);
+
+        // An ASCII top-level domain does not run into the text after it.
+        let text = "詳細はhttps://example.comをご覧ください 请访问https://www.google.com获取更多信息";
+        let expected = ["https://example.com", "https://www.google.com"];
+        assert_eq!(extract_urls(text, None), expected);
+    }
+
     #[tokio::test]
     async fn adds_the_requests_of_a_remote_list() {
         let storage = MemoryStorageBackend::new();
@@ -921,7 +932,8 @@ mod tests {
         let request = queue.fetch_next_request().await.unwrap().unwrap();
         assert_eq!((request.url.as_str(), request.label()), ("https://a.com/1", Some("LIST")));
 
-        // A Google Sheets sharing link is read as CSV.
+        // A Google Sheets sharing link is fetched as it is (crawlee#4377). The Apify SDK rewrites
+        // it in the Actor input.
         queue
             .add_requests_from_url(
                 RequestsFromUrl::new("https://docs.google.com/spreadsheets/d/abc-1_x/edit#gid=0"),
@@ -931,7 +943,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             fetcher.fetched.lock().last().map(String::as_str),
-            Some("https://docs.google.com/spreadsheets/d/abc-1_x/gviz/tq?tqx=out:csv")
+            Some("https://docs.google.com/spreadsheets/d/abc-1_x/edit#gid=0")
         );
 
         let failing = RequestQueue::open(&storage, &StorageIdentifier::alias("other")).await.unwrap();

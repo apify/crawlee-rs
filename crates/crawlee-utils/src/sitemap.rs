@@ -69,8 +69,10 @@ pub enum SitemapItem {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SitemapError {
-    #[error("malformed sitemap XML: {0}")]
-    Xml(String),
+    /// The XML is malformed. The entries read before the error are kept, as Crawlee for JS
+    /// yields them before it stops reading the sitemap.
+    #[error("malformed sitemap XML: {message}")]
+    Xml { message: String, items_read: Vec<SitemapItem> },
     #[error("failed to decompress the sitemap: {0}")]
     Gzip(#[from] std::io::Error),
     #[error("unsupported sitemap content type (contentType = {content_type}, url = {url})")]
@@ -125,7 +127,17 @@ fn field_of(name: &[u8]) -> Option<Field> {
     })
 }
 
+/// Namespaces of the sitemap protocol, Google's legacy ones included.
+const SITEMAP_NAMESPACES: [&str; 4] = [
+    "http://www.sitemaps.org/schemas/sitemap/0.9",
+    "https://www.sitemaps.org/schemas/sitemap/0.9",
+    "http://www.google.com/schemas/sitemap/0.9",
+    "http://www.google.com/schemas/sitemap/0.84",
+];
+
 struct XmlState {
+    /// Prefixes bound to a sitemap namespace, such as `ns0` in `<ns0:urlset xmlns:ns0="...">`.
+    sitemap_prefixes: Vec<String>,
     root: Option<Root>,
     field: Option<Field>,
     text: String,
@@ -159,7 +171,31 @@ impl XmlState {
         }
     }
 
-    fn open(&mut self, name: &[u8]) {
+    /// Remembers the prefixes the tag binds to a sitemap namespace.
+    fn bind_prefixes(&mut self, tag: &quick_xml::events::BytesStart<'_>) {
+        for attribute in tag.attributes().flatten() {
+            if let Some(prefix) = attribute.key.as_ref().strip_prefix("xmlns:")
+                && SITEMAP_NAMESPACES.contains(&attribute.value.trim())
+                && !self.sitemap_prefixes.iter().any(|known| known == prefix)
+            {
+                self.sitemap_prefixes.push(prefix.to_owned());
+            }
+        }
+    }
+
+    /// The local name of a sitemap element, or `None` for an element of another namespace (such
+    /// as `image:loc`). Elements without a prefix are sitemap elements.
+    fn sitemap_name<'a>(&self, qualified: &'a str) -> Option<&'a str> {
+        match qualified.split_once(':') {
+            None => Some(qualified),
+            Some((prefix, name)) => self.sitemap_prefixes.iter().any(|known| known == prefix).then_some(name),
+        }
+    }
+
+    fn open(&mut self, tag: &quick_xml::events::BytesStart<'_>) {
+        self.bind_prefixes(tag);
+        let qualified = tag.name();
+        let Some(name) = self.sitemap_name(qualified.as_ref()).map(str::as_bytes) else { return };
         if self.root.is_some()
             && let Some(field) = field_of(name)
         {
@@ -172,7 +208,8 @@ impl XmlState {
         }
     }
 
-    fn close(&mut self, name: &[u8]) {
+    fn close(&mut self, qualified: &str) {
+        let Some(name) = self.sitemap_name(qualified).map(str::as_bytes) else { return };
         if field_of(name).is_some() {
             self.field = None;
         }
@@ -185,27 +222,38 @@ impl XmlState {
     }
 }
 
-/// Parses a `urlset` (pages) or `sitemapindex` (nested sitemaps) document. Tag names are
-/// compared as written, so a prefixed `<sitemap:loc>` is not read, as in JS.
+/// Parses a `urlset` (pages) or `sitemapindex` (nested sitemaps) document. On malformed XML,
+/// the error holds the entries read before it. A prefixed element is
+/// read when an `xmlns:` attribute binds its prefix to a sitemap namespace (`<ns0:loc>`), and
+/// ignored otherwise (`<image:loc>`), as in JS.
 pub fn parse_sitemap_xml(content: &str) -> Result<Vec<SitemapItem>, SitemapError> {
     let mut reader = quick_xml::Reader::from_str(content);
-    let mut state =
-        XmlState { root: None, field: None, text: String::new(), url: SitemapUrl::default(), items: Vec::new() };
+    let mut state = XmlState {
+        sitemap_prefixes: Vec::new(),
+        root: None,
+        field: None,
+        text: String::new(),
+        url: SitemapUrl::default(),
+        items: Vec::new(),
+    };
     loop {
-        let event = reader.read_event().map_err(|err| SitemapError::Xml(err.to_string()))?;
+        let event = match reader.read_event() {
+            Ok(event) => event,
+            Err(err) => return Err(SitemapError::Xml { message: err.to_string(), items_read: state.items }),
+        };
         match event {
             Event::Start(tag) => {
                 state.flush_text();
-                state.open(tag.name().as_ref().as_bytes());
+                state.open(&tag);
             }
             Event::Empty(tag) => {
                 state.flush_text();
-                state.open(tag.name().as_ref().as_bytes());
-                state.close(tag.name().as_ref().as_bytes());
+                state.open(&tag);
+                state.close(tag.name().as_ref());
             }
             Event::End(tag) => {
                 state.flush_text();
-                state.close(tag.name().as_ref().as_bytes());
+                state.close(tag.name().as_ref());
             }
             Event::Text(text) => state.text.push_str(&text.xml10_content()),
             Event::CData(data) => state.text.push_str(&data.xml10_content()),
@@ -216,7 +264,12 @@ pub fn parse_sitemap_xml(content: &str) -> Result<Vec<SitemapItem>, SitemapError
                     let name = reference.xml10_content();
                     match resolve_predefined_entity(&name) {
                         Some(resolved) => state.text.push_str(resolved),
-                        None => return Err(SitemapError::Xml(format!("unknown entity &{name};"))),
+                        None => {
+                            return Err(SitemapError::Xml {
+                                message: format!("unknown entity &{name};"),
+                                items_read: state.items,
+                            });
+                        }
                     }
                 }
             }
@@ -364,6 +417,48 @@ mod tests {
         );
         assert_eq!(parse_sitemap_txt("https://a.test/1\r\n\n  https://a.test/2  \n").len(), 2);
         assert!(parse_sitemap_xml("<urlset><url><loc>x</url></urlset>").is_err());
+        let Err(SitemapError::Xml { items_read, .. }) =
+            parse_sitemap_xml("<urlset><url><loc>a</loc></url><url><loc>b</url></urlset>")
+        else {
+            panic!()
+        };
+        assert_eq!(items_read, vec![SitemapItem::Url(SitemapUrl { loc: "a".into(), ..Default::default() })]);
+    }
+
+    /// crawlee#4393: elements prefixed with a sitemap namespace, as Python's ElementTree writes them.
+    #[test]
+    fn elements_with_a_sitemap_namespace_prefix() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ns0:urlset xmlns:ns0="http://www.sitemaps.org/schemas/sitemap/0.9">
+<ns0:url><ns0:loc>https://a.test/1</ns0:loc><ns0:lastmod>2004-11-23</ns0:lastmod>
+<ns0:changefreq>daily</ns0:changefreq><ns0:priority>0.4</ns0:priority></ns0:url>
+<ns0:url><ns0:loc>https://a.test/2</ns0:loc></ns0:url>
+</ns0:urlset>"#;
+        let items = parse_sitemap_xml(xml).unwrap();
+        assert_eq!(items.len(), 2);
+        let SitemapItem::Url(first) = &items[0] else { panic!() };
+        assert_eq!(first.loc, "https://a.test/1");
+        assert_eq!(first.lastmod.unwrap().to_rfc3339(), "2004-11-23T00:00:00+00:00");
+        assert_eq!(first.changefreq, Some(ChangeFreq::Daily));
+        assert_eq!(first.priority, Some(0.4));
+
+        let index = r#"<sm:sitemapindex xmlns:sm="http://www.google.com/schemas/sitemap/0.84">
+<sm:sitemap><sm:loc>https://a.test/child.xml</sm:loc></sm:sitemap></sm:sitemapindex>"#;
+        assert_eq!(parse_sitemap_xml(index).unwrap(), vec![SitemapItem::Sitemap("https://a.test/child.xml".into())]);
+
+        // A `loc` of another namespace does not replace the page URL.
+        let images = r#"<ns0:urlset xmlns:ns0="http://www.sitemaps.org/schemas/sitemap/0.9"
+xmlns:image="http://www.google.com/schemas/sitemap-image/1.1"><ns0:url><ns0:loc>https://a.test/page</ns0:loc>
+<image:image><image:loc>https://a.test/image.jpg</image:loc></image:image></ns0:url></ns0:urlset>"#;
+        assert_eq!(
+            parse_sitemap_xml(images).unwrap(),
+            vec![SitemapItem::Url(SitemapUrl { loc: "https://a.test/page".into(), ..Default::default() })]
+        );
+
+        // A prefix bound to another namespace is not read.
+        let other =
+            r#"<x:urlset xmlns:x="https://example.com/ns"><x:url><x:loc>https://a.test/1</x:loc></x:url></x:urlset>"#;
+        assert!(parse_sitemap_xml(other).unwrap().is_empty());
     }
 
     #[test]

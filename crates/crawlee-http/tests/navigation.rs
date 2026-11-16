@@ -30,6 +30,22 @@ fn endless(content_type: &'static str) -> impl IntoResponse {
     )
 }
 
+/// The AWS WAF challenge (served with a 202) and CAPTCHA (a 405), with the markup of the real
+/// pages; the script paths are local.
+const AWS_WAF_CHALLENGE: &str = r#"<!DOCTYPE html><html><head><title></title>
+<script>window.gokuProps = {};</script>
+<script src="/x.us-east-1.token.awswaf.com/a/b/c/challenge.js"></script></head>
+<body><div id="challenge-container"></div><noscript>JavaScript is disabled</noscript></body></html>"#;
+const AWS_WAF_CAPTCHA: &str = r#"<!DOCTYPE html><html><head><title>Human Verification</title>
+<script src="/x.us-east-1.token.awswaf.com/a/b/c/challenge.js"></script>
+<script src="/x.us-east-1.captcha.awswaf.com/a/b/c/captcha.js"></script></head>
+<body><div id="captcha-container"></div></body></html>"#;
+/// A regular page of a site that uses the AWS WAF integration: not blocked.
+const AWS_WAF_INTEGRATION: &str = r#"<!DOCTYPE html><html><head><title>shop</title>
+<script src="/x.sdk.awswaf.com/a/b/c/challenge.js"></script>
+<script src="/x.sdk.awswaf.com/a/b/c/captcha.js"></script></head>
+<body><form><div id="challenge-container"></div><div id="captcha-container"></div></form></body></html>"#;
+
 /// A response without a `Content-Type` header.
 fn untyped(body: &'static str) -> axum::response::Response {
     let mut response = Body::from(body).into_response();
@@ -65,6 +81,9 @@ async fn serve(hits: Arc<AtomicUsize>) -> SocketAddr {
             }),
         )
         .route("/forbidden", route(|| (StatusCode::FORBIDDEN, Html("<p>no</p>")).into_response()))
+        .route("/aws-waf-challenge", route(|| (StatusCode::ACCEPTED, Html(AWS_WAF_CHALLENGE)).into_response()))
+        .route("/aws-waf-captcha", route(|| (StatusCode::METHOD_NOT_ALLOWED, Html(AWS_WAF_CAPTCHA)).into_response()))
+        .route("/aws-waf-integration", route(|| Html(AWS_WAF_INTEGRATION).into_response()))
         .route("/ok", route(|| Html("<title>ok</title>").into_response()))
         .route(
             "/echo",
@@ -121,7 +140,7 @@ fn options() -> HttpCrawlerOptions {
 fn defaults_are_those_of_crawlee_for_js() {
     let options = HttpCrawlerOptions::default();
     assert_eq!(options.navigation_timeout, Duration::from_secs(30));
-    assert!(options.ignore_tls_errors);
+    assert!(!options.ignore_tls_errors, "TLS certificates are verified by default");
     assert_eq!(options.max_body_size, None);
     assert!(!options.retry_on_blocked);
 }
@@ -192,6 +211,24 @@ async fn retry_on_blocked_checks_the_content_and_the_status() {
     );
 }
 
+/// crawlee#4184: `retryOnBlocked` detects the AWS WAF challenge and CAPTCHA, but not a regular
+/// page that loads the AWS WAF scripts and embeds their containers in a form.
+#[tokio::test]
+async fn retry_on_blocked_detects_the_aws_waf_challenge_and_captcha() {
+    let options = HttpCrawlerOptions { retry_on_blocked: true, ..options() };
+    let (failed, hits) = crawl(options, 0, &["/aws-waf-challenge", "/aws-waf-captcha", "/aws-waf-integration"]).await;
+    assert_eq!(hits, 3);
+    let selectors: Vec<(String, String)> =
+        failed.into_iter().map(|(path, errors)| (path, errors[0].rsplit('>').next().unwrap().to_owned())).collect();
+    assert_eq!(
+        selectors,
+        [
+            ("/aws-waf-captcha".to_owned(), " #captcha-container".to_owned()),
+            ("/aws-waf-challenge".to_owned(), " #challenge-container".to_owned()),
+        ]
+    );
+}
+
 /// Records what the crawler asks the client for.
 #[derive(Default)]
 struct Recording(parking_lot::Mutex<Vec<SendOptions>>);
@@ -237,6 +274,20 @@ async fn the_session_fingerprint_and_its_proxy_tls_mode_reach_the_client() {
     let sent = client.0.lock();
     assert!(sent[0].ignore_tls_errors);
     assert!(sent[0].fingerprint.is_some());
+}
+
+/// Without a proxy that asks otherwise, the client verifies TLS certificates (crawlee#4317).
+#[tokio::test]
+async fn tls_certificates_are_verified_by_default() {
+    let client = Arc::new(Recording::default());
+    let crawler = HttpCrawler::builder_with_options(options())
+        .services(Services::in_memory())
+        .http_client(client.clone())
+        .request_handler(|_ctx: HttpContext| async move { Ok(()) })
+        .build()
+        .unwrap();
+    crawler.run(["https://a.example/"]).await.unwrap();
+    assert!(!client.0.lock()[0].ignore_tls_errors);
 }
 
 /// A proxy nothing listens on, which records the sessions it is asked for.

@@ -80,6 +80,7 @@ Differences that make runs faster or waits shorter without doing less work.
 | `createSessionFunction` | Also recreates the sessions restored from the saved pool, from their record | Makes new sessions only; restored sessions are rebuilt from their record (their proxy through `ProxySource::restored_proxy_info`) | A Rust `Session` is not built from an options bag holding its whole saved state |
 | Navigation hooks | Async; may return a partial object whose properties are merged into the crawling context | Async; take the context by value and hand it on (`BasicContext`, or `PostNavigationContext` whose `response` can be replaced); they cannot add members | Rust cannot grow a struct at runtime (see Crawling context) |
 | `skipNavigation` | The response members of the context are getters that throw `NavigationSkippedError` | Infallible response members (`status()`, `text()`, …) panic with that error's message, which the crawler turns back into the error; fallible ones (`json()`, `with_html()`, `enqueue_links()`, …) return it. Either way the request fails without retries | Rust has no throwing getters, and making every response member fallible would change every handler |
+| `maxNewRequests` of `addRequestsBatched` | Without `waitForAllRequestsToBeAdded`, the batches after the first are added in the background and the requests over the budget are left in the source, unread; `requestsOverLimit` is reported only when it waits | `max_new_requests` always waits for every batch and reports `requests_over_limit` | The requests come in a `Vec`, not an async iterable, so finding the leftovers cannot block; JS stopped draining because a producer might never end |
 | Error groups in saved statistics | `errors` / `retryErrors` hold the nested `ErrorTracker` tree | A flat `{ group: count }` map | Follows from the error grouping above; JS rebuilds its trackers from scratch on restore anyway |
 
 ## Behavior differences not yet covered by golden cases
@@ -102,12 +103,14 @@ Differences that make runs faster or waits shorter without doing less work.
   - Integers beyond 2^53 are kept exact; JS rounds them.
   - Lone UTF-16 surrogates in `\u` escapes are rejected by serde_json.
   - Object keys keep insertion order (`preserve_order`). JS moves integer-like keys first.
-- **Malformed sitemaps.** A sitemap is parsed whole once fetched. A syntax error discards it and
-  is retried like a failed fetch. JS streams it: it yields the entries before the error, then the
-  error ends the whole `Sitemap.load`.
-- **Cycles of nested sitemaps.** `SitemapRequestLoader` loads each sitemap once and saves the
-  ones it loaded with its state (`visitedSitemapUrls`). JS loads a sitemap again whenever it is
-  listed, so it never finishes a sitemap index that lists itself.
+- **Sitemaps that fail to decompress.** A sitemap is parsed whole once fetched. When its gzip
+  data is corrupt, it is discarded and fetched again, like a failed fetch. JS streams it and keeps
+  the entries before the error. A malformed XML sitemap keeps the entries before the error and is
+  not fetched again, as in JS.
+- **Loaded sitemaps are compared normalized.** `SitemapRequestLoader` loads each sitemap once, as
+  JS does. To tell whether a nested sitemap was loaded already, it compares URLs normalized by the
+  `url` crate (as `Sitemap::load_entries` does), and saves them so in `processedSitemapUrls`. JS
+  compares and saves them as written.
 - **A failed background batch of `run`.** The requests passed to `run` after the first batch are
   added in the background. When adding a batch fails, the requests of that batch and the later ones
   are not crawled, as in JS, but an error is logged; JS ignores the failure. The run goes on either
