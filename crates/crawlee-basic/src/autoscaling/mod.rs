@@ -331,6 +331,14 @@ impl ConcurrencySystem {
         state.clamp_desired();
     }
 
+    /// Sets the desired concurrency (`desiredConcurrency = value` in JS), up or down. Unlike JS,
+    /// it is kept within the minimum and the maximum concurrency, as the autoscaling keeps it.
+    pub fn set_desired_concurrency(&self, desired: usize) {
+        let mut state = self.state.lock();
+        state.desired = desired;
+        state.clamp_desired();
+    }
+
     pub fn is_running(&self) -> bool {
         self.running.load(Ordering::Acquire)
     }
@@ -569,6 +577,31 @@ mod tests {
         system.register_task_start();
         assert!(system.has_capacity_for_task());
         (system, gating, scaling_only)
+    }
+
+    #[test]
+    fn the_desired_concurrency_can_be_set_up_and_down_within_the_limits() {
+        let system = system(
+            ConcurrencyOptions { min_concurrency: 2, max_concurrency: 20, ..Default::default() },
+            &Arc::new(Switch::default()),
+        );
+        assert_eq!(system.desired_concurrency(), 2);
+
+        system.set_desired_concurrency(15);
+        assert_eq!(system.desired_concurrency(), 15, "raised, not only capped");
+        system.set_desired_concurrency(5);
+        assert_eq!(system.desired_concurrency(), 5);
+
+        system.set_desired_concurrency(50);
+        assert_eq!(system.desired_concurrency(), 20, "kept at the maximum");
+        system.set_desired_concurrency(0);
+        assert_eq!(system.desired_concurrency(), 2, "kept at the minimum");
+
+        // `desiredConcurrency = maxConcurrency = n` in JS, after the concurrency was lowered
+        system.set_max_concurrency(3);
+        system.set_max_concurrency(12);
+        system.set_desired_concurrency(12);
+        assert_eq!(system.desired_concurrency(), 12);
     }
 
     #[test]
