@@ -30,6 +30,22 @@ fn endless(content_type: &'static str) -> impl IntoResponse {
     )
 }
 
+/// The AWS WAF challenge (served with a 202) and CAPTCHA (a 405), with the markup of the real
+/// pages; the script paths are local.
+const AWS_WAF_CHALLENGE: &str = r#"<!DOCTYPE html><html><head><title></title>
+<script>window.gokuProps = {};</script>
+<script src="/x.us-east-1.token.awswaf.com/a/b/c/challenge.js"></script></head>
+<body><div id="challenge-container"></div><noscript>JavaScript is disabled</noscript></body></html>"#;
+const AWS_WAF_CAPTCHA: &str = r#"<!DOCTYPE html><html><head><title>Human Verification</title>
+<script src="/x.us-east-1.token.awswaf.com/a/b/c/challenge.js"></script>
+<script src="/x.us-east-1.captcha.awswaf.com/a/b/c/captcha.js"></script></head>
+<body><div id="captcha-container"></div></body></html>"#;
+/// A regular page of a site that uses the AWS WAF integration: not blocked.
+const AWS_WAF_INTEGRATION: &str = r#"<!DOCTYPE html><html><head><title>shop</title>
+<script src="/x.sdk.awswaf.com/a/b/c/challenge.js"></script>
+<script src="/x.sdk.awswaf.com/a/b/c/captcha.js"></script></head>
+<body><form><div id="challenge-container"></div><div id="captcha-container"></div></form></body></html>"#;
+
 /// A response without a `Content-Type` header.
 fn untyped(body: &'static str) -> axum::response::Response {
     let mut response = Body::from(body).into_response();
@@ -65,6 +81,9 @@ async fn serve(hits: Arc<AtomicUsize>) -> SocketAddr {
             }),
         )
         .route("/forbidden", route(|| (StatusCode::FORBIDDEN, Html("<p>no</p>")).into_response()))
+        .route("/aws-waf-challenge", route(|| (StatusCode::ACCEPTED, Html(AWS_WAF_CHALLENGE)).into_response()))
+        .route("/aws-waf-captcha", route(|| (StatusCode::METHOD_NOT_ALLOWED, Html(AWS_WAF_CAPTCHA)).into_response()))
+        .route("/aws-waf-integration", route(|| Html(AWS_WAF_INTEGRATION).into_response()))
         .route("/ok", route(|| Html("<title>ok</title>").into_response()))
         .route(
             "/echo",
@@ -188,6 +207,24 @@ async fn retry_on_blocked_checks_the_content_and_the_status() {
         [
             ("/forbidden".to_owned(), vec!["Blocked by status code 403".to_owned(); 2]),
             ("/incapsula".to_owned(), vec![r#"Found selectors: iframe[src*="_Incapsula_Resource"]"#.to_owned(); 2]),
+        ]
+    );
+}
+
+/// crawlee#4184: `retryOnBlocked` detects the AWS WAF challenge and CAPTCHA, but not a regular
+/// page that loads the AWS WAF scripts and embeds their containers in a form.
+#[tokio::test]
+async fn retry_on_blocked_detects_the_aws_waf_challenge_and_captcha() {
+    let options = HttpCrawlerOptions { retry_on_blocked: true, ..options() };
+    let (failed, hits) = crawl(options, 0, &["/aws-waf-challenge", "/aws-waf-captcha", "/aws-waf-integration"]).await;
+    assert_eq!(hits, 3);
+    let selectors: Vec<(String, String)> =
+        failed.into_iter().map(|(path, errors)| (path, errors[0].rsplit('>').next().unwrap().to_owned())).collect();
+    assert_eq!(
+        selectors,
+        [
+            ("/aws-waf-captcha".to_owned(), " #captcha-container".to_owned()),
+            ("/aws-waf-challenge".to_owned(), " #challenge-container".to_owned()),
         ]
     );
 }

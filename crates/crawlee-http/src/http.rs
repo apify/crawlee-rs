@@ -68,8 +68,13 @@ impl DerefMut for PostNavigationContext {
 
 /// Elements of pages that block crawlers (`RETRY_CSS_SELECTORS`), checked with
 /// [`HttpCrawlerOptions::retry_on_blocked`].
-pub const RETRY_CSS_SELECTORS: [&str; 3] = [
+pub const RETRY_CSS_SELECTORS: [&str; 5] = [
     r#"#turnstile-wrapper iframe[src^="https://challenges.cloudflare.com"]"#,
+    // The AWS WAF challenge (a 202) and CAPTCHA (a 405). The container must be a child of
+    // `<body>` and the script in `<head>`, so that regular pages of sites using the AWS WAF
+    // integration do not match.
+    r#"html:has(head > script[src*=".awswaf.com/"][src$="/challenge.js"]) > body > #challenge-container"#,
+    r#"html:has(head > script[src*=".awswaf.com/"][src$="/captcha.js"]) > body > #captcha-container"#,
     r#"div#infoDiv0 a[href*="//www.google.com/policies/terms/"]"#,
     r#"iframe[src*="_Incapsula_Resource"]"#,
 ];
