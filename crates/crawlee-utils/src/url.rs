@@ -182,15 +182,17 @@ fn hostname_of(url: &Url) -> &str {
 }
 
 /// Checks whether `target` matches `origin` under `strategy`. The scheme is not checked here; see
-/// [`filter_url`] for the combined check.
+/// [`filter_url`] for the combined check. Only `SameOrigin` compares schemes and ports. This is the
+/// one definition of the strategies, used by `enqueue_links`, sitemaps, robots.txt and the check
+/// after a redirect.
 pub fn matches_enqueue_strategy(strategy: EnqueueStrategy, target: &Url, origin: &Url) -> bool {
     match strategy {
         EnqueueStrategy::All => true,
         EnqueueStrategy::SameHostname => hostname_of(target) == hostname_of(origin),
         EnqueueStrategy::SameDomain => match registrable_domain(hostname_of(origin)) {
             Some(origin_domain) => registrable_domain(hostname_of(target)).as_deref() == Some(origin_domain.as_str()),
-            // No registrable domain (e.g. an IP address): compare origins.
-            None => target.origin() == origin.origin(),
+            // No registrable domain (an IP address or `localhost`): the same hostname.
+            None => matches_enqueue_strategy(EnqueueStrategy::SameHostname, target, origin),
         },
         EnqueueStrategy::SameOrigin => {
             target.scheme() == origin.scheme()
@@ -324,5 +326,21 @@ mod tests {
             filter_url("mailto:a@b.c", origin.as_str(), EnqueueStrategy::All),
             Err(UrlRejection::UnsupportedScheme)
         );
+    }
+
+    /// crawlee#4345: only `SameOrigin` compares ports, and `SameDomain` on a host without a
+    /// registrable domain (an IP address, `localhost`) is `SameHostname`.
+    #[test]
+    fn only_same_origin_compares_ports() {
+        let check = |strategy, target: &str, origin: &str| {
+            matches_enqueue_strategy(strategy, &Url::parse(target).unwrap(), &Url::parse(origin).unwrap())
+        };
+        assert!(check(EnqueueStrategy::SameHostname, "http://example.com:8080/a", "http://example.com/s.xml"));
+        assert!(!check(EnqueueStrategy::SameOrigin, "http://example.com:8080/a", "http://example.com/s.xml"));
+        assert!(check(EnqueueStrategy::SameDomain, "https://10.0.0.5/a", "http://10.0.0.5/s.xml"));
+        assert!(check(EnqueueStrategy::SameDomain, "http://10.0.0.5:8080/a", "http://10.0.0.5/"));
+        assert!(check(EnqueueStrategy::SameDomain, "http://localhost:3001/a", "https://localhost:3000/s.xml"));
+        assert!(!check(EnqueueStrategy::SameDomain, "http://10.0.0.6/a", "http://10.0.0.5/s.xml"));
+        assert!(!check(EnqueueStrategy::SameOrigin, "https://10.0.0.5/b", "http://10.0.0.5/"));
     }
 }
