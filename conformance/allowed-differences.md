@@ -102,9 +102,10 @@ Differences that make runs faster or waits shorter without doing less work.
   - Integers beyond 2^53 are kept exact; JS rounds them.
   - Lone UTF-16 surrogates in `\u` escapes are rejected by serde_json.
   - Object keys keep insertion order (`preserve_order`). JS moves integer-like keys first.
-- **Malformed sitemaps.** A sitemap is parsed whole once fetched. A syntax error discards it and
-  is retried like a failed fetch. JS streams it: it yields the entries before the error, then the
-  error ends the whole `Sitemap.load`.
+- **Sitemaps that fail to decompress.** A sitemap is parsed whole once fetched. When its gzip
+  data is corrupt, it is discarded and fetched again, like a failed fetch. JS streams it and keeps
+  the entries before the error. A malformed XML sitemap keeps the entries before the error and is
+  not fetched again, as in JS.
 - **Cycles of nested sitemaps.** `SitemapRequestLoader` loads each sitemap once and saves the
   ones it loaded with its state (`visitedSitemapUrls`). JS loads a sitemap again whenever it is
   listed, so it never finishes a sitemap index that lists itself.

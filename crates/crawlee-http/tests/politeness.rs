@@ -14,6 +14,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::get;
 use parking_lot::Mutex;
 
+use crawlee_basic::sitemap::{Sitemap, SitemapOptions};
 use crawlee_basic::{SitemapRequestLoader, SitemapRequestLoaderOptions};
 use crawlee_core::{RequestManagerTandem, Services, StorageIdentifier};
 use crawlee_http::{EnqueueLinksOptions, HtmlContext, HtmlCrawler};
@@ -97,6 +98,12 @@ async fn serve(robots: Option<&'static str>) -> Site {
             .into_response(),
             "b.xml" => format!("<sitemapindex><sitemap><loc>{base}/sitemaps/a.xml</loc></sitemap></sitemapindex>")
                 .into_response(),
+            // Malformed after its first page: the second `loc` is never closed.
+            "broken.xml" => format!(
+                "<urlset><url><loc>{base}/page/b1</loc></url><url><loc>{base}/page/b2</url>\
+                 <url><loc>{base}/page/b3</loc></url></urlset>"
+            )
+            .into_response(),
             _ => StatusCode::NOT_FOUND.into_response(),
         }
     }
@@ -218,4 +225,22 @@ async fn nested_sitemaps_are_loaded_once_even_in_a_cycle() {
     assert!(loader.is_sitemap_fully_loaded());
     assert_eq!(site.hits("/sitemaps/a.xml"), 1);
     assert_eq!(site.hits("/sitemaps/b.xml"), 1);
+}
+
+/// crawlee#4249: a malformed sitemap keeps the pages read before the error, is not fetched again,
+/// and the other sitemaps are still loaded.
+#[tokio::test]
+async fn a_malformed_sitemap_keeps_the_pages_before_the_error() {
+    let site = serve(None).await;
+    let base = site.base();
+    let client = crawlee_http_client::default_client();
+    let sitemap = Sitemap::load(
+        &[format!("{base}/sitemaps/broken.xml"), format!("{base}/sitemaps/list.txt")],
+        client.as_ref(),
+        &SitemapOptions::default(),
+    )
+    .await;
+    let urls: Vec<&str> = sitemap.urls.iter().map(|url| url.trim_start_matches(&base)).collect();
+    assert_eq!(urls, ["/page/b1", "/page/s3", "/page/excluded"]);
+    assert_eq!(site.hits("/sitemaps/broken.xml"), 1, "a malformed sitemap is not retried");
 }

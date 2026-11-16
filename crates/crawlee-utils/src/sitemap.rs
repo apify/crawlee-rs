@@ -69,8 +69,10 @@ pub enum SitemapItem {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SitemapError {
-    #[error("malformed sitemap XML: {0}")]
-    Xml(String),
+    /// The XML is malformed. The entries read before the error are kept, as Crawlee for JS
+    /// yields them before it stops reading the sitemap.
+    #[error("malformed sitemap XML: {message}")]
+    Xml { message: String, items_read: Vec<SitemapItem> },
     #[error("failed to decompress the sitemap: {0}")]
     Gzip(#[from] std::io::Error),
     #[error("unsupported sitemap content type (contentType = {content_type}, url = {url})")]
@@ -220,7 +222,8 @@ impl XmlState {
     }
 }
 
-/// Parses a `urlset` (pages) or `sitemapindex` (nested sitemaps) document. A prefixed element is
+/// Parses a `urlset` (pages) or `sitemapindex` (nested sitemaps) document. On malformed XML,
+/// the error holds the entries read before it. A prefixed element is
 /// read when an `xmlns:` attribute binds its prefix to a sitemap namespace (`<ns0:loc>`), and
 /// ignored otherwise (`<image:loc>`), as in JS.
 pub fn parse_sitemap_xml(content: &str) -> Result<Vec<SitemapItem>, SitemapError> {
@@ -234,7 +237,10 @@ pub fn parse_sitemap_xml(content: &str) -> Result<Vec<SitemapItem>, SitemapError
         items: Vec::new(),
     };
     loop {
-        let event = reader.read_event().map_err(|err| SitemapError::Xml(err.to_string()))?;
+        let event = match reader.read_event() {
+            Ok(event) => event,
+            Err(err) => return Err(SitemapError::Xml { message: err.to_string(), items_read: state.items }),
+        };
         match event {
             Event::Start(tag) => {
                 state.flush_text();
@@ -258,7 +264,12 @@ pub fn parse_sitemap_xml(content: &str) -> Result<Vec<SitemapItem>, SitemapError
                     let name = reference.xml10_content();
                     match resolve_predefined_entity(&name) {
                         Some(resolved) => state.text.push_str(resolved),
-                        None => return Err(SitemapError::Xml(format!("unknown entity &{name};"))),
+                        None => {
+                            return Err(SitemapError::Xml {
+                                message: format!("unknown entity &{name};"),
+                                items_read: state.items,
+                            });
+                        }
                     }
                 }
             }
@@ -406,6 +417,12 @@ mod tests {
         );
         assert_eq!(parse_sitemap_txt("https://a.test/1\r\n\n  https://a.test/2  \n").len(), 2);
         assert!(parse_sitemap_xml("<urlset><url><loc>x</url></urlset>").is_err());
+        let Err(SitemapError::Xml { items_read, .. }) =
+            parse_sitemap_xml("<urlset><url><loc>a</loc></url><url><loc>b</url></urlset>")
+        else {
+            panic!()
+        };
+        assert_eq!(items_read, vec![SitemapItem::Url(SitemapUrl { loc: "a".into(), ..Default::default() })]);
     }
 
     /// crawlee#4393: elements prefixed with a sitemap namespace, as Python's ElementTree writes them.
