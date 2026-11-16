@@ -183,14 +183,7 @@ impl RequestsFromUrl {
         let fetcher = fetcher.ok_or_else(|| {
             cannot_fetch(&"no URL list fetcher was set; set one with RequestQueue::set_url_list_fetcher")
         })?;
-        // A Google Sheets sharing link is fetched as the CSV export of the sheet.
-        static GOOGLE_SHEETS: LazyLock<Regex> =
-            LazyLock::new(|| Regex::new(r"^(https://docs\.google\.com/spreadsheets/d/[A-Za-z0-9_-]+)/?").unwrap());
-        let url = match GOOGLE_SHEETS.captures(requests_from_url) {
-            Some(sheet) => format!("{}/gviz/tq?tqx=out:csv", &sheet[1]),
-            None => requests_from_url.clone(),
-        };
-        let body = fetcher.fetch(&url, proxy_url).await.map_err(|err| cannot_fetch(&err))?;
+        let body = fetcher.fetch(requests_from_url, proxy_url).await.map_err(|err| cannot_fetch(&err))?;
         let urls = extract_urls(&String::from_utf8_lossy(&body), self.regex.as_ref());
         if urls.is_empty() {
             tracing::warn!(requests_from_url, regex = ?self.regex, "The fetched list contains no valid URLs.");
@@ -939,7 +932,8 @@ mod tests {
         let request = queue.fetch_next_request().await.unwrap().unwrap();
         assert_eq!((request.url.as_str(), request.label()), ("https://a.com/1", Some("LIST")));
 
-        // A Google Sheets sharing link is read as CSV.
+        // A Google Sheets sharing link is fetched as it is (crawlee#4377). The Apify SDK rewrites
+        // it in the Actor input.
         queue
             .add_requests_from_url(
                 RequestsFromUrl::new("https://docs.google.com/spreadsheets/d/abc-1_x/edit#gid=0"),
@@ -949,7 +943,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             fetcher.fetched.lock().last().map(String::as_str),
-            Some("https://docs.google.com/spreadsheets/d/abc-1_x/gviz/tq?tqx=out:csv")
+            Some("https://docs.google.com/spreadsheets/d/abc-1_x/edit#gid=0")
         );
 
         let failing = RequestQueue::open(&storage, &StorageIdentifier::alias("other")).await.unwrap();
