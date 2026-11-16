@@ -112,7 +112,7 @@ pub trait UrlListFetcher: Send + Sync {
 /// The URLs [`RequestsFromUrl`] finds by default (`URL_NO_COMMAS_REGEX` of `@crawlee/utils`).
 pub static URL_NO_COMMAS_REGEX: LazyLock<Regex> = LazyLock::new(|| {
     RegexBuilder::new(
-        r"https?://(www\.)?([\p{L}0-9]|[\p{L}0-9][-\p{L}0-9@:%._+~#=]{0,254}[\p{L}0-9])\.[a-z]{2,63}(:[0-9]{1,5})?(/[-\p{L}0-9@:%_+.~#?&/=()'*]*)?",
+        r"https?://(www\.)?([\p{L}0-9]|[\p{L}0-9][-\p{L}\p{M}0-9@:%._+~#=]{0,254}[\p{L}\p{M}0-9])\.(xn--[a-z0-9-]{1,59}|[a-z]{2,63}|[\p{L}\p{M}]{2,63})(:[0-9]{1,5})?(/[-\p{L}\p{M}0-9@:%_+.~#?&/=()'*]*)?",
     )
     .case_insensitive(true)
     .size_limit(64 << 20)
@@ -901,6 +901,24 @@ mod tests {
         );
         let only_b = regex::Regex::new("https://b[^,]+").unwrap();
         assert_eq!(extract_urls(text, Some(&only_b)), ["https://b.com/y"]);
+    }
+
+    /// crawlee#4380: internationalized and punycode top-level domains, and combining marks.
+    #[test]
+    fn extracts_urls_with_internationalized_top_level_domains() {
+        let urls = [
+            "https://пример.рф/путь",
+            "https://xn--e1afmkfd.xn--p1ai/path",
+            "https://例子.中国/",
+            "https://उदाहरण.भारत/page",
+            "https://test.みんな/",
+        ];
+        assert_eq!(extract_urls(&urls.join(" "), None), urls);
+
+        // An ASCII top-level domain does not run into the text after it.
+        let text = "詳細はhttps://example.comをご覧ください 请访问https://www.google.com获取更多信息";
+        let expected = ["https://example.com", "https://www.google.com"];
+        assert_eq!(extract_urls(text, None), expected);
     }
 
     #[tokio::test]
