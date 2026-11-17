@@ -176,13 +176,16 @@ impl<S: PersistedState> RecoverableState<S> {
             let record: Option<Value> = tokio::time::timeout(PERSISTENCE_TIMEOUT, store.get_value(&self.inner.key))
                 .await
                 .map_err(|_| self.timeout_error("Loading"))??;
-            if let Some(record) = record.filter(|record| !record.is_null()) {
-                match self.inner.state.restore(record.clone()) {
+            match record.filter(|record| !record.is_null()) {
+                Some(record) => match self.inner.state.restore(record.clone()) {
                     Ok(()) => *self.inner.saved.lock().await = Some(record),
                     Err(source) => {
                         invalid = Some(StateValidationError { persist_state_key: self.inner.key.clone(), source })
                     }
-                }
+                },
+                // Without a record the state starts as it is, which a run would restore to as well:
+                // it is written once it changes.
+                None => *self.inner.saved.lock().await = Some(self.inner.state.to_record()),
             }
         }
 
@@ -239,7 +242,8 @@ impl<S: PersistedState> RecoverableState<S> {
         Ok(())
     }
 
-    /// Saves the state now, unless the record would be the one last saved or restored.
+    /// Saves the state now, unless the record would be the one last saved or restored (or, without
+    /// a record, the initial state).
     pub async fn persist(&self) -> StorageResult<()> {
         if !self.inner.persistence_enabled {
             return Ok(());
@@ -451,7 +455,10 @@ mod tests {
         let writes = || counting.writes.load(Ordering::SeqCst);
 
         state.persist().await.unwrap();
-        assert_eq!(writes(), 1, "the first save writes the record");
+        assert_eq!(writes(), 0, "the initial state, which a missing record restores to");
+        state.state().lock().count = 5;
+        state.persist().await.unwrap();
+        assert_eq!(writes(), 1, "the first change writes the record");
         for _ in 0..3 {
             services.events.emit(crate::events::Event::PersistState { is_migrating: false });
             services.events.wait_for_all_listeners_to_complete().await;
@@ -490,14 +497,14 @@ mod tests {
         state.initialize().await.unwrap();
         let writes = || counting.writes.load(Ordering::SeqCst);
 
-        tokio::time::sleep(Duration::from_millis(5100)).await;
-        assert_eq!(writes(), 1, "the initial state, saved once");
-        tokio::time::sleep(Duration::from_secs(20)).await;
-        assert_eq!(writes(), 1, "unchanged");
+        tokio::time::sleep(Duration::from_secs(25)).await;
+        assert_eq!(writes(), 0, "the initial state is not written");
 
         state.state().lock().count = 1;
         tokio::time::sleep(Duration::from_secs(5)).await;
-        assert_eq!(writes(), 2);
+        assert_eq!(writes(), 1);
+        tokio::time::sleep(Duration::from_secs(20)).await;
+        assert_eq!(writes(), 1, "unchanged");
         let store = services.open_key_value_store(&StorageIdentifier::Default).await.unwrap();
         assert_eq!(store.get_value::<Counter>("COUNTER").await.unwrap(), Some(Counter { count: 1 }));
 
@@ -505,7 +512,7 @@ mod tests {
         state.teardown().await;
         state.state().lock().count = 2;
         tokio::time::sleep(Duration::from_secs(20)).await;
-        assert_eq!(writes(), 2);
+        assert_eq!(writes(), 1);
     }
 
     #[tokio::test]

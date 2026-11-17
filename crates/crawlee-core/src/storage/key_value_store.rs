@@ -59,6 +59,9 @@ struct AutoSavedValues {
 struct AutoSaved {
     value: Arc<dyn Any + Send + Sync>,
     state: Arc<dyn PersistedState>,
+    /// The record as last saved, loaded or set, or the default without a record: a save writes
+    /// only a record that differs.
+    saved: Arc<Mutex<Option<Value>>>,
 }
 
 /// The operations a key-value store handle (and its clones) issued to the backend, counted per
@@ -263,10 +266,15 @@ impl KeyValueStore {
         if let Some(loaded) = loaded {
             *state.lock() = loaded;
         }
+        // Loaded, or the default a missing record restores to: either is saved already.
+        let record = Arc::new(Mutex::new(Some(state.to_record())));
         let saved = {
             let mut values = self.auto_saved.values.lock();
             // Another call may have loaded it meanwhile; its value is the one saved.
-            values.entry(key.to_owned()).or_insert_with(|| AutoSaved { value: state.clone(), state }).clone()
+            values
+                .entry(key.to_owned())
+                .or_insert_with(|| AutoSaved { value: state.clone(), state, saved: record })
+                .clone()
         };
         self.ensure_auto_saving();
         Self::downcast(key, saved)
@@ -298,9 +306,15 @@ impl KeyValueStore {
     }
 
     async fn save_auto_saved_values(&self) {
-        let records: Vec<(String, Value)> =
-            self.auto_saved.values.lock().iter().map(|(key, saved)| (key.clone(), saved.state.to_record())).collect();
-        for (key, record) in records {
+        let records: Vec<(String, Value, Arc<Mutex<Option<Value>>>)> = self
+            .auto_saved
+            .values
+            .lock()
+            .iter()
+            .map(|(key, saved)| (key.clone(), saved.state.to_record(), saved.saved.clone()))
+            .filter(|(_, record, saved)| saved.lock().as_ref() != Some(record))
+            .collect();
+        for (key, record, saved) in records {
             let written = match serialize_json(&record) {
                 Ok(value) => {
                     self.write_record(KeyValueStoreRecord {
@@ -312,8 +326,9 @@ impl KeyValueStore {
                 }
                 Err(err) => Err(err),
             };
-            if let Err(err) = written {
-                tracing::warn!("Failed to persist the state value to {key}: {err}");
+            match written {
+                Ok(()) => *saved.lock() = Some(record),
+                Err(err) => tracing::warn!("Failed to persist the state value to {key}: {err}"),
             }
         }
     }
@@ -322,9 +337,12 @@ impl KeyValueStore {
     pub(crate) fn update_auto_saved(&self, key: &str, value: impl FnOnce() -> Option<Value>) {
         if let Some(saved) = self.auto_saved_value(key)
             && let Some(value) = value()
-            && let Err(err) = saved.state.restore(value)
         {
-            tracing::warn!("The value written to {key} does not fit its auto-saved value: {err}");
+            match saved.state.restore(value.clone()) {
+                // Written: saved as it is.
+                Ok(()) => *saved.saved.lock() = Some(saved.state.to_record()),
+                Err(err) => tracing::warn!("The value written to {key} does not fit its auto-saved value: {err}"),
+            }
         }
     }
 
@@ -534,6 +552,39 @@ mod tests {
         assert_eq!(store.get_value::<String>("text").await.unwrap().as_deref(), Some("hello"));
         assert_eq!(store.get_value::<serde_json::Value>("text").await.unwrap(), Some(json!("hello")));
         assert!(store.get_value::<serde_json::Value>("png").await.is_err());
+    }
+
+    /// The writes of the auto-saved values of `services`'s default store, by key.
+    async fn persist_and_read(services: &crate::Services, store: &KeyValueStore) -> Vec<String> {
+        let before = store.stats();
+        services.events.emit(crate::Event::PersistState { is_migrating: false });
+        services.events.wait_for_all_listeners_to_complete().await;
+        let written = store.stats().write_count - before.write_count;
+        (0..written).map(|_| "write".to_owned()).collect()
+    }
+
+    #[tokio::test]
+    async fn auto_saved_values_are_written_only_when_they_change() {
+        let services = crate::Services::in_memory();
+        let store = services.open_key_value_store(&StorageIdentifier::Default).await.unwrap();
+        store.set_value("LOADED", &json!({ "n": 1 })).await.unwrap();
+
+        // A default never changed and a loaded value never changed: nothing to write.
+        let fresh = store.get_auto_saved_value("FRESH", || json!({ "n": 0 })).await.unwrap();
+        let loaded = store.get_auto_saved_value("LOADED", || json!({})).await.unwrap();
+        assert!(persist_and_read(&services, &store).await.is_empty());
+        assert!(store.get_value::<serde_json::Value>("FRESH").await.unwrap().is_none());
+
+        // A change is written once.
+        fresh.lock()["n"] = json!(2);
+        assert_eq!(persist_and_read(&services, &store).await.len(), 1);
+        assert!(persist_and_read(&services, &store).await.is_empty());
+        assert_eq!(store.get_value::<serde_json::Value>("FRESH").await.unwrap(), Some(json!({ "n": 2 })));
+
+        // A value set on the key is the one saved: not written again unchanged.
+        store.set_value("LOADED", &json!({ "n": 3 })).await.unwrap();
+        assert_eq!(*loaded.lock(), json!({ "n": 3 }));
+        assert!(persist_and_read(&services, &store).await.is_empty());
     }
 
     #[tokio::test]
