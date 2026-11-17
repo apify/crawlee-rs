@@ -117,6 +117,15 @@ storage/
   instead keeps them out of it: the list tracks them, and their retries, itself (see
   `RequestListAndQueue`). Set `persist_state_interval` to save its position more often than on
   `PersistState` events.
+- **A queue that starts in memory.** `SpillingRequestQueueBackend` keeps a request queue in memory
+  and moves ("spills") it to another backend, typically a remote queue where each write is an API
+  call, once `SpillingOptions::spill_after` has passed (30 s by default), once
+  `SpillingOptions::max_requests` requests were added (no limit by default), or on `spill()`. A
+  short crawl never calls the other backend. At the switch, the handled requests are added there
+  as handled (so they are still deduplicated, also by a resumed crawl), the pending ones in their
+  order, and the ones in progress last; those finish on the other backend, and are not handed out
+  twice. The Apify SDK uses it for the default queue of an Actor run, so unlike in Crawlee for JS,
+  the queue of a short run stays empty in the Apify console.
 
 ## Events and saved state
 
