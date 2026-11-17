@@ -2294,6 +2294,63 @@ async fn each_outcome_of_a_request_scores_its_session() {
     assert_eq!((session.usage_count(), session.error_score()), (4, 3.0));
 }
 
+/// Runs a crawler whose pool of one session finds a saved pool under its key, emitting
+/// `PersistState` from the handler. Returns the sessions used, and the saved record before and after.
+async fn crawl_over_a_saved_session_pool(persistence_enabled: bool) -> (Vec<String>, Value, Option<Value>) {
+    use crawlee_basic::{Session, SessionOptions, SessionPool, SessionPoolOptions};
+    use crawlee_core::{Event, PersistedState};
+
+    let services = services();
+    let used = Arc::new(Mutex::new(Vec::new()));
+    let crawler = BasicCrawler::builder()
+        .services(services.clone())
+        .max_concurrency(1)
+        .session_pool_options(SessionPoolOptions { max_pool_size: 1, persistence_enabled, ..Default::default() })
+        .request_handler({
+            let (used, events) = (used.clone(), services.events.clone());
+            move |ctx: BasicContext| {
+                used.lock().push(ctx.session().unwrap().id().to_owned());
+                events.emit(Event::PersistState { is_migrating: false });
+                async { Ok(()) }
+            }
+        })
+        .build()
+        .unwrap();
+
+    // The pool of a previous run, holding one usable session.
+    let previous = SessionPool::with_id("previous", SessionPoolOptions::default(), None);
+    previous.add_session(Session::new("saved_session".into(), None, SessionOptions::default())).unwrap();
+    let saved = previous.to_record();
+    let key = crawler.session_pool().persist_state_key();
+    let store = services.open_key_value_store(&StorageIdentifier::Default).await.unwrap();
+    store.set_value(&key, &saved).await.unwrap();
+
+    crawler.run(["https://a.dev/1", "https://a.dev/2"]).await.unwrap();
+    services.events.wait_for_all_listeners_to_complete().await;
+    let used = used.lock().clone();
+    (used, saved, store.get_value::<Value>(&key).await.unwrap())
+}
+
+/// By default, as in JS, the pool picks up the saved sessions and saves itself over them.
+#[tokio::test]
+async fn the_session_pool_is_restored_and_saved_by_default() {
+    let (used, saved, after) = crawl_over_a_saved_session_pool(true).await;
+    assert_eq!(used, ["saved_session", "saved_session"]);
+    let after = after.unwrap();
+    assert_ne!(after, saved, "saved again");
+    assert_eq!(after["sessions"][0]["usageCount"], 2);
+}
+
+/// With `persistence_enabled: false` (`persistenceOptions: { enable: false }` in JS), the pool
+/// neither reads its saved state nor writes it, on `PersistState` events or at the end.
+#[tokio::test]
+async fn a_session_pool_without_persistence_is_neither_restored_nor_saved() {
+    let (used, saved, after) = crawl_over_a_saved_session_pool(false).await;
+    assert_eq!(used.len(), 2);
+    assert!(used.iter().all(|id| id != "saved_session"), "not restored: {used:?}");
+    assert_eq!(after, Some(saved), "not written");
+}
+
 /// A queue that starts in memory and moves to its target while a crawl runs, with requests in
 /// progress and requests being added.
 #[tokio::test]
