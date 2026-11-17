@@ -2293,3 +2293,104 @@ async fn each_outcome_of_a_request_scores_its_session() {
     assert!(session.is_retired());
     assert_eq!((session.usage_count(), session.error_score()), (4, 3.0));
 }
+
+/// A queue that starts in memory and moves to its target while a crawl runs, with requests in
+/// progress and requests being added.
+#[tokio::test]
+async fn a_queue_moving_from_memory_mid_crawl_handles_every_request_once() {
+    use crawlee_core::storage::backend::StorageBackend;
+    use crawlee_core::{MemoryStorageBackend, SpillingOptions, SpillingRequestQueueBackend};
+
+    let target = MemoryStorageBackend::new().create_request_queue_backend(&StorageIdentifier::Default).await.unwrap();
+    let options = SpillingOptions { spill_after: Some(Duration::from_millis(150)), max_requests: None };
+    let spilling = {
+        let target = target.clone();
+        Arc::new(SpillingRequestQueueBackend::new(move || std::future::ready(Ok(target.clone())), options))
+    };
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let log = seen.clone();
+    let crawler = BasicCrawler::builder()
+        .services(services())
+        .request_manager(Arc::new(RequestQueue::from_backend(spilling.clone())))
+        .fixed_concurrency(10)
+        .request_handler(move |ctx: BasicContext| {
+            let log = log.clone();
+            async move {
+                let n: usize = ctx.request().url.trim_start_matches("https://a.dev/").parse()?;
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                // Each page links to two new ones and to the first one.
+                let links = [2 * n + 1, 2 * n + 2].into_iter().filter(|&link| link < 150).chain([0]);
+                ctx.add_requests(links.map(|link| format!("https://a.dev/{link}"))).await?;
+                log.lock().push(n);
+                Ok(())
+            }
+        })
+        .build()
+        .unwrap();
+
+    let stats = crawler.run(["https://a.dev/0"]).await.unwrap();
+    assert!(spilling.is_spilled());
+    assert_eq!((stats.requests_succeeded, stats.requests_failed), (150, 0));
+    let mut seen = seen.lock().clone();
+    seen.sort_unstable();
+    assert_eq!(seen, (0..150).collect::<Vec<_>>(), "every request once");
+    let info = target.get_metadata().await.unwrap();
+    assert_eq!((info.total_request_count, info.handled_request_count, info.pending_request_count), (150, 150, 0));
+}
+
+/// A request list beside a queue that moves from memory while the list is read.
+#[tokio::test]
+async fn a_request_list_beside_a_queue_moving_from_memory() {
+    use crawlee_core::storage::backend::StorageBackend;
+    use crawlee_core::{MemoryStorageBackend, RequestList, SpillingOptions, SpillingRequestQueueBackend};
+
+    let services = services();
+    let list =
+        RequestList::open(&services, None, ["https://a.dev/1", "https://a.dev/2", "https://a.dev/3"]).await.unwrap();
+    let target = MemoryStorageBackend::new().create_request_queue_backend(&StorageIdentifier::Default).await.unwrap();
+    let spilling = {
+        let target = target.clone();
+        Arc::new(SpillingRequestQueueBackend::new(
+            move || std::future::ready(Ok(target.clone())),
+            SpillingOptions { spill_after: None, max_requests: None },
+        ))
+    };
+    let queue: Arc<dyn RequestManager> = Arc::new(RequestQueue::from_backend(spilling.clone()));
+    let manager = Arc::new(list.with_queue(Some(queue)).await.unwrap());
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let (log, moving) = (seen.clone(), spilling.clone());
+    let crawler = BasicCrawler::builder()
+        .services(services.clone())
+        .max_concurrency(1)
+        .request_manager(manager)
+        .request_handler(move |mut ctx: BasicContext| {
+            let (log, moving) = (log.clone(), moving.clone());
+            async move {
+                let (url, retry_count) = (ctx.request().url.clone(), ctx.request().retry_count);
+                log.lock().push(url.clone());
+                match (url.as_str(), retry_count) {
+                    ("https://a.dev/1", 0) => {
+                        ctx.add_requests(["https://a.dev/new", "https://a.dev/2"]).await?;
+                        moving.spill().await?;
+                        Ok(())
+                    }
+                    // Changed, so retried through the queue.
+                    ("https://a.dev/2", 0) => {
+                        ctx.request_mut().user_data.insert("tried".into(), json!(true));
+                        anyhow::bail!("fails once, changed")
+                    }
+                    _ => Ok(()),
+                }
+            }
+        })
+        .build()
+        .unwrap();
+
+    let stats = crawler.run(Vec::<String>::new()).await.unwrap();
+    assert!(spilling.is_spilled());
+    assert_eq!((stats.requests_succeeded, stats.requests_failed), (4, 0));
+    let mut seen = seen.lock().clone();
+    seen.sort();
+    assert_eq!(seen, ["https://a.dev/1", "https://a.dev/2", "https://a.dev/2", "https://a.dev/3", "https://a.dev/new"]);
+    assert!(target.get_request("https://a.dev/2").await.unwrap().unwrap().handled_at.is_some());
+}

@@ -11,3 +11,4 @@ pub mod memory;
 pub mod request_list;
 pub mod request_loader;
 pub mod request_queue;
+pub mod spilling;

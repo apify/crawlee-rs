@@ -426,9 +426,19 @@ impl QueueState {
     }
 }
 
-struct MemoryRequestQueue {
+pub(crate) struct MemoryRequestQueue {
     key: StorageKey,
     state: Mutex<QueueState>,
+}
+
+/// What a request queue holds, for a [spilling queue](super::spilling) to commit elsewhere.
+pub(crate) struct QueueSnapshot {
+    /// The requests to fetch, in the order they would be fetched, each with whether it was added
+    /// (or reclaimed) to the forefront.
+    pub(crate) pending: Vec<(Request, bool)>,
+    /// The requests fetched and not handled yet, in queue order.
+    pub(crate) in_progress: Vec<Request>,
+    pub(crate) handled: Vec<Request>,
 }
 
 impl MemoryRequestQueue {
@@ -446,7 +456,39 @@ impl MemoryRequestQueue {
         }
     }
 
-    fn purge_now(&self) {
+    /// A queue outside any registry, for a [spilling queue](super::spilling).
+    pub(crate) fn standalone() -> Self {
+        let id = uuid::Uuid::new_v4().to_string();
+        MemoryRequestQueue::new(StorageKey { cache_key: id.clone(), id, name: None })
+    }
+
+    /// The number of requests ever added, handled ones included.
+    pub(crate) fn request_count(&self) -> usize {
+        self.state.lock().requests.len()
+    }
+
+    /// The number of requests not handled yet, those in progress included.
+    pub(crate) fn unhandled_count(&self) -> usize {
+        self.state.lock().pending.len()
+    }
+
+    pub(crate) fn snapshot(&self) -> QueueSnapshot {
+        let state = self.state.lock();
+        let mut snapshot = QueueSnapshot { pending: Vec::new(), in_progress: Vec::new(), handled: Vec::new() };
+        for (&order_no, id) in &state.pending {
+            let request = state.requests[id].request.clone();
+            if state.in_progress.contains(id) {
+                snapshot.in_progress.push(request);
+            } else {
+                snapshot.pending.push((request, order_no < 0));
+            }
+        }
+        snapshot.handled =
+            state.requests.values().filter(|stored| stored.order_no.is_none()).map(|s| s.request.clone()).collect();
+        snapshot
+    }
+
+    pub(crate) fn purge_now(&self) {
         let mut state = self.state.lock();
         state.requests.clear();
         state.pending.clear();

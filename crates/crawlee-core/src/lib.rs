@@ -34,6 +34,7 @@ pub use crate::storage::request_loader::{
 pub use crate::storage::request_queue::{
     RequestManager, RequestQueue, RequestQueueStats, RequestsFromUrl, UrlListFetcher,
 };
+pub use crate::storage::spilling::{SpillingOptions, SpillingRequestQueueBackend};
 pub use crate::system_info::SystemInfo;
 pub use crate::transaction::StorageTransaction;
 
