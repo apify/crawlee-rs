@@ -549,8 +549,12 @@ where
         let statistics = self.statistics.unwrap_or_else(|| Arc::new(Statistics::with_id(id.clone())));
         let statistics_state =
             RecoverableState::new(&services, statistics.persist_state_key(), statistics.clone(), true);
-        let session_pool_state =
-            RecoverableState::new(&services, session_pool.persist_state_key(), session_pool.clone(), true);
+        let session_pool_state = RecoverableState::new(
+            &services,
+            session_pool.persist_state_key(),
+            session_pool.clone(),
+            session_pool.persistence_enabled(),
+        );
         Ok(BasicCrawler {
             inner: Arc::new(Inner {
                 pipeline: self.pipeline,

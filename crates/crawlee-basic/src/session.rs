@@ -5,7 +5,7 @@
 //!
 //! The pool is a [`PersistedState`]: the crawler saves it under `CRAWLEE_SESSION_POOL_STATE_{id}`
 //! in the record format of Crawlee for JS (cookies included, in tough-cookie's format), so a
-//! resumed crawl keeps its sessions.
+//! resumed crawl keeps its sessions, unless [`SessionPoolOptions::persistence_enabled`] is off.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -356,6 +356,11 @@ pub struct SessionPoolOptions {
     pub session_options: SessionOptions,
     pub session_reuse_strategy: SessionReuseStrategy,
     pub create_session_function: Option<CreateSessionFunction>,
+    /// Restore the pool from its saved state when the crawl starts and save it on every
+    /// `PersistState` event and at the end (`persistenceOptions.enable`, default `true`). Off,
+    /// the pool lives in memory only: for sessions that only keep HTTP clients and their
+    /// connections, saving them is wasted work.
+    pub persistence_enabled: bool,
 }
 
 impl Default for SessionPoolOptions {
@@ -365,6 +370,7 @@ impl Default for SessionPoolOptions {
             session_options: SessionOptions::default(),
             session_reuse_strategy: SessionReuseStrategy::default(),
             create_session_function: None,
+            persistence_enabled: true,
         }
     }
 }
@@ -376,6 +382,7 @@ impl std::fmt::Debug for SessionPoolOptions {
             .field("session_options", &self.session_options)
             .field("session_reuse_strategy", &self.session_reuse_strategy)
             .field("create_session_function", &self.create_session_function.is_some())
+            .field("persistence_enabled", &self.persistence_enabled)
             .finish()
     }
 }
@@ -437,6 +444,11 @@ impl SessionPool {
     /// The key the pool is saved under.
     pub fn persist_state_key(&self) -> String {
         format!("CRAWLEE_SESSION_POOL_STATE_{}", self.id)
+    }
+
+    /// Whether the pool is restored and saved ([`SessionPoolOptions::persistence_enabled`]).
+    pub fn persistence_enabled(&self) -> bool {
+        self.options.persistence_enabled
     }
 
     /// The pool's session options with a fingerprint: the pool-wide one, else a random default.
