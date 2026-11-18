@@ -23,7 +23,7 @@ Differences that use less CPU or memory for the same work.
 
 | Area | Crawlee for JS | crawlee-rs | Why |
 |---|---|---|---|
-| Request queue caches | A 1M-slot dedup cache of keys plus a 2M-entry LRU of requests with their handled state; requests added in background batches skip the LRU, so a later add of one reports `wasAlreadyHandled: false` | One 1M-slot cache of 64-bit key fingerprints with a handled bit (8 MiB), kept for every add | Memory |
+| Request queue caches | An LRU of up to 2M request records (id, unique key, handled state, forefront), filled by single adds, the first batch of `addRequestsBatched`, marking and reclaiming; plus a 1M-slot direct-mapped cache of full keys and ids, filled by every add, without the handled state. A batch add served from the latter reports `wasAlreadyHandled: false`; a single add that misses the LRU asks the backend | One hash table of 64-bit key fingerprints with a handled bit, 8 bytes a key, filled by every add, marking and reclaiming; every cached add reports the cached handled state. It starts at 8 KiB on the first add and doubles at 3/4 full, keeping every key up to about 3.1M (32 MiB); past that, a new key replaces the one in its slot. A fingerprint match could report an unseen request as present (about 2^-63 a lookup), where JS's full keys never do | Memory: 2 MiB for 100k keys and 32 MiB for 3M, instead of a record, a key string and an id string a request |
 
 ### Fewer API calls
 

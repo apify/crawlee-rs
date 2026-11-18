@@ -201,24 +201,44 @@ impl RequestsFromUrl {
     }
 }
 
-/// Number of slots of the add-deduplication cache, as in Crawlee for JS.
-const DEDUP_CACHE_SLOTS: usize = 1 << 20;
+/// Slots of the add-deduplication cache when it is first used: 8 KiB.
+const DEDUP_CACHE_MIN_SLOTS: usize = 1 << 10;
 
-/// A direct-mapped cache of unique keys this client has already added, so repeated adds of the
-/// same URL (the common case when every page links to the same navigation) skip the backend.
-/// It also remembers whether each request was handled, as the backend last reported it (the
-/// `requestCache` of `RequestQueue` in JS), so that a cached add reports it.
+/// The most slots the add-deduplication cache grows to: 32 MiB, which keeps every key exactly up to
+/// about 3.1 million, more than the 2 million requests of the `requestCache` of JS.
+const DEDUP_CACHE_MAX_SLOTS: usize = 1 << 22;
+
+/// A cache of unique keys this client has already added, so repeated adds of the same URL (the
+/// common case when every page links to the same navigation) skip the backend. It also remembers
+/// whether each request was handled, as the backend last reported it (the `requestCache` of
+/// `RequestQueue` in JS), so that a cached add reports it.
 ///
-/// Slots hold 64-bit fingerprints rather than the keys themselves, which keeps the cache at 8 MiB
-/// for a million entries. The lowest bit of a slot is the handled flag. A fingerprint collision
-/// would make the cache report an unseen request as present; with 63-bit fingerprints that needs
-/// about 2^31 distinct keys to become likely.
+/// It is a hash table of 64-bit fingerprints of the keys, not of the keys themselves: 8 bytes a
+/// key, with the lowest bit as the handled flag. It starts at 8 KiB on the first add and doubles
+/// whenever it is 3/4 full, keeping every key, up to [`DEDUP_CACHE_MAX_SLOTS`]. From there a new
+/// key replaces the one in its slot, so the table stays at most 3/4 full and a lookup a short
+/// probe. A fingerprint collision would make the cache report an unseen request as present; with
+/// 63-bit fingerprints, that is a chance of about 2^-63 a lookup.
 struct DedupCache {
-    slots: Option<Box<[u64]>>,
+    /// Empty slots are zero. A power of two long, or empty before the first add.
+    slots: Box<[u64]>,
+    /// The slots in use.
+    len: usize,
+    max_slots: usize,
+}
+
+impl Default for DedupCache {
+    fn default() -> Self {
+        Self::with_max_slots(DEDUP_CACHE_MAX_SLOTS)
+    }
 }
 
 impl DedupCache {
     const HANDLED: u64 = 1;
+
+    fn with_max_slots(max_slots: usize) -> Self {
+        DedupCache { slots: Box::default(), len: 0, max_slots }
+    }
 
     fn fingerprint(unique_key: &str) -> u64 {
         // FNV-1a, 64-bit, without the flag bit. Zero marks an empty slot.
@@ -230,27 +250,81 @@ impl DedupCache {
         (hash & !Self::HANDLED).max(2)
     }
 
-    fn slot(fingerprint: u64) -> usize {
+    /// The slot a fingerprint starts its probe at, in a table of `len` slots (a power of two).
+    fn home(fingerprint: u64, len: usize) -> usize {
         // FNV-1a barely moves the high bits for keys that differ in their last bytes (URLs that
         // differ in a trailing digit), so they are mixed before picking the slot from them.
-        (fingerprint.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 44) as usize % DEDUP_CACHE_SLOTS
+        (fingerprint.wrapping_mul(0x9e37_79b9_7f4a_7c15) >> (64 - len.trailing_zeros())) as usize
+    }
+
+    /// Where the fingerprint is, or the empty slot where its probe ends.
+    fn probe(slots: &[u64], fingerprint: u64) -> usize {
+        let mask = slots.len() - 1;
+        let mut index = Self::home(fingerprint, slots.len());
+        while slots[index] != 0 && slots[index] & !Self::HANDLED != fingerprint {
+            index = (index + 1) & mask;
+        }
+        index
     }
 
     /// Whether the request was handled, or `None` if it is not cached.
     fn get(&self, unique_key: &str) -> Option<bool> {
-        let fingerprint = Self::fingerprint(unique_key);
-        let slot = self.slots.as_ref()?[Self::slot(fingerprint)];
-        (slot & !Self::HANDLED == fingerprint).then_some(slot & Self::HANDLED != 0)
+        if self.slots.is_empty() {
+            return None;
+        }
+        let slot = self.slots[Self::probe(&self.slots, Self::fingerprint(unique_key))];
+        (slot != 0).then_some(slot & Self::HANDLED != 0)
     }
 
     fn insert(&mut self, unique_key: &str, handled: bool) {
         let fingerprint = Self::fingerprint(unique_key);
-        let slots = self.slots.get_or_insert_with(|| vec![0u64; DEDUP_CACHE_SLOTS].into_boxed_slice());
-        slots[Self::slot(fingerprint)] = fingerprint | u64::from(handled);
+        let entry = fingerprint | u64::from(handled);
+        if self.slots.is_empty() {
+            self.slots = vec![0; DEDUP_CACHE_MIN_SLOTS.min(self.max_slots)].into_boxed_slice();
+        }
+        let index = Self::probe(&self.slots, fingerprint);
+        if self.slots[index] != 0 {
+            // Cached already: only its handled flag changes.
+            self.slots[index] = entry;
+            return;
+        }
+        if (self.len + 1) * 4 <= self.slots.len() * 3 {
+            self.slots[index] = entry;
+            self.len += 1;
+        } else if self.slots.len() < self.max_slots {
+            self.grow();
+            let index = Self::probe(&self.slots, fingerprint);
+            self.slots[index] = entry;
+            self.len += 1;
+        } else {
+            // At its largest and 3/4 full: the key replaces the one in its home slot. Replacing a
+            // key in use leaves every probe as it was; when the home slot is empty, the key is not
+            // cached, and a later add of it asks the backend.
+            let home = Self::home(fingerprint, self.slots.len());
+            if self.slots[home] != 0 {
+                self.slots[home] = entry;
+            }
+        }
+    }
+
+    /// Doubles the table, placing every key again from its fingerprint.
+    fn grow(&mut self) {
+        let mut slots = vec![0; self.slots.len() * 2].into_boxed_slice();
+        for &entry in self.slots.iter().filter(|&&entry| entry != 0) {
+            let index = Self::probe(&slots, entry & !Self::HANDLED);
+            slots[index] = entry;
+        }
+        self.slots = slots;
     }
 
     fn clear(&mut self) {
-        self.slots = None;
+        self.slots = Box::default();
+        self.len = 0;
+    }
+
+    #[cfg(test)]
+    fn allocated_bytes(&self) -> usize {
+        std::mem::size_of_val(&*self.slots)
     }
 }
 
@@ -304,7 +378,7 @@ impl RequestQueue {
         RequestQueue {
             backend,
             cache_link: CacheLink::default(),
-            added: Arc::new(Mutex::new(DedupCache { slots: None })),
+            added: Arc::default(),
             expected_processing_time: Arc::default(),
             counters: Arc::default(),
             url_list_fetcher: Arc::default(),
@@ -954,7 +1028,7 @@ mod tests {
 
     #[test]
     fn dedup_cache_fingerprints() {
-        let mut cache = DedupCache { slots: None };
+        let mut cache = DedupCache::default();
         assert_eq!(cache.get("https://a.dev"), None);
         cache.insert("https://a.dev", false);
         assert_eq!(cache.get("https://a.dev"), Some(false));
@@ -967,5 +1041,52 @@ mod tests {
             cache.insert(&format!("https://example.com/{i}"), false);
         }
         assert!((0..100).all(|i| cache.get(&format!("https://example.com/{i}")).is_some()));
+    }
+
+    #[test]
+    fn the_dedup_cache_keeps_every_key_of_a_large_crawl() {
+        let mut cache = DedupCache::default();
+        let key = |i: usize| format!("https://example.com/page/{i}");
+        for i in 0..300_000 {
+            cache.insert(&key(i), i % 3 == 0);
+        }
+        assert!((0..300_000).all(|i| cache.get(&key(i)) == Some(i % 3 == 0)));
+        assert_eq!(cache.get("https://example.com/other"), None);
+    }
+
+    #[test]
+    fn the_dedup_cache_starts_small_and_grows_with_the_keys() {
+        let mut cache = DedupCache::default();
+        assert_eq!(cache.allocated_bytes(), 0, "nothing is allocated before the first add");
+        cache.insert("https://a.dev", false);
+        assert_eq!(cache.allocated_bytes(), 8 * 1024);
+        for i in 0..10_000 {
+            cache.insert(&format!("https://example.com/{i}"), false);
+        }
+        // 10,001 keys at most 3/4 full: 16,384 slots of 8 bytes.
+        assert_eq!(cache.allocated_bytes(), 16_384 * 8);
+        cache.clear();
+        assert_eq!(cache.allocated_bytes(), 0);
+        assert_eq!(cache.get("https://a.dev"), None);
+    }
+
+    #[test]
+    fn at_its_largest_the_dedup_cache_replaces_keys_instead_of_growing() {
+        let mut cache = DedupCache::with_max_slots(1 << 12);
+        let key = |i: usize| format!("https://example.com/{i}");
+        for i in 0..50_000 {
+            cache.insert(&key(i), false);
+        }
+        assert_eq!(cache.allocated_bytes(), (1 << 12) * 8);
+        // Never more than 3/4 full, so a miss stays a short probe.
+        assert!(cache.len <= 3 << 10);
+        // The latest keys are kept, as far as they replaced older ones.
+        let kept = (49_000..50_000).filter(|&i| cache.get(&key(i)).is_some()).count();
+        assert!(kept > 500, "{kept}");
+        // Updating a key that is cached does not replace another one.
+        let len = cache.len;
+        cache.insert(&key(49_999), true);
+        assert_eq!(cache.get(&key(49_999)), Some(true));
+        assert_eq!(cache.len, len);
     }
 }
