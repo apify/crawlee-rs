@@ -55,13 +55,16 @@ struct AutoSavedValues {
     listening: Mutex<bool>,
 }
 
+/// The record an auto-saved value last saved, loaded or was set to, shared with its saves.
+type LastSaved = Arc<Mutex<Option<Value>>>;
+
 #[derive(Clone)]
 struct AutoSaved {
     value: Arc<dyn Any + Send + Sync>,
     state: Arc<dyn PersistedState>,
     /// The record as last saved, loaded or set, or the default without a record: a save writes
     /// only a record that differs.
-    saved: Arc<Mutex<Option<Value>>>,
+    saved: LastSaved,
 }
 
 /// The operations a key-value store handle (and its clones) issued to the backend, counted per
@@ -306,7 +309,7 @@ impl KeyValueStore {
     }
 
     async fn save_auto_saved_values(&self) {
-        let records: Vec<(String, Value, Arc<Mutex<Option<Value>>>)> = self
+        let records: Vec<(String, Value, LastSaved)> = self
             .auto_saved
             .values
             .lock()
