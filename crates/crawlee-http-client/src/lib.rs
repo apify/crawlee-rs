@@ -385,7 +385,8 @@ impl<T: Transport> RedirectingClient<T> {
                 url: response.url.clone(),
             })?;
 
-            let switch_to_get = response.status == StatusCode::SEE_OTHER
+            // As the fetch spec says, a 303 keeps GET and HEAD.
+            let switch_to_get = (response.status == StatusCode::SEE_OTHER && current.method != Method::HEAD)
                 || (matches!(response.status, StatusCode::MOVED_PERMANENTLY | StatusCode::FOUND)
                     && current.method == Method::POST);
 
@@ -549,6 +550,21 @@ mod tests {
         assert!(seen[2].headers.get(AUTHORIZATION).is_none(), "cross-origin drops credentials");
         assert!(seen[2].headers.get(COOKIE).is_none());
         assert_eq!(jar.cookie_header(&Url::parse("https://example.com/").unwrap()).as_deref(), Some("sid=1"));
+    }
+
+    /// Only methods other than GET and HEAD become GET on a 303, as the fetch spec says.
+    #[tokio::test]
+    async fn a_303_keeps_head_and_turns_other_methods_into_get() {
+        for (method, expected) in [(Method::HEAD, Method::HEAD), (Method::POST, Method::GET), (Method::PUT, Method::GET)]
+        {
+            let transport = Scripted::default();
+            *transport.responses.lock() = vec![(303, vec![("location", "/next")]), (200, vec![])];
+            let client = RedirectingClient::new(transport);
+            let mut request = HttpRequest::get(Url::parse("https://example.com/start").unwrap());
+            request.method = method.clone();
+            client.send_request(request, &SendOptions::default()).await.unwrap();
+            assert_eq!(client.transport().seen.lock()[1].method, expected, "{method} after a 303");
+        }
     }
 
     /// A body that yields its chunks one by one, then waits forever.
