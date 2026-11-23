@@ -296,3 +296,22 @@ async fn sitemaps_load_in_parallel_up_to_the_concurrency() {
     let site = serve(None).await;
     assert_eq!(loaded_pages(&site, "pair.xml", 1).await, ["/page/alone-a", "/page/together-b"]);
 }
+
+/// crawlee#4412: a sitemap that is both a source and a nested entry of another source is fetched
+/// once, and its pages are returned once.
+#[tokio::test]
+async fn a_sitemap_that_is_a_source_and_a_nested_entry_is_fetched_once() {
+    let site = serve(None).await;
+    let base = site.base();
+    let client = crawlee_http_client::default_client();
+    let sitemap = Sitemap::load(
+        &[format!("{base}/sitemaps/index.xml"), format!("{base}/sitemaps/list.txt")],
+        client.as_ref(),
+        &SitemapOptions::default(),
+    )
+    .await;
+    let mut urls: Vec<&str> = sitemap.urls.iter().map(|url| url.trim_start_matches(&base)).collect();
+    urls.sort_unstable();
+    assert_eq!(urls, ["/page/excluded", "/page/s1", "/page/s2", "/page/s3"]);
+    assert_eq!(site.hits("/sitemaps/list.txt"), 1);
+}

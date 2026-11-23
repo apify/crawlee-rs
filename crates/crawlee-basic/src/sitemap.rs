@@ -142,17 +142,20 @@ pub struct Sitemap {
 impl Sitemap {
     /// Every page of the sitemaps at `urls`, following nested sitemaps (each fetched once).
     pub async fn load_entries(urls: &[String], client: &dyn HttpClient, options: &SitemapOptions) -> Vec<SitemapEntry> {
-        let mut sources: VecDeque<(String, u32)> = urls.iter().map(|url| (url.clone(), 0)).collect();
+        let normalize = |url: &str| Url::parse(url).map_or_else(|_| url.to_owned(), |u| u.to_string());
+        // Marked when queued, not when fetched, so a sitemap that is both a source and a nested
+        // entry is queued once (crawlee#4412).
         let mut visited: HashSet<String> = HashSet::new();
+        let mut sources: VecDeque<(String, u32)> =
+            urls.iter().filter(|url| visited.insert(normalize(url))).map(|url| (url.clone(), 0)).collect();
         let mut entries = Vec::new();
         while let Some((url, depth)) = sources.pop_front() {
             if options.max_depth.is_some_and(|max| depth > max) {
                 continue;
             }
-            visited.insert(Url::parse(&url).map_or_else(|_| url.clone(), |u| u.to_string()));
             let Some(contents) = fetch_sitemap(&url, client, options).await else { continue };
             for nested in contents.nested_sitemaps {
-                if !visited.contains(&nested) {
+                if visited.insert(normalize(&nested)) {
                     sources.push_back((nested, depth + 1));
                 }
             }
