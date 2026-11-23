@@ -555,7 +555,8 @@ mod tests {
     /// Only methods other than GET and HEAD become GET on a 303, as the fetch spec says.
     #[tokio::test]
     async fn a_303_keeps_head_and_turns_other_methods_into_get() {
-        for (method, expected) in [(Method::HEAD, Method::HEAD), (Method::POST, Method::GET), (Method::PUT, Method::GET)]
+        for (method, expected) in
+            [(Method::HEAD, Method::HEAD), (Method::POST, Method::GET), (Method::PUT, Method::GET)]
         {
             let transport = Scripted::default();
             *transport.responses.lock() = vec![(303, vec![("location", "/next")]), (200, vec![])];

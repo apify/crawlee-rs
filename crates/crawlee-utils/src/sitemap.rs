@@ -404,6 +404,35 @@ mod tests {
         assert_eq!(parse_sitemap_xml(index).unwrap(), vec![SitemapItem::Sitemap("https://example.com/s.xml".into())]);
     }
 
+    /// crawlee#4434: a CDATA section or a comment inside a value does not split it.
+    #[test]
+    fn values_split_by_cdata_or_comments() {
+        let xml = "<urlset>\
+<url><loc><![CDATA[http://example.com/catalog?item=80]]>&amp;desc=turkey</loc></url>\
+<url><loc>http://example.com/<!-- generated -->catalog?item=81</loc><priority>0.<![CDATA[5]]></priority></url>\
+</urlset>";
+        assert_eq!(
+            parse_sitemap_xml(xml).unwrap(),
+            vec![
+                SitemapItem::Url(SitemapUrl {
+                    loc: "http://example.com/catalog?item=80&desc=turkey".into(),
+                    ..Default::default()
+                }),
+                SitemapItem::Url(SitemapUrl {
+                    loc: "http://example.com/catalog?item=81".into(),
+                    priority: Some(0.5),
+                    ..Default::default()
+                }),
+            ]
+        );
+        let index = "<sitemapindex><sitemap><loc><![CDATA[http://example.com/]]>sitemap_child.xml</loc></sitemap>\
+</sitemapindex>";
+        assert_eq!(
+            parse_sitemap_xml(index).unwrap(),
+            vec![SitemapItem::Sitemap("http://example.com/sitemap_child.xml".into())]
+        );
+    }
+
     #[test]
     fn sitemap_index_and_text() {
         let xml = "<sitemapindex><sitemap><loc>https://example.com/s1.xml</loc></sitemap>\
