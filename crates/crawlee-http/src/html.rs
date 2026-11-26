@@ -161,6 +161,10 @@ impl<'a> IntoIterator for Selection<'a> {
     }
 }
 
+/// The elements whose text dom-serializer (cheerio) writes without escaping, and that html5ever
+/// always parses as raw text. `noscript` is left out: with scripting off, it holds elements.
+const RAW_TEXT_ELEMENTS: [&str; 7] = ["style", "script", "xmp", "iframe", "noembed", "noframes", "plaintext"];
+
 /// One element.
 #[derive(Clone, Copy, Debug)]
 pub struct Element<'a>(scraper::ElementRef<'a>);
@@ -182,7 +186,13 @@ impl<'a> Element<'a> {
         self.0.html()
     }
 
+    /// The element's children as HTML. The text of a raw-text element (a script, a style...) is
+    /// not escaped, as in cheerio's `.html()`: scraper's `inner_html` escapes it, so `&` in a
+    /// script's JSON would come back as `&amp;`.
     pub fn inner_html(&self) -> String {
+        if RAW_TEXT_ELEMENTS.contains(&self.name()) {
+            return self.text();
+        }
         self.0.inner_html()
     }
 
@@ -368,6 +378,18 @@ impl HtmlCrawler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// As cheerio's `.html()`: the text of a script or a style is raw, not escaped.
+    #[test]
+    fn inner_html_of_raw_text_elements_is_not_escaped() {
+        let doc = Document::parse(
+            r#"<html><head><script type="application/json">{"u":"a?b=1&c=2","t":"<x>"}</script><style>a > b {}</style></head><body><p>a &amp; b</p></body></html>"#,
+        );
+        let inner = |css: &str| doc.select_first(css).unwrap().unwrap().inner_html();
+        assert_eq!(inner("script"), r#"{"u":"a?b=1&c=2","t":"<x>"}"#);
+        assert_eq!(inner("style"), "a > b {}");
+        assert_eq!(inner("p"), "a &amp; b", "other elements stay escaped");
+    }
 
     #[test]
     fn document_facade() {
